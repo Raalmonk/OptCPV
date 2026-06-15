@@ -464,6 +464,17 @@ def _source_for_net(normalized: dict[str, Any], net_name: str | None) -> dict[st
     )
 
 
+def _add_source_label_positions(
+    normalized: dict[str, Any],
+    placements: dict[str, tuple[float, float, str]],
+    special_positions: dict[str, tuple[float, float]],
+) -> None:
+    for component in normalized["components"]:
+        if _is_source(component) and component["id"] in placements:
+            grid_x, grid_y, _orientation = placements[component["id"]]
+            special_positions[component["id"]] = (grid_x, grid_y - 1.6)
+
+
 def _finalize_with_generic_routes(
     circuit_ir: Any,
     placements: dict[str, tuple[float, float, str]],
@@ -516,6 +527,7 @@ def plan_non_inverting_op_amp(circuit_ir: Any) -> LayoutPlan:
             special_labels[feedback["id"]] = (10.0, 3.8)
         if gain:
             special_labels[gain["id"]] = (5.7, 12.0)
+    _add_source_label_positions(normalized, placements, special_labels)
 
     labels = _add_default_labels(normalized, placements, special_labels)
     provisional = _build_plan(
@@ -749,6 +761,7 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
         special_labels[r_ref["id"]] = (22.1, 16.0)
     if gain:
         special_labels[gain["id"]] = (3.2, 10.0)
+    _add_source_label_positions(normalized, placements, special_labels)
     labels = _add_default_labels(normalized, placements, special_labels)
 
     provisional = _build_plan(
@@ -805,8 +818,8 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
                 _pin_ref_for_net(rf_top, top_inv_net) or "",
                 Point(7.0, 3.0),
                 _pin_ref_by_kind(top_buffer, "inverting") or "",
-                Point(2.0, 5.0),
-                Point(2.0, 9.0),
+                Point(2.15, 5.0),
+                Point(2.15, 9.0),
                 _pin_ref_for_net(gain, top_inv_net) or "",
             ],
         )
@@ -879,12 +892,26 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
         )
     if r_ref and ground_component:
         ground_net = _ground_net(normalized)
+        ground_sequence: list[str | Point] = []
+        if top_source:
+            ground_sequence.append(_pin_ref_for_net(top_source, ground_net) or "")
+            ground_sequence.append(Point(-1.0, 7.0))
+        if bottom_source:
+            if top_source:
+                ground_sequence.append(Point(-1.0, 17.0))
+            ground_sequence.append(_pin_ref_for_net(bottom_source, ground_net) or "")
+            ground_sequence.append(Point(-1.0, 17.0))
+        if ground_sequence:
+            ground_sequence.extend([Point(-1.0, 19.2), Point(20.0, 19.2)])
+        ground_sequence.extend(
+            [
+                _pin_ref_for_net(ground_component, ground_net) or "",
+                _pin_ref_for_net(r_ref, ground_net) or "",
+            ]
+        )
         add_route(
             ground_net,
-            [
-                _pin_ref_for_net(r_ref, ground_net) or "",
-                _pin_ref_for_net(ground_component, ground_net) or "",
-            ],
+            ground_sequence,
         )
 
     generic_routes = _build_generic_routes(normalized["net_to_pins"], pin_points)
@@ -907,14 +934,15 @@ def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
     capacitor = _first_component(normalized, _is_capacitor)
     ground = _first_component(normalized, _is_ground)
     output = _first_component(normalized, _is_output)
+    input_net = next(iter(source["pins"].values())) if source else None
+    output_net = next(iter(output["pins"].values())) if output else None
+    ground_net = _ground_net(normalized)
+    input_source = _source_for_net(normalized, input_net)
     placements: dict[str, tuple[float, float, str]] = {}
     if source:
         placements[source["id"]] = (3.0, 9.0, "right")
-    if source:
-        source_net = next(iter(source["pins"].values()))
-        input_source = _source_for_net(normalized, source_net)
-        if input_source and input_source["id"] not in placements:
-            placements[input_source["id"]] = (1.2, 9.0, "right")
+    if input_source and input_source["id"] not in placements:
+        placements[input_source["id"]] = (1.2, 9.0, "right")
     if resistor:
         placements[resistor["id"]] = (8.0, 9.0, "right")
     if capacitor:
@@ -928,48 +956,191 @@ def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
         special_labels[resistor["id"]] = (8.0, 7.8)
     if capacitor:
         special_labels[capacitor["id"]] = (13.4, 12.0)
+    _add_source_label_positions(normalized, placements, special_labels)
     labels = _add_default_labels(normalized, placements, special_labels)
-    return _finalize_with_generic_routes(
+    provisional = _build_plan(
+        circuit_ir,
+        dict(placements),
+        labels,
+        wires=[],
+        warnings=["motif: rc_low_pass"],
+    )
+    pin_points = _pin_points_grid(provisional.components)
+    routes_by_net: dict[str, WireRoute] = {}
+
+    def add_route(net_name: str | None, sequence: list[str | Point]) -> None:
+        if not net_name or net_name not in normalized["net_to_pins"]:
+            return
+        routes_by_net[net_name] = _route_from_sequence(
+            net_name,
+            normalized["net_to_pins"][net_name],
+            pin_points,
+            sequence,
+        )
+
+    if source and resistor and input_net:
+        sequence: list[str | Point] = []
+        if input_source:
+            sequence.append(_pin_ref_for_net(input_source, input_net) or "")
+        sequence.extend(
+            [
+                _pin_ref_for_net(source, input_net) or "",
+                _pin_ref_for_net(resistor, input_net) or "",
+            ]
+        )
+        add_route(input_net, sequence)
+    if resistor and capacitor and output and output_net:
+        add_route(
+            output_net,
+            [
+                _pin_ref_for_net(resistor, output_net) or "",
+                Point(12.0, 9.0),
+                _pin_ref_for_net(output, output_net) or "",
+                Point(12.0, 9.0),
+                _pin_ref_for_net(capacitor, output_net) or "",
+            ],
+        )
+    if capacitor and ground and ground_net:
+        sequence = []
+        if input_source:
+            sequence.extend(
+                [
+                    _pin_ref_for_net(input_source, ground_net) or "",
+                    Point(0.2, 15.2),
+                    Point(12.0, 15.2),
+                ]
+            )
+        sequence.extend(
+            [
+                _pin_ref_for_net(ground, ground_net) or "",
+                _pin_ref_for_net(capacitor, ground_net) or "",
+            ]
+        )
+        add_route(ground_net, sequence)
+
+    for route in _build_generic_routes(normalized["net_to_pins"], pin_points):
+        routes_by_net.setdefault(route.net_name, route)
+
+    return _build_plan(
         circuit_ir,
         placements,
         labels,
-        ["motif: rc_low_pass"],
+        wires=[routes_by_net[net] for net in sorted(routes_by_net)],
+        warnings=["motif: rc_low_pass"],
     )
 
 
 def plan_voltage_divider(circuit_ir: Any) -> LayoutPlan:
     normalized = normalize_circuit_ir(circuit_ir)
-    resistors = _components_matching(normalized, _is_resistor)
     source = _first_component(normalized, _is_input) or _first_component(normalized, _is_source)
     ground = _first_component(normalized, _is_ground)
     output = _first_component(normalized, _is_output)
+    input_net = next(iter(source["pins"].values())) if source else None
+    output_net = next(iter(output["pins"].values())) if output else None
+    ground_net = _ground_net(normalized)
+    input_source = _source_for_net(normalized, input_net)
+    top_resistor = _resistor_between(normalized, input_net, output_net, "top")
+    bottom_resistor = _resistor_between(normalized, output_net, ground_net, "bottom")
+    if top_resistor is None:
+        top_resistor = _resistor_between(normalized, input_net, output_net)
+    if bottom_resistor is None:
+        bottom_resistor = _resistor_between(normalized, output_net, ground_net)
+    resistors = _components_matching(normalized, _is_resistor)
+    if top_resistor is None and resistors:
+        top_resistor = resistors[0]
+    if bottom_resistor is None:
+        bottom_resistor = next((item for item in resistors if item != top_resistor), None)
     placements: dict[str, tuple[float, float, str]] = {}
     if source:
         placements[source["id"]] = (3.0, 7.0, "right")
-    if source:
-        source_net = next(iter(source["pins"].values()))
-        input_source = _source_for_net(normalized, source_net)
-        if input_source and input_source["id"] not in placements:
-            placements[input_source["id"]] = (1.2, 7.0, "right")
-    if resistors:
-        placements[resistors[0]["id"]] = (9.0, 7.0, "down")
-    if len(resistors) > 1:
-        placements[resistors[1]["id"]] = (9.0, 12.0, "down")
+    if input_source and input_source["id"] not in placements:
+        placements[input_source["id"]] = (1.2, 7.0, "right")
+    if top_resistor:
+        placements[top_resistor["id"]] = (9.0, 7.0, "down")
+    if bottom_resistor:
+        placements[bottom_resistor["id"]] = (9.0, 12.0, "down")
     if output:
         placements[output["id"]] = (15.0, 9.5, "right")
     if ground:
         placements[ground["id"]] = (9.0, 16.0, "down")
     special_labels: dict[str, tuple[float, float]] = {}
-    if resistors:
-        special_labels[resistors[0]["id"]] = (10.3, 7.0)
-    if len(resistors) > 1:
-        special_labels[resistors[1]["id"]] = (10.3, 12.0)
+    if top_resistor:
+        special_labels[top_resistor["id"]] = (11.6, 7.0)
+    if bottom_resistor:
+        special_labels[bottom_resistor["id"]] = (11.6, 12.0)
+    _add_source_label_positions(normalized, placements, special_labels)
     labels = _add_default_labels(normalized, placements, special_labels)
-    return _finalize_with_generic_routes(
+    provisional = _build_plan(
+        circuit_ir,
+        dict(placements),
+        labels,
+        wires=[],
+        warnings=["motif: voltage_divider"],
+    )
+    pin_points = _pin_points_grid(provisional.components)
+    routes_by_net: dict[str, WireRoute] = {}
+
+    def add_route(net_name: str | None, sequence: list[str | Point]) -> None:
+        if not net_name or net_name not in normalized["net_to_pins"]:
+            return
+        routes_by_net[net_name] = _route_from_sequence(
+            net_name,
+            normalized["net_to_pins"][net_name],
+            pin_points,
+            sequence,
+        )
+
+    if source and top_resistor and input_net:
+        sequence: list[str | Point] = []
+        if input_source:
+            sequence.append(_pin_ref_for_net(input_source, input_net) or "")
+        sequence.extend(
+            [
+                _pin_ref_for_net(source, input_net) or "",
+                Point(6.0, 7.0),
+                Point(6.0, 6.0),
+                _pin_ref_for_net(top_resistor, input_net) or "",
+            ]
+        )
+        add_route(input_net, sequence)
+    if top_resistor and bottom_resistor and output and output_net:
+        add_route(
+            output_net,
+            [
+                _pin_ref_for_net(top_resistor, output_net) or "",
+                Point(9.0, 9.5),
+                _pin_ref_for_net(output, output_net) or "",
+                Point(9.0, 9.5),
+                _pin_ref_for_net(bottom_resistor, output_net) or "",
+            ],
+        )
+    if bottom_resistor and ground and ground_net:
+        sequence = []
+        if input_source:
+            sequence.extend(
+                [
+                    _pin_ref_for_net(input_source, ground_net) or "",
+                    Point(0.2, 15.2),
+                    Point(9.0, 15.2),
+                ]
+            )
+        sequence.extend(
+            [
+                _pin_ref_for_net(ground, ground_net) or "",
+                _pin_ref_for_net(bottom_resistor, ground_net) or "",
+            ]
+        )
+        add_route(ground_net, sequence)
+
+    for route in _build_generic_routes(normalized["net_to_pins"], pin_points):
+        routes_by_net.setdefault(route.net_name, route)
+
+    return _build_plan(
         circuit_ir,
         placements,
         labels,
-        ["motif: voltage_divider"],
+        wires=[routes_by_net[net] for net in sorted(routes_by_net)],
+        warnings=["motif: voltage_divider"],
     )
 
 

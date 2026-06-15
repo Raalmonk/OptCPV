@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import xml.etree.ElementTree as ET
+from html import escape as html_escape
 from pathlib import Path
 
 
@@ -15,7 +16,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.app.schem_forge import MockLLMClient, generate_beautiful_schematic
+from backend.app.schem_forge.adapters import circuit_problem_to_schem_forge_ir
 from backend.app.schem_forge.artifact import SchematicArtifact, build_schematic_artifact
+from backend.app.schem_forge.citt_examples import CITT_EXAMPLE_CASES
 from backend.app.schem_forge.critic import critique_layout
 from backend.app.schem_forge.examples import EXAMPLE_CASES, instrumentation_amp_ir
 from backend.app.schem_forge.planner import plan_circuit
@@ -24,12 +27,21 @@ from backend.app.schem_forge.verifier import verify_equivalence
 
 
 OUTPUT_ROOT = REPO_ROOT / "backend" / "app" / "schem_forge" / "generated"
-QA_THRESHOLDS = {
+BUILTIN_QA_THRESHOLDS = {
     "instrumentation_amp": 300,
     "non_inverting_op_amp": 200,
     "rc_low_pass": 150,
     "voltage_divider": 100,
 }
+CITT_QA_THRESHOLDS = {
+    "citt_bme_instrumentation_amplifier": 300,
+    "citt_non_inverting_op_amp": 200,
+    "citt_rc_low_pass": 150,
+    "citt_voltage_divider": 100,
+}
+QA_THRESHOLDS = {**BUILTIN_QA_THRESHOLDS, **CITT_QA_THRESHOLDS}
+SUITES = ("builtins", "citt")
+ALL_CASES = {**EXAMPLE_CASES, **CITT_EXAMPLE_CASES}
 
 
 def build_instrumentation_amplifier_ir() -> dict:
@@ -248,10 +260,145 @@ artifact.focus_regions.forEach(region => {{
 """
 
 
-def run_case(case_name: str) -> dict:
+def infer_suite(case_name: str, requested_suite: str | None = None) -> str:
+    if requested_suite == "builtins":
+        if case_name not in EXAMPLE_CASES:
+            raise SystemExit(f"Case {case_name!r} is not a built-in fixture.")
+        return "builtins"
+    if requested_suite == "citt":
+        if case_name not in CITT_EXAMPLE_CASES:
+            raise SystemExit(f"Case {case_name!r} is not a CiTT fixture.")
+        return "citt"
+    if case_name in EXAMPLE_CASES:
+        return "builtins"
+    if case_name in CITT_EXAMPLE_CASES:
+        return "citt"
+    raise SystemExit(f"Unknown case {case_name!r}.")
+
+
+def build_case_ir(case_name: str, suite: str) -> tuple[dict, dict | None]:
+    if suite == "builtins":
+        return EXAMPLE_CASES[case_name](), None
+    payload = CITT_EXAMPLE_CASES[case_name]()
+    return circuit_problem_to_schem_forge_ir(payload), payload
+
+
+def selected_cases(args: argparse.Namespace) -> list[tuple[str, str]]:
+    if args.all:
+        return [
+            *[(case_name, "builtins") for case_name in sorted(EXAMPLE_CASES)],
+            *[(case_name, "citt") for case_name in sorted(CITT_EXAMPLE_CASES)],
+        ]
+    if args.case:
+        return [(args.case, infer_suite(args.case, args.suite))]
+    if args.suite == "builtins":
+        return [(case_name, "builtins") for case_name in sorted(EXAMPLE_CASES)]
+    if args.suite == "citt":
+        return [(case_name, "citt") for case_name in sorted(CITT_EXAMPLE_CASES)]
+    return [("instrumentation_amp", "builtins")]
+
+
+def relative_to_output(path: str | Path) -> str:
+    return Path(path).relative_to(OUTPUT_ROOT).as_posix()
+
+
+def write_visual_review(rows: list[dict]) -> Path:
+    review_path = OUTPUT_ROOT / "visual_review.html"
+    cards: list[str] = []
+    for row in rows:
+        after_svg = relative_to_output(row["after_svg"])
+        debug_path = relative_to_output(row["debug_html"])
+        artifact_path = relative_to_output(row["after_artifact"])
+        critic_path = relative_to_output(row["critic_report"])
+        violations = row["violations_after"]
+        if violations:
+            violation_items = "\n".join(
+                f"<li><code>{html_escape(item['code'])}</code> {html_escape(item['message'])}</li>"
+                for item in violations
+            )
+        else:
+            violation_items = "<li>none</li>"
+        status = "pass" if row["threshold_ok"] and row["fatal_after"] == 0 and row["artifact_ok"] == "yes" else "fail"
+        escaped_case = html_escape(row["case"])
+        escaped_suite = html_escape(row["suite"])
+        escaped_artifact_ok = html_escape(row["artifact_ok"])
+        cards.append(
+            f"""
+    <article class="case-card {status}">
+      <header>
+        <div>
+          <h2>{escaped_case}</h2>
+          <p>{escaped_suite} - threshold {row["threshold"]}</p>
+        </div>
+        <strong>{row["after"]}</strong>
+      </header>
+      <img src="{html_escape(after_svg)}" alt="{escaped_case} schematic">
+      <dl>
+        <div><dt>before</dt><dd>{row["before"]}</dd></div>
+        <div><dt>after</dt><dd>{row["after"]}</dd></div>
+        <div><dt>fatal</dt><dd>{row["fatal_after"]}</dd></div>
+        <div><dt>artifact</dt><dd>{escaped_artifact_ok}</dd></div>
+      </dl>
+      <nav>
+        <a href="{html_escape(after_svg)}">SVG</a>
+        <a href="{html_escape(debug_path)}">Debug</a>
+        <a href="{html_escape(artifact_path)}">Artifact</a>
+        <a href="{html_escape(critic_path)}">Critic</a>
+      </nav>
+      <h3>Violations</h3>
+      <ul>{violation_items}</ul>
+    </article>
+"""
+        )
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>schem_forge visual review</title>
+  <style>
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #f6f7f9; color: #111827; }}
+    main {{ max-width: 1280px; margin: 0 auto; padding: 28px; }}
+    h1 {{ margin: 0 0 18px; font-size: 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }}
+    .case-card {{ background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 14px; }}
+    .case-card.pass {{ border-top: 4px solid #15803d; }}
+    .case-card.fail {{ border-top: 4px solid #b91c1c; }}
+    header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }}
+    h2 {{ margin: 0; font-size: 16px; }}
+    h3 {{ margin: 12px 0 6px; font-size: 13px; }}
+    p {{ margin: 3px 0 0; color: #4b5563; font-size: 12px; }}
+    strong {{ font-size: 26px; }}
+    img {{ width: 100%; height: 320px; object-fit: contain; background: #fbfaf7; border: 1px solid #e5e7eb; margin: 12px 0; }}
+    dl {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 0; }}
+    dt {{ color: #6b7280; font-size: 11px; }}
+    dd {{ margin: 0; font-weight: 600; }}
+    nav {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }}
+    a {{ color: #1d4ed8; text-decoration: none; }}
+    ul {{ margin: 0; padding-left: 18px; font-size: 12px; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>schem_forge visual review</h1>
+  <section class="grid">
+{''.join(cards)}
+  </section>
+</main>
+</body>
+</html>
+"""
+    write_text(review_path, html)
+    return review_path
+
+
+def run_case(case_name: str, suite: str | None = None) -> dict:
+    resolved_suite = infer_suite(case_name, suite)
     output_dir = OUTPUT_ROOT / case_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    circuit_ir = EXAMPLE_CASES[case_name]()
+    circuit_ir, source_payload = build_case_ir(case_name, resolved_suite)
+    if source_payload is not None:
+        write_json(output_dir / "citt_payload.json", source_payload)
+        write_json(output_dir / "adapted_ir.json", circuit_ir)
 
     before_plan = plan_circuit(circuit_ir)
     verify_equivalence(circuit_ir, before_plan)
@@ -287,16 +434,13 @@ def run_case(case_name: str) -> dict:
         },
     )
     artifact_errors = artifact_contract_errors(result.artifact)
-    after_codes = [violation.code for violation in result.critic_report.violations]
-    known_visual_issues = []
-    if case_name == "instrumentation_amp" and after_codes == ["wire_crossing"]:
-        known_visual_issues.append(
-            "Known instrumentation_amp crossing between N_GAIN_TOP and VINP; fatal-free but not zero-score."
-        )
     threshold = QA_THRESHOLDS[case_name]
+    payload_path = str(output_dir / "citt_payload.json") if source_payload is not None else None
+    adapted_ir_path = str(output_dir / "adapted_ir.json") if source_payload is not None else None
 
     return {
         "case": case_name,
+        "suite": resolved_suite,
         "before": before_report.total_score,
         "after": result.critic_report.total_score,
         "fatal_after": result.critic_report.fatal_count,
@@ -311,10 +455,11 @@ def run_case(case_name: str) -> dict:
         "after_artifact": str(output_dir / "after_artifact.json"),
         "debug_html": str(output_dir / "debug.html"),
         "critic_report": str(output_dir / "critic_report.json"),
+        "source_payload": payload_path,
+        "adapted_ir": adapted_ir_path,
         "threshold": threshold,
         "threshold_ok": result.critic_report.total_score <= threshold,
         "artifact_errors": artifact_errors,
-        "known_visual_issues": known_visual_issues,
         "violations_after": [violation.to_dict() if hasattr(violation, "to_dict") else violation.__dict__ for violation in result.critic_report.violations],
     }
 
@@ -322,8 +467,14 @@ def run_case(case_name: str) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--suite",
+        choices=SUITES,
+        default=None,
+        help="Fixture suite to export. Without --case, exports every case in the suite.",
+    )
+    parser.add_argument(
         "--case",
-        choices=sorted(EXAMPLE_CASES),
+        choices=sorted(ALL_CASES),
         default=None,
         help="Single fixture case to export.",
     )
@@ -332,26 +483,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Export all fixture cases.",
     )
-    parser.add_argument(
-        "--allow-known-issues",
-        action="store_true",
-        help="Do not return non-zero when known non-fatal visual issues are present.",
-    )
     return parser.parse_args()
 
 
 def print_summary(rows: list[dict]) -> None:
     print(
-        f"{'case':<24} {'before':>8} {'after':>8} {'fatal_after':>12} "
+        f"{'case':<40} {'suite':<9} {'before':>8} {'after':>8} {'fatal_after':>12} "
         f"{'focus_regions':>14} {'zoom_presets':>13} {'hit_targets':>12} "
-        f"{'artifact_ok':>11} {'improved':>10}"
+        f"{'artifact_ok':>11} {'threshold':>10}"
     )
     for row in rows:
         print(
-            f"{row['case']:<24} {row['before']:>8} {row['after']:>8} "
+            f"{row['case']:<40} {row['suite']:<9} {row['before']:>8} {row['after']:>8} "
             f"{row['fatal_after']:>12} {row['focus_regions']:>14} "
             f"{row['zoom_presets']:>13} {row['hit_targets']:>12} "
-            f"{row['artifact_ok']:>11} {row['improved']:>10}"
+            f"{row['artifact_ok']:>11} {row['threshold']:>10}"
         )
     print("Output root:", OUTPUT_ROOT)
     for row in rows:
@@ -359,13 +505,16 @@ def print_summary(rows: list[dict]) -> None:
         print(f"{row['case']} debug:", row["debug_html"])
 
 
-def write_qa_summary(rows: list[dict]) -> Path:
+def write_qa_summary(rows: list[dict], visual_review_path: Path) -> Path:
     summary_path = OUTPUT_ROOT / "qa_summary.json"
     summary = {
         "all_artifacts_ok": all(row["artifact_ok"] == "yes" for row in rows),
         "any_fatal_after": any(row["fatal_after"] > 0 for row in rows),
+        "all_thresholds_ok": all(row["threshold_ok"] for row in rows),
+        "visual_review": str(visual_review_path),
         "cases": {
             row["case"]: {
+                "suite": row["suite"],
                 "before": row["before"],
                 "after": row["after"],
                 "fatal_after": row["fatal_after"],
@@ -385,14 +534,21 @@ def write_qa_summary(rows: list[dict]) -> Path:
                     "after_artifact": row["after_artifact"],
                     "debug_html": row["debug_html"],
                     "critic_report": row["critic_report"],
+                    "source_payload": row["source_payload"],
+                    "adapted_ir": row["adapted_ir"],
+                    "visual_review": str(visual_review_path),
                 },
-                "known_visual_issues": row["known_visual_issues"],
+                "violation_codes_after": [
+                    violation["code"] for violation in row["violations_after"]
+                ],
                 "violations_after": row["violations_after"],
             }
             for row in rows
         },
-        "known_visual_issues": [
-            issue for row in rows for issue in row["known_visual_issues"]
+        "remaining_visual_issues": [
+            {"case": row["case"], "violations": row["violations_after"]}
+            for row in rows
+            if row["violations_after"]
         ],
     }
     write_json(summary_path, summary)
@@ -401,18 +557,18 @@ def write_qa_summary(rows: list[dict]) -> Path:
 
 def main() -> int:
     args = parse_args()
-    if args.all:
-        case_names = sorted(EXAMPLE_CASES)
-    else:
-        case_names = [args.case or "instrumentation_amp"]
+    cases = selected_cases(args)
 
-    rows = [run_case(case_name) for case_name in case_names]
+    rows = [run_case(case_name, suite=suite) for case_name, suite in cases]
     print_summary(rows)
-    summary_path = write_qa_summary(rows)
+    visual_review_path = write_visual_review(rows)
+    summary_path = write_qa_summary(rows, visual_review_path)
     print("QA summary:", summary_path)
+    print("Visual review:", visual_review_path)
     has_fatal = any(row["fatal_after"] > 0 for row in rows)
     has_artifact_errors = any(row["artifact_errors"] for row in rows)
-    if has_artifact_errors or (has_fatal and not args.allow_known_issues):
+    has_threshold_failures = any(not row["threshold_ok"] for row in rows)
+    if has_artifact_errors or has_fatal or has_threshold_failures:
         return 1
     return 0
 

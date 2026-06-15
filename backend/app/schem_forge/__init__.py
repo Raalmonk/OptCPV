@@ -7,6 +7,13 @@ from typing import Any
 from .agent import AgentResult, GeminiLLMClient, LayoutPatch, MockLLMClient, generate_beautiful_schematic
 from .adapters import circuit_problem_to_schem_forge_ir
 from .artifact import SchematicArtifact, build_schematic_artifact
+from .citt_examples import (
+    CITT_EXAMPLE_CASES,
+    citt_bme_instrumentation_amplifier_payload,
+    citt_non_inverting_op_amp_payload,
+    citt_rc_low_pass_payload,
+    citt_voltage_divider_payload,
+)
 from .critic import CriticReport, critique_layout
 from .planner import (
     plan_bridge_or_wheatstone,
@@ -44,6 +51,7 @@ def compile_schematic_for_generator(
 
 __all__ = [
     "AgentResult",
+    "CITT_EXAMPLE_CASES",
     "CriticReport",
     "ElectricalTopologyError",
     "GeminiLLMClient",
@@ -51,6 +59,10 @@ __all__ = [
     "MockLLMClient",
     "SchematicArtifact",
     "build_schematic_artifact",
+    "citt_bme_instrumentation_amplifier_payload",
+    "citt_non_inverting_op_amp_payload",
+    "citt_rc_low_pass_payload",
+    "citt_voltage_divider_payload",
     "circuit_problem_to_schem_forge_ir",
     "compile_schematic_for_generator",
     "critique_layout",

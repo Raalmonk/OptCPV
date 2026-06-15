@@ -1,4 +1,6 @@
 /backend/app/schem_forge/generated/
+.env
+.env.local
 __pycache__/
 *.pyc
 .DS_Store

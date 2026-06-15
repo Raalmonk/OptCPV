@@ -31,9 +31,4 @@ def test_builtin_visual_quality_gates(case_name: str) -> None:
     assert after_report.total_score <= before_report.total_score
     assert "component_overlap" not in codes
     assert "wire_crosses_component_body" not in codes
-
-    if case_name == "instrumentation_amp":
-        # TODO: replace the remaining input/gain-node crossing with a jumper or cleaner bus route.
-        assert codes == ["wire_crossing"]
-    else:
-        assert "wire_crossing" not in codes
+    assert "wire_crossing" not in codes

@@ -299,23 +299,6 @@ class MockLLMClient:
                                 "grid_y": component.grid_y,
                             }
                         )
-            elif violation.code == "wire_crossing" and set(violation.entities) == {"N_GAIN_TOP", "VINP"}:
-                vinp_route = next((wire for wire in layout_plan.wires if wire.net_name == "VINP"), None)
-                if vinp_route and len(vinp_route.waypoints) >= 2:
-                    start = vinp_route.waypoints[0]
-                    end = vinp_route.waypoints[-1]
-                    patch["set_wire_waypoints"].append(
-                        {
-                            "net_name": "VINP",
-                            "waypoints": [
-                                {"x": start.x, "y": start.y},
-                                {"x": start.x, "y": 2.0},
-                                {"x": end.x, "y": 2.0},
-                                {"x": end.x, "y": end.y},
-                            ],
-                        }
-                    )
-
         return LayoutPatch(
             move_component=patch["move_component"],
             move_label=patch["move_label"],

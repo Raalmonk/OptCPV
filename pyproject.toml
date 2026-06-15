@@ -7,10 +7,16 @@ name = "optcpv-schem-forge"
 version = "0.1.0"
 description = "Deterministic circuit-to-schematic compiler for analog tutoring diagrams."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "fastapi>=0.100",
+    "pydantic>=2",
+    "python-multipart>=0.0.9",
+    "uvicorn>=0.23",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["httpx<0.28", "pytest>=7"]
+gemini = ["google-genai>=0.5"]
 
 [tool.setuptools.packages.find]
 include = ["backend*"]
