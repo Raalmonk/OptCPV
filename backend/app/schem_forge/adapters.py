@@ -69,7 +69,12 @@ def _component_type(raw_component: Any) -> str:
 
 def _value_label(raw_component: Any) -> str | None:
     value = _read(raw_component, "value_label", _read(raw_component, "value"))
-    return None if value is None else str(value)
+    unit = _read(raw_component, "unit")
+    if value is None:
+        return None
+    if unit is None:
+        return str(value)
+    return f"{value} {unit}"
 
 
 def _display_label(raw_component: Any) -> str | None:
@@ -84,10 +89,20 @@ def _goal_nodes(circuit_problem: Any) -> set[str]:
         goals = [goal] if goal is not None else []
     nodes: set[str] = set()
     for goal in goals:
-        goal_type = _key(_read(goal, "type", _read(goal, "kind", "")))
-        node = _read(goal, "node", _read(goal, "node_name", _read(goal, "net")))
-        if node is not None and ("voltage" in goal_type or "node" in goal_type or goal_type == ""):
+        goal_type = _key(_read(goal, "type", _read(goal, "kind", _read(goal, "quantity", ""))))
+        node = _read(goal, "node", _read(goal, "node_name", _read(goal, "net", _read(goal, "target"))))
+        if node is not None and not isinstance(node, dict) and (
+            "voltage" in goal_type or "node" in goal_type or goal_type == ""
+        ):
             nodes.add(str(node))
+        reference = _read(goal, "reference")
+        positive_node = _read(reference, "positive_node")
+        negative_node = _read(reference, "negative_node")
+        if "voltage" in goal_type:
+            if positive_node is not None:
+                nodes.add(str(positive_node))
+            if negative_node is not None and _key(negative_node) not in {"0", "gnd", "ground"}:
+                nodes.add(str(negative_node))
     return nodes
 
 
@@ -184,6 +199,7 @@ def circuit_problem_to_schem_forge_ir(circuit_problem: Any) -> dict:
                 "type": "ground",
                 "role": "ground",
                 "display_label": "GND",
+                "source": "virtual_terminal",
                 "pins": {"gnd": ground_net},
             }
         )
@@ -201,6 +217,7 @@ def circuit_problem_to_schem_forge_ir(circuit_problem: Any) -> dict:
                     "type": "output",
                     "role": "output",
                     "display_label": node,
+                    "source": "virtual_terminal",
                     "pins": {"in": node},
                 }
             )
@@ -219,13 +236,17 @@ def circuit_problem_to_schem_forge_ir(circuit_problem: Any) -> dict:
                     "type": "input",
                     "role": "input_source",
                     "display_label": node,
+                    "source": "virtual_terminal",
                     "pins": {"out": node},
                 }
             )
             existing_input_nets.add(node)
 
     circuit_id = _read(raw_problem, "id", _read(raw_problem, "circuit_id", "citt_circuit"))
-    motif = _infer_motif(components, _read(raw_problem, "motif", _read(raw_problem, "kind")))
+    motif = _infer_motif(
+        components,
+        _read(raw_problem, "motif", _read(raw_problem, "kind", _read(raw_problem, "topology_id"))),
+    )
     return {
         "id": str(circuit_id),
         "motif": motif,

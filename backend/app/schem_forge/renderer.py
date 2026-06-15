@@ -468,4 +468,8 @@ def render_layout(layout_plan: LayoutPlan) -> RenderResult:
         pin_points=pin_points,
         junction_points=junction_points,
     )
-    return RenderResult(svg="\n".join(parts), geometry=geometry)
+    return RenderResult(
+        svg="\n".join(parts),
+        geometry=geometry,
+        svg_viewbox=BBox(0.0, 0.0, float(max_x), float(max_y)),
+    )

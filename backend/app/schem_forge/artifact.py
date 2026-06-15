@@ -689,11 +689,12 @@ def build_schematic_artifact(
 ) -> SchematicArtifact:
     """Build the tutor-facing artifact from trusted layout and render geometry."""
 
+    rendered_viewbox = render_result.svg_viewbox
     canvas = ViewBox(
-        x=0.0,
-        y=0.0,
-        width=float(layout_plan.canvas_width),
-        height=float(layout_plan.canvas_height),
+        x=float(rendered_viewbox.x if rendered_viewbox else 0.0),
+        y=float(rendered_viewbox.y if rendered_viewbox else 0.0),
+        width=float(rendered_viewbox.width if rendered_viewbox else layout_plan.canvas_width),
+        height=float(rendered_viewbox.height if rendered_viewbox else layout_plan.canvas_height),
     )
     labels = _build_labels(layout_plan, render_result)
     components = _build_components(layout_plan, render_result, labels)

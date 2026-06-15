@@ -153,6 +153,7 @@ class RenderGeometry:
 class RenderResult:
     svg: str
     geometry: RenderGeometry
+    svg_viewbox: BBox | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclass_to_dict(self)

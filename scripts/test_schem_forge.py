@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -23,6 +24,12 @@ from backend.app.schem_forge.verifier import verify_equivalence
 
 
 OUTPUT_ROOT = REPO_ROOT / "backend" / "app" / "schem_forge" / "generated"
+QA_THRESHOLDS = {
+    "instrumentation_amp": 300,
+    "non_inverting_op_amp": 200,
+    "rc_low_pass": 150,
+    "voltage_divider": 100,
+}
 
 
 def build_instrumentation_amplifier_ir() -> dict:
@@ -37,6 +44,97 @@ def write_text(path: Path, text: str) -> None:
 
 def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def root_viewbox(svg: str) -> dict[str, float]:
+    root = ET.fromstring(svg)
+    x, y, width, height = [float(part) for part in root.attrib["viewBox"].split()]
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def artifact_contract_errors(artifact: SchematicArtifact) -> list[str]:
+    errors: list[str] = []
+    payload = artifact.to_dict()
+    try:
+        json.dumps(payload)
+        root = ET.fromstring(artifact.svg)
+    except Exception as exc:  # pragma: no cover - defensive report path
+        return [f"artifact serialization/svg parse failed: {exc}"]
+
+    if root_viewbox(artifact.svg) != artifact.svg_viewbox.__dict__:
+        errors.append("SVG root viewBox does not match artifact.svg_viewbox")
+
+    component_ids = set(artifact.components)
+    net_names = set(artifact.nets)
+    label_ids = set(artifact.labels)
+    pin_refs = {
+        f"{component_id}.{pin_name}"
+        for component_id, component in artifact.components.items()
+        for pin_name in component.pins
+    }
+    focus_ids = {region.id for region in artifact.focus_regions}
+    preset_ids = [preset.id for preset in artifact.zoom_presets]
+
+    if preset_ids.count("fit_all") != 1:
+        errors.append("fit_all zoom preset must exist exactly once")
+
+    for preset in artifact.zoom_presets:
+        if preset.viewbox.width <= 0 or preset.viewbox.height <= 0:
+            errors.append(f"zoom preset {preset.id} has non-positive viewbox")
+    for region in artifact.focus_regions:
+        if region.bbox.width <= 0 or region.bbox.height <= 0:
+            errors.append(f"focus region {region.id} has non-positive bbox")
+        if not set(region.components) <= component_ids:
+            errors.append(f"focus region {region.id} references missing components")
+        if not set(region.nets) <= net_names:
+            errors.append(f"focus region {region.id} references missing nets")
+        if not set(region.pins) <= pin_refs:
+            errors.append(f"focus region {region.id} references missing pins")
+        if not set(region.labels) <= label_ids:
+            errors.append(f"focus region {region.id} references missing labels")
+        if f"focus_{region.id}" not in preset_ids:
+            errors.append(f"focus region {region.id} has no matching zoom preset")
+    for component_id in component_ids:
+        if f"component_{component_id}" not in preset_ids:
+            errors.append(f"component {component_id} has no matching zoom preset")
+    for overlay in artifact.overlays:
+        if not set(overlay.components) <= component_ids:
+            errors.append(f"overlay {overlay.id} references missing components")
+        if not set(overlay.nets) <= net_names:
+            errors.append(f"overlay {overlay.id} references missing nets")
+        if not set(overlay.pins) <= pin_refs:
+            errors.append(f"overlay {overlay.id} references missing pins")
+        if overlay.focus_region_id not in focus_ids:
+            errors.append(f"overlay {overlay.id} references missing focus region")
+    valid_targets = {
+        "component": component_ids,
+        "net": net_names,
+        "pin": pin_refs,
+        "label": label_ids,
+        "focus_region": focus_ids,
+    }
+    for target in artifact.hit_targets:
+        if target.bbox.width <= 0 or target.bbox.height <= 0:
+            errors.append(f"hit target {target.id} has non-positive bbox")
+        if target.target_id not in valid_targets[target.kind]:
+            errors.append(f"hit target {target.id} references missing {target.kind}")
+
+    svg_component_ids = {
+        value for element in root.iter() if (value := element.attrib.get("data-component-id"))
+    }
+    svg_net_names = {
+        value for element in root.iter() if (value := element.attrib.get("data-net-name"))
+    }
+    svg_pin_refs = {
+        value for element in root.iter() if (value := element.attrib.get("data-pin-ref"))
+    }
+    if not component_ids <= svg_component_ids:
+        errors.append("one or more artifact components missing from SVG metadata")
+    if not {name for name, net in artifact.nets.items() if net.segments} <= svg_net_names:
+        errors.append("one or more segmented artifact nets missing from SVG metadata")
+    if not pin_refs <= svg_pin_refs:
+        errors.append("one or more artifact pins missing from SVG metadata")
+    return errors
 
 
 def debug_html(artifact: SchematicArtifact) -> str:
@@ -66,7 +164,7 @@ def debug_html(artifact: SchematicArtifact) -> str:
     <h1>{artifact.circuit_id}</h1>
     <div class="meta">critic score: {artifact.critic_report.get("total_score")}<br>renderer: {artifact.renderer}<br>artifact: {artifact.artifact_version}</div>
     <h2>View</h2>
-    <button type="button" onclick="resetView()">Reset viewBox</button>
+    <button type="button" id="reset-view">Reset viewBox</button>
     <h2>Zoom Presets</h2>
     <div id="zoom-buttons"></div>
     <h2>Focus Regions</h2>
@@ -84,6 +182,11 @@ const originalViewBox = `${{artifact.svg_viewbox.x}} ${{artifact.svg_viewbox.y}}
 svg.setAttribute("width", "100%");
 svg.setAttribute("height", "100%");
 svg.setAttribute("viewBox", originalViewBox);
+
+function cssEscape(value) {{
+  if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, "\\\\$&");
+}}
 
 function clearHighlights() {{
   svg.querySelectorAll(".highlight").forEach(el => el.classList.remove("highlight"));
@@ -109,17 +212,36 @@ function highlightFocusRegion(regionId) {{
   clearHighlights();
   const region = artifact.focus_regions.find(r => r.id === regionId);
   if (!region) return;
-  region.components.forEach(id => svg.querySelector(`[data-component-id="${{CSS.escape(id)}}"]`)?.classList.add("highlight"));
-  region.nets.forEach(net => svg.querySelectorAll(`[data-net-name="${{CSS.escape(net)}}"]`).forEach(el => el.classList.add("highlight")));
-  region.labels.forEach(id => svg.querySelector(`[data-label-id="${{CSS.escape(id)}}"]`)?.classList.add("highlight"));
+  region.components.forEach(id => svg.querySelector(`[data-component-id="${{cssEscape(id)}}"]`)?.classList.add("highlight"));
+  region.nets.forEach(net => svg.querySelectorAll(`[data-net-name="${{cssEscape(net)}}"]`).forEach(el => el.classList.add("highlight")));
+  region.labels.forEach(id => svg.querySelector(`[data-label-id="${{cssEscape(id)}}"]`)?.classList.add("highlight"));
 }}
 
-document.getElementById("zoom-buttons").innerHTML = artifact.zoom_presets
-  .map(preset => `<button type="button" onclick="zoomToPreset('${{preset.id}}')">${{preset.label}}</button>`)
-  .join("");
-document.getElementById("focus-buttons").innerHTML = artifact.focus_regions
-  .map(region => `<button type="button" onclick="highlightFocusRegion('${{region.id}}'); zoomToPreset('focus_${{region.id}}')">${{region.label}}</button>`)
-  .join("");
+document.getElementById("reset-view").addEventListener("click", resetView);
+
+const zoomButtons = document.getElementById("zoom-buttons");
+artifact.zoom_presets.forEach(preset => {{
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.presetId = preset.id;
+  button.textContent = preset.label;
+  button.addEventListener("click", () => zoomToPreset(button.dataset.presetId));
+  zoomButtons.appendChild(button);
+}});
+
+const focusButtons = document.getElementById("focus-buttons");
+artifact.focus_regions.forEach(region => {{
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.regionId = region.id;
+  button.textContent = region.label;
+  button.addEventListener("click", () => {{
+    const regionId = button.dataset.regionId;
+    highlightFocusRegion(regionId);
+    zoomToPreset(`focus_${{regionId}}`);
+  }});
+  focusButtons.appendChild(button);
+}});
 </script>
 </body>
 </html>
@@ -164,16 +286,36 @@ def run_case(case_name: str) -> dict:
             "agent_debug_log": result.debug_log,
         },
     )
+    artifact_errors = artifact_contract_errors(result.artifact)
+    after_codes = [violation.code for violation in result.critic_report.violations]
+    known_visual_issues = []
+    if case_name == "instrumentation_amp" and after_codes == ["wire_crossing"]:
+        known_visual_issues.append(
+            "Known instrumentation_amp crossing between N_GAIN_TOP and VINP; fatal-free but not zero-score."
+        )
+    threshold = QA_THRESHOLDS[case_name]
 
     return {
         "case": case_name,
         "before": before_report.total_score,
         "after": result.critic_report.total_score,
         "fatal_after": result.critic_report.fatal_count,
+        "focus_regions": len(result.artifact.focus_regions),
+        "zoom_presets": len(result.artifact.zoom_presets),
+        "hit_targets": len(result.artifact.hit_targets),
+        "artifact_ok": "yes" if not artifact_errors else "no",
         "improved": "yes" if result.critic_report.total_score < before_report.total_score else "no",
         "output_dir": str(output_dir),
+        "before_svg": str(output_dir / "before.svg"),
+        "after_svg": str(output_dir / "after.svg"),
         "after_artifact": str(output_dir / "after_artifact.json"),
         "debug_html": str(output_dir / "debug.html"),
+        "critic_report": str(output_dir / "critic_report.json"),
+        "threshold": threshold,
+        "threshold_ok": result.critic_report.total_score <= threshold,
+        "artifact_errors": artifact_errors,
+        "known_visual_issues": known_visual_issues,
+        "violations_after": [violation.to_dict() if hasattr(violation, "to_dict") else violation.__dict__ for violation in result.critic_report.violations],
     }
 
 
@@ -190,20 +332,71 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Export all fixture cases.",
     )
+    parser.add_argument(
+        "--allow-known-issues",
+        action="store_true",
+        help="Do not return non-zero when known non-fatal visual issues are present.",
+    )
     return parser.parse_args()
 
 
 def print_summary(rows: list[dict]) -> None:
-    print(f"{'case':<24} {'before':>8} {'after':>8} {'fatal_after':>12} {'improved':>10}")
+    print(
+        f"{'case':<24} {'before':>8} {'after':>8} {'fatal_after':>12} "
+        f"{'focus_regions':>14} {'zoom_presets':>13} {'hit_targets':>12} "
+        f"{'artifact_ok':>11} {'improved':>10}"
+    )
     for row in rows:
         print(
             f"{row['case']:<24} {row['before']:>8} {row['after']:>8} "
-            f"{row['fatal_after']:>12} {row['improved']:>10}"
+            f"{row['fatal_after']:>12} {row['focus_regions']:>14} "
+            f"{row['zoom_presets']:>13} {row['hit_targets']:>12} "
+            f"{row['artifact_ok']:>11} {row['improved']:>10}"
         )
     print("Output root:", OUTPUT_ROOT)
     for row in rows:
         print(f"{row['case']} artifact:", row["after_artifact"])
         print(f"{row['case']} debug:", row["debug_html"])
+
+
+def write_qa_summary(rows: list[dict]) -> Path:
+    summary_path = OUTPUT_ROOT / "qa_summary.json"
+    summary = {
+        "all_artifacts_ok": all(row["artifact_ok"] == "yes" for row in rows),
+        "any_fatal_after": any(row["fatal_after"] > 0 for row in rows),
+        "cases": {
+            row["case"]: {
+                "before": row["before"],
+                "after": row["after"],
+                "fatal_after": row["fatal_after"],
+                "threshold": row["threshold"],
+                "threshold_ok": row["threshold_ok"],
+                "improved": row["improved"],
+                "artifact_ok": row["artifact_ok"],
+                "artifact_errors": row["artifact_errors"],
+                "artifact_counts": {
+                    "focus_regions": row["focus_regions"],
+                    "zoom_presets": row["zoom_presets"],
+                    "hit_targets": row["hit_targets"],
+                },
+                "paths": {
+                    "before_svg": row["before_svg"],
+                    "after_svg": row["after_svg"],
+                    "after_artifact": row["after_artifact"],
+                    "debug_html": row["debug_html"],
+                    "critic_report": row["critic_report"],
+                },
+                "known_visual_issues": row["known_visual_issues"],
+                "violations_after": row["violations_after"],
+            }
+            for row in rows
+        },
+        "known_visual_issues": [
+            issue for row in rows for issue in row["known_visual_issues"]
+        ],
+    }
+    write_json(summary_path, summary)
+    return summary_path
 
 
 def main() -> int:
@@ -215,6 +408,12 @@ def main() -> int:
 
     rows = [run_case(case_name) for case_name in case_names]
     print_summary(rows)
+    summary_path = write_qa_summary(rows)
+    print("QA summary:", summary_path)
+    has_fatal = any(row["fatal_after"] > 0 for row in rows)
+    has_artifact_errors = any(row["artifact_errors"] for row in rows)
+    if has_artifact_errors or (has_fatal and not args.allow_known_issues):
+        return 1
     return 0
 
 

@@ -529,9 +529,8 @@ def plan_non_inverting_op_amp(circuit_ir: Any) -> LayoutPlan:
             input_net,
             [
                 _pin_ref_for_net(input_component, input_net) or "",
-                Point(3.6, 13.5),
-                Point(8.0, 13.5),
-                Point(8.0, plus_point.y if plus_point else 10.0),
+                Point(3.6, 16.5),
+                Point(plus_point.x if plus_point else 8.0, 16.5),
                 plus_ref,
             ],
         )
