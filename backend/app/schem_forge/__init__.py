@@ -6,6 +6,7 @@ from typing import Any
 
 from .agent import AgentResult, GeminiLLMClient, LayoutPatch, MockLLMClient, generate_beautiful_schematic
 from .adapters import circuit_problem_to_schem_forge_ir
+from .artifact import SchematicArtifact, build_schematic_artifact
 from .critic import CriticReport, critique_layout
 from .planner import (
     plan_bridge_or_wheatstone,
@@ -36,6 +37,7 @@ def compile_schematic_for_generator(
         "layout": result.layout,
         "geometry": result.geometry,
         "critic_report": result.critic_report,
+        "artifact": result.artifact,
         "iterations": result.iterations,
     }
 
@@ -47,6 +49,8 @@ __all__ = [
     "GeminiLLMClient",
     "LayoutPatch",
     "MockLLMClient",
+    "SchematicArtifact",
+    "build_schematic_artifact",
     "circuit_problem_to_schem_forge_ir",
     "compile_schematic_for_generator",
     "critique_layout",

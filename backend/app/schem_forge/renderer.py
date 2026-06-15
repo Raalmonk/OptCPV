@@ -5,6 +5,7 @@ from __future__ import annotations
 from html import escape
 from typing import Iterable
 
+from .artifact import ARTIFACT_VERSION
 from .models import (
     BBox,
     ComponentLayout,
@@ -264,6 +265,7 @@ def _draw_source_or_terminal(component: ComponentLayout, grid_size: int) -> str:
             parts.append(
                 f'<line x1="{center.x:.2f}" y1="{center.y:.2f}" x2="{point.x:.2f}" y2="{point.y:.2f}" '
                 f'class="component-stroke" data-pin-ref="{escape(component.id)}.{escape(pin.pin_name)}" '
+                f'data-component-id="{escape(component.id)}" '
                 f'data-net-name="{escape(pin.net_name)}"/>'
             )
     label = escape(component.display_label or component.id)
@@ -305,10 +307,11 @@ def _draw_component(component: ComponentLayout, grid_size: int) -> str:
             pin_anchors.append(
                 f'<circle cx="{point.x:.2f}" cy="{point.y:.2f}" r="2.2" class="pin-anchor" '
                 f'data-pin-ref="{escape(component.id)}.{escape(pin.pin_name)}" '
+                f'data-component-id="{escape(component.id)}" '
                 f'data-net-name="{escape(pin.net_name)}"/>'
             )
     return (
-        f'<g data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}">\n'
+        f'<g data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}" data-component-role="{escape(component.role or "")}">\n'
         f"{inner}\n"
         f"{chr(10).join(pin_anchors)}\n"
         "</g>"
@@ -335,12 +338,12 @@ def _segments_from_route(route: WireRoute, grid_size: int) -> list[WireSegment]:
 
 def _draw_wire_segments(segments: list[WireSegment]) -> str:
     parts: list[str] = []
-    for segment in segments:
+    for index, segment in enumerate(segments):
         parts.append(
             '<line '
             f'x1="{segment.start.x:.2f}" y1="{segment.start.y:.2f}" '
             f'x2="{segment.end.x:.2f}" y2="{segment.end.y:.2f}" '
-            f'class="wire" data-net-name="{escape(segment.net_name)}" data-wire-kind="{escape(segment.kind)}"/>'
+            f'class="wire" data-net-name="{escape(segment.net_name)}" data-wire-index="{index}" data-wire-kind="{escape(segment.kind)}"/>'
         )
     return "\n".join(parts)
 
@@ -392,7 +395,7 @@ def _draw_label(label: LabelLayout, bbox: BBox, grid_size: int) -> str:
     return (
         f'<text x="{point.x:.2f}" y="{point.y:.2f}" '
         f'text-anchor="{text_anchor}" class="layout-label" '
-        f'data-label-id="{escape(label.id)}">{escape(label.text)}</text>'
+        f'data-label-id="{escape(label.id)}" data-owner-id="{escape(label.owner_id or "")}">{escape(label.text)}</text>'
     )
 
 
@@ -441,8 +444,8 @@ def render_layout(layout_plan: LayoutPlan) -> RenderResult:
 """.strip()
 
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{max_x}" height="{max_y}" viewBox="0 0 {max_x} {max_y}" role="img" data-schem-forge-renderer="{escape(layout_plan.renderer)}" data-circuit-id="{escape(layout_plan.circuit_id)}">',
-        f"<desc>{escape(layout_plan.renderer)} rendering for circuit {escape(layout_plan.circuit_id)}</desc>",
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{max_x}" height="{max_y}" viewBox="0 0 {max_x} {max_y}" role="img" data-schem-forge-renderer="{escape(layout_plan.renderer)}" data-circuit-id="{escape(layout_plan.circuit_id)}" data-artifact-version="{escape(ARTIFACT_VERSION)}">',
+        f"<desc>SchemForge renderer {escape(layout_plan.renderer)} for circuit {escape(layout_plan.circuit_id)}</desc>",
         style,
         '<g class="wires">',
         _draw_wire_segments(wire_segments),

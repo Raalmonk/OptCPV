@@ -7,6 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .artifact import SchematicArtifact, build_schematic_artifact
 from .critic import CriticReport, critique_layout
 from .models import LabelLayout, LayoutPlan, Point, RenderGeometry, RenderResult
 from .planner import pin_layouts_for_component, plan_circuit
@@ -38,6 +39,7 @@ class AgentResult:
     svg: str
     geometry: RenderGeometry
     critic_report: CriticReport
+    artifact: SchematicArtifact
     iterations: int
     improved: bool
     debug_log: list[dict[str, Any]] = field(default_factory=list)
@@ -48,6 +50,7 @@ class AgentResult:
             "svg": self.svg,
             "geometry": self.geometry.to_dict(),
             "critic_report": self.critic_report.to_dict(),
+            "artifact": self.artifact.to_dict(),
             "iterations": self.iterations,
             "improved": self.improved,
             "debug_log": list(self.debug_log),
@@ -413,11 +416,18 @@ def generate_beautiful_schematic(
         if candidate_report.total_score >= previous_score:
             break
 
+    artifact = build_schematic_artifact(
+        circuit_ir,
+        best_plan,
+        best_render,
+        best_report,
+    )
     return AgentResult(
         layout=best_plan,
         svg=best_render.svg,
         geometry=best_render.geometry,
         critic_report=best_report,
+        artifact=artifact,
         iterations=iterations,
         improved=best_report.total_score < initial_score,
         debug_log=debug_log,

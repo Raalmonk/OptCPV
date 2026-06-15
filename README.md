@@ -2,6 +2,10 @@
 
 `schem_forge` is a lightweight circuit-to-schematic compiler for OptCPV/CiTT analog tutoring diagrams. It is not a generic graph drawing tool: its first job is to recognize common circuit motifs and produce textbook-style schematics with deterministic, topology-safe planning.
 
+Core product contract: **SVG 是展示层，artifact JSON 才是产品接口。**
+
+`generate_beautiful_schematic(circuit).artifact` returns a `SchematicArtifact` containing the display SVG plus structured metadata for zooming, focus, hit-testing, overlays, critic status, and provenance. The frontend should not parse raw SVG to rediscover circuit meaning; it should consume the artifact JSON.
+
 ## Why Not Generic Graph Layout
 
 Generic graph layout treats components as nodes and electrical nets as edges. That is the wrong abstraction for circuit tutoring diagrams. A good analog schematic needs semantic conventions: inputs on the left, outputs on the right, feedback loops above op-amps, ground at the bottom, symmetric instrumentation-amplifier stages, and clear orthogonal routing. `schem_forge` starts with canonical motif planners and only uses an LLM-style patch loop as a constrained polishing layer.
@@ -17,6 +21,24 @@ The core DSL lives in `backend/app/schem_forge/models.py` and separates:
 - labels: owner-aware text positions
 - critic geometry: rendered bboxes, pins, junctions, wire segments
 - renderer metadata: deterministic SVG renderer id
+
+## SchematicArtifact
+
+`backend/app/schem_forge/artifact.py` builds the tutor-facing artifact from the verified `LayoutPlan`, deterministic `RenderResult`, and `CriticReport`.
+
+The artifact includes:
+
+- `svg`: the display layer
+- `components`: bbox, labels, and pin artifacts for every component
+- `nets`: connected pins, wire segments, junctions, and net bboxes
+- `labels`: owner-aware label bboxes
+- `focus_regions`: semantic regions such as `differential_stage` or `feedback_network`
+- `zoom_presets`: `fit_all`, one preset per focus region, component presets, and major net presets
+- `hit_targets`: component, net, pin, label, and focus-region bboxes for probing
+- `overlays`: optional semantic highlight groups
+- `critic_report` and `provenance`
+
+Focus regions let a lesson step sync directly to schematic meaning. For example, an instrumentation-amplifier lesson can zoom to `focus_differential_stage`, highlight its op-amp and nets, then attach probes to hit targets without searching the SVG DOM for topology.
 
 ## Topology Safety
 
@@ -60,7 +82,47 @@ Generated files are written under `backend/app/schem_forge/generated/<case>/` an
 - `after.svg`
 - `before_plan.json`
 - `after_plan.json`
+- `before_artifact.json`
+- `after_artifact.json`
 - `critic_report.json`
+- `debug.html`
+
+`debug.html` is a standalone local viewer with buttons for zoom presets and focus regions.
+
+## Frontend Usage
+
+```js
+diagramPanel.innerHTML = artifact.svg;
+```
+
+```js
+function zoomToPreset(artifact, presetId) {
+  const preset = artifact.zoom_presets.find(p => p.id === presetId);
+  svg.setAttribute(
+    "viewBox",
+    `${preset.viewbox.x} ${preset.viewbox.y} ${preset.viewbox.width} ${preset.viewbox.height}`
+  );
+}
+
+function highlightFocusRegion(artifact, regionId) {
+  const region = artifact.focus_regions.find(r => r.id === regionId);
+  region.components.forEach(id =>
+    svg.querySelector(`[data-component-id="${id}"]`)?.classList.add("highlight")
+  );
+  region.nets.forEach(net =>
+    svg.querySelectorAll(`[data-net-name="${net}"]`).forEach(el => el.classList.add("highlight"))
+  );
+}
+```
+
+Lesson step example:
+
+```js
+zoomToPreset(artifact, "focus_differential_stage");
+highlightFocusRegion(artifact, "differential_stage");
+```
+
+Hit targets support component/net probes by using artifact bboxes directly instead of reverse-engineering layout from raw SVG.
 
 ## Supported Motifs
 
