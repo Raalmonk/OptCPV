@@ -109,7 +109,7 @@ class GeminiCircuitParser(CircuitParser):
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         load_local_dotenv()
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
         if not self.api_key:
             raise CircuitParserUnavailable("GEMINI_API_KEY or GOOGLE_API_KEY is not configured.")
 

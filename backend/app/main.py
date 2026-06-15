@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from backend.app.api_models import FromIRRequest, FromTextRequest
 from backend.app.services.artifact_service import (
+    UnsupportedStudentFacingDiagram,
     generate_schematic_payload,
     normalize_input_circuit,
 )
@@ -40,7 +41,7 @@ def viewer() -> str:
 
 
 @app.post("/v1/schematic/from-ir")
-def schematic_from_ir(request: FromIRRequest) -> dict[str, Any]:
+def schematic_from_ir(request: FromIRRequest) -> Any:
     try:
         circuit_ir = normalize_input_circuit(request.circuit, request.input_format)
         return generate_schematic_payload(
@@ -48,8 +49,24 @@ def schematic_from_ir(request: FromIRRequest) -> dict[str, Any]:
             max_iterations=request.max_iterations,
             use_mock_agent=request.use_mock_agent,
         )
+    except UnsupportedStudentFacingDiagram as exc:
+        return JSONResponse({"status": "unsupported_motif", "message": str(exc)}, status_code=422)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/schematic")
+async def schematic(request: Request) -> Any:
+    """Compatibility product endpoint backed by schem_forge, never fallback graph."""
+
+    payload = await request.json()
+    if isinstance(payload, dict) and "circuit" in payload:
+        request_model = FromIRRequest.model_validate(payload)
+    elif isinstance(payload, dict):
+        request_model = FromIRRequest(circuit=payload)
+    else:
+        raise HTTPException(status_code=400, detail="Request body must be a circuit object.")
+    return schematic_from_ir(request_model)
 
 
 @app.post("/v1/schematic/from-text")
@@ -79,6 +96,8 @@ def schematic_from_text(request: FromTextRequest) -> Any:
             max_iterations=request.max_iterations,
             use_mock_agent=request.use_mock_agent,
         )
+    except UnsupportedStudentFacingDiagram as exc:
+        return JSONResponse({"status": "unsupported_motif", "message": str(exc)}, status_code=422)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -115,6 +134,8 @@ async def schematic_from_image(request: Request) -> Any:
         circuit_ir = parse_image_to_ir(image_bytes, prompt=prompt)
         circuit_ir = normalize_input_circuit(circuit_ir, "auto")
         return generate_schematic_payload(circuit_ir)
+    except UnsupportedStudentFacingDiagram as exc:
+        return JSONResponse({"status": "unsupported_motif", "message": str(exc)}, status_code=422)
     except CircuitParserUnavailable as exc:
         return JSONResponse({"status": "vision_backend_unavailable", "message": str(exc)})
     except CircuitParserError as exc:

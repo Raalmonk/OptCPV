@@ -9,8 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import app
-from backend.app.schem_forge.citt_examples import citt_voltage_divider_payload
-from backend.app.schem_forge.examples import voltage_divider_ir
+from backend.app.schem_forge.citt_examples import (
+    citt_bme_instrumentation_amplifier_payload,
+    citt_voltage_divider_payload,
+)
+from backend.app.schem_forge.examples import non_inverting_op_amp_ir, voltage_divider_ir
 
 
 def _patch_testclient_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -76,6 +79,57 @@ def test_from_ir_accepts_citt_style_voltage_divider(client: TestClient) -> None:
     payload = response.json()
     _assert_ok_artifact(payload)
     assert payload["input_ir"]["motif"] == "voltage_divider"
+
+
+def test_schematic_endpoint_uses_schem_forge_for_op_amp(client: TestClient) -> None:
+    response = client.post("/schematic", json=non_inverting_op_amp_ir())
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_ok_artifact(payload)
+    assert payload["input_ir"]["motif"] == "non_inverting_op_amp"
+    assert "grid_fallback" not in " ".join(payload["warnings"])
+
+
+def test_schematic_endpoint_uses_schem_forge_for_bme_template(client: TestClient) -> None:
+    response = client.post(
+        "/schematic",
+        json={"input_format": "auto", "circuit": citt_bme_instrumentation_amplifier_payload()},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_ok_artifact(payload)
+    assert payload["input_ir"]["motif"] == "instrumentation_amplifier"
+    assert payload["critic"]["total_score"] == 0
+    assert "grid_fallback" not in " ".join(payload["warnings"])
+
+
+def test_schematic_endpoint_rejects_student_facing_grid_fallback(client: TestClient) -> None:
+    response = client.post(
+        "/schematic",
+        json={
+            "id": "unknown_demo",
+            "components": [
+                {
+                    "id": "X1",
+                    "type": "mystery_block",
+                    "display_label": "X1",
+                    "pins": {"a": "A", "b": "B"},
+                },
+                {
+                    "id": "X2",
+                    "type": "mystery_block",
+                    "display_label": "X2",
+                    "pins": {"a": "A", "b": "B"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["status"] == "unsupported_motif"
+    assert "grid fallback" in response.json()["message"]
 
 
 def test_from_text_recognizes_deterministic_voltage_divider(client: TestClient) -> None:

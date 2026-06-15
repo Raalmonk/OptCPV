@@ -13,7 +13,7 @@
 
 `planner.py` is the main quality layer. It detects known motifs and creates deterministic canonical layouts before any agent loop runs. This avoids the trap of starting from a crammed generic graph and hoping an LLM fixes it later.
 
-Current planners include instrumentation amplifier, non-inverting op-amp, RC low-pass, voltage divider, bridge/Wheatstone, and a simple grid fallback.
+Current student-facing planners include instrumentation amplifier, non-inverting op-amp, RC low-pass, voltage divider, and bridge/Wheatstone. The simple grid fallback exists only as an emergency diagnostic layout and must not be returned as an acceptable student-facing diagram.
 
 ## Renderer
 

@@ -55,7 +55,7 @@ For local debugging, you can put the key in `.env`; the API loads it automatical
 
 ```text
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-3.5-flash
 ```
 
 ## Generate From IR
@@ -129,6 +129,7 @@ Important artifact fields:
 
 - `GET /`
 - `GET /health`
+- `POST /schematic`
 - `POST /v1/schematic/from-ir`
 - `POST /v1/schematic/from-text`
 - `POST /v1/schematic/from-image`
@@ -179,6 +180,8 @@ The core compiler still lives in `backend/app/schem_forge`:
 - `circuit_problem_to_schem_forge_ir()`
 
 The API layer is deliberately thin. Text/image parsers may produce circuit IR only. They never produce SVG. Layout, SVG, zoom metadata, focus regions, and critic reports always come from schem_forge.
+
+The internal grid fallback is diagnostic only. Student-facing API endpoints reject unsupported motifs instead of returning fallback diagrams.
 
 ## Current Limitations
 

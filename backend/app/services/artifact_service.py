@@ -12,6 +12,10 @@ from backend.app.schem_forge.agent import generate_beautiful_schematic
 InputFormat = Literal["auto", "schem_forge_ir", "citt"]
 
 
+class UnsupportedStudentFacingDiagram(ValueError):
+    """Raised when only diagnostic fallback layout is available."""
+
+
 def normalize_input_circuit(circuit: dict[str, Any], input_format: InputFormat = "auto") -> dict[str, Any]:
     payload = deepcopy(circuit)
     components = payload.get("components")
@@ -48,6 +52,11 @@ def generate_schematic_payload(
         max_iterations=max_iterations,
         llm_client=llm_client,
     )
+    if any(warning == "motif: grid_fallback" for warning in result.layout.warnings):
+        raise UnsupportedStudentFacingDiagram(
+            "No student-facing schematic planner is available for this circuit. "
+            "The grid fallback is reserved for emergency diagnostics."
+        )
     return {
         "status": "ok",
         "artifact": result.artifact.to_dict(),
