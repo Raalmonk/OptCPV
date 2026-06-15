@@ -40,6 +40,7 @@ class AgentResult:
     critic_report: CriticReport
     iterations: int
     improved: bool
+    debug_log: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class AgentResult:
             "critic_report": self.critic_report.to_dict(),
             "iterations": self.iterations,
             "improved": self.improved,
+            "debug_log": list(self.debug_log),
         }
 
 
@@ -217,28 +219,106 @@ def _patch_has_operations(patch: LayoutPatch | dict[str, Any] | list[dict[str, A
 class MockLLMClient:
     """Deterministic polish client used by tests and local instrumentation."""
 
+    def _merge_patch(
+        self,
+        target: dict[str, list[dict[str, Any]]],
+        patch: dict[str, Any],
+    ) -> None:
+        for key in ("move_component", "move_label", "set_orientation", "set_wire_waypoints"):
+            value = patch.get(key)
+            if not value:
+                continue
+            if isinstance(value, dict):
+                target[key].append(value)
+            else:
+                target[key].extend(value)
+
     def propose_patch(
         self,
         layout_plan: LayoutPlan,
         critic_report: CriticReport,
         rendered: RenderResult,
     ) -> LayoutPatch:
-        label_ids: set[str] = set()
-        for violation in critic_report.violations:
-            if violation.code.startswith("label_"):
-                label_ids.update(entity for entity in violation.entities if entity.startswith("label_"))
-
-        moves: list[dict[str, Any]] = []
+        patch: dict[str, list[dict[str, Any]]] = {
+            "move_component": [],
+            "move_label": [],
+            "set_orientation": [],
+            "set_wire_waypoints": [],
+        }
+        components = {component.id: component for component in layout_plan.components}
         labels = {label.id: label for label in layout_plan.labels}
-        for label_id in sorted(label_ids):
-            label = labels.get(label_id)
-            if not label:
+        input_xs = [
+            component.grid_x
+            for component in layout_plan.components
+            if (component.role or "").lower() in {"input", "input_source", "input_terminal", "sensor"}
+            or component.type.lower() in {"input", "input_terminal"}
+        ]
+
+        for violation in critic_report.violations:
+            if violation.suggested_patch:
+                self._merge_patch(patch, violation.suggested_patch)
                 continue
-            if label_id == "label_RG" or label.text.upper().startswith("RG"):
-                moves.append({"id": label_id, "grid_x": 3.2, "grid_y": label.grid_y})
-            else:
-                moves.append({"id": label_id, "grid_x": label.grid_x, "grid_y": label.grid_y - 1.1})
-        return LayoutPatch(move_label=moves)
+
+            if violation.code.startswith("label_"):
+                for label_id in violation.entities:
+                    label = labels.get(label_id)
+                    if not label:
+                        continue
+                    if label.text.upper().startswith("RG"):
+                        patch["move_label"].append(
+                            {"id": label_id, "grid_x": label.grid_x - 1.8, "grid_y": label.grid_y}
+                        )
+                    else:
+                        patch["move_label"].append(
+                            {"id": label_id, "grid_x": label.grid_x, "grid_y": label.grid_y - 1.1}
+                        )
+            elif violation.code == "opamp_not_facing_right":
+                for component_id in violation.entities:
+                    if component_id in components:
+                        patch["set_orientation"].append(
+                            {"id": component_id, "orientation": "right"}
+                        )
+            elif violation.code == "ground_not_down":
+                for component_id in violation.entities:
+                    if component_id in components:
+                        patch["set_orientation"].append(
+                            {"id": component_id, "orientation": "down"}
+                        )
+            elif violation.code == "output_not_right_of_input":
+                min_output_x = max(input_xs, default=0.0) + 8.0
+                for component in components.values():
+                    role = (component.role or "").lower()
+                    if role == "output" or component.type.lower() == "output":
+                        patch["move_component"].append(
+                            {
+                                "id": component.id,
+                                "grid_x": max(component.grid_x, min_output_x),
+                                "grid_y": component.grid_y,
+                            }
+                        )
+            elif violation.code == "wire_crossing" and set(violation.entities) == {"N_GAIN_TOP", "VINP"}:
+                vinp_route = next((wire for wire in layout_plan.wires if wire.net_name == "VINP"), None)
+                if vinp_route and len(vinp_route.waypoints) >= 2:
+                    start = vinp_route.waypoints[0]
+                    end = vinp_route.waypoints[-1]
+                    patch["set_wire_waypoints"].append(
+                        {
+                            "net_name": "VINP",
+                            "waypoints": [
+                                {"x": start.x, "y": start.y},
+                                {"x": start.x, "y": 2.0},
+                                {"x": end.x, "y": 2.0},
+                                {"x": end.x, "y": end.y},
+                            ],
+                        }
+                    )
+
+        return LayoutPatch(
+            move_component=patch["move_component"],
+            move_label=patch["move_label"],
+            set_orientation=patch["set_orientation"],
+            set_wire_waypoints=patch["set_wire_waypoints"],
+        )
 
 
 class GeminiLLMClient:
@@ -279,6 +359,9 @@ def generate_beautiful_schematic(
     best_render = current_render
     best_report = current_report
     iterations = 0
+    debug_log: list[dict[str, Any]] = [
+        {"iteration": 0, "score": current_report.total_score, "event": "initial"}
+    ]
 
     for iteration in range(max_iterations):
         if best_report.total_score <= ACCEPTABLE_SCORE:
@@ -289,15 +372,36 @@ def generate_beautiful_schematic(
         iterations = iteration + 1
         patch = llm_client.propose_patch(current_plan, current_report, current_render)
         if not _patch_has_operations(patch):
+            debug_log.append(
+                {"iteration": iterations, "score": current_report.total_score, "event": "no_patch"}
+            )
             break
         try:
             candidate_plan = apply_layout_patch(circuit_ir, current_plan, patch)
-        except (ElectricalTopologyError, LayoutPatchError):
+        except (ElectricalTopologyError, LayoutPatchError) as exc:
+            debug_log.append(
+                {
+                    "iteration": iterations,
+                    "score": current_report.total_score,
+                    "event": "patch_rejected",
+                    "error": str(exc),
+                    "patch": _as_patch_dict(patch),
+                }
+            )
             break
 
         candidate_render = render_layout(candidate_plan)
         candidate_report = critique_layout(candidate_plan, candidate_render)
         previous_score = current_report.total_score
+        debug_log.append(
+            {
+                "iteration": iterations,
+                "previous_score": previous_score,
+                "candidate_score": candidate_report.total_score,
+                "event": "patch_evaluated",
+                "patch": _as_patch_dict(patch),
+            }
+        )
         if candidate_report.total_score <= best_report.total_score:
             current_plan = candidate_plan
             current_render = candidate_render
@@ -316,4 +420,5 @@ def generate_beautiful_schematic(
         critic_report=best_report,
         iterations=iterations,
         improved=best_report.total_score < initial_score,
+        debug_log=debug_log,
     )

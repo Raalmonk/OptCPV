@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Local smoke test for schem_forge instrumentation-amplifier planning."""
+"""Export local schem_forge SVG fixtures and critic reports."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -14,119 +15,19 @@ if str(REPO_ROOT) not in sys.path:
 
 from backend.app.schem_forge import MockLLMClient, generate_beautiful_schematic
 from backend.app.schem_forge.critic import critique_layout
-from backend.app.schem_forge.planner import plan_instrumentation_amplifier
+from backend.app.schem_forge.examples import EXAMPLE_CASES, instrumentation_amp_ir
+from backend.app.schem_forge.planner import plan_circuit
 from backend.app.schem_forge.renderer import render_layout
 from backend.app.schem_forge.verifier import verify_equivalence
 
 
-OUTPUT_DIR = REPO_ROOT / "backend" / "app" / "schem_forge" / "generated"
+OUTPUT_ROOT = REPO_ROOT / "backend" / "app" / "schem_forge" / "generated"
 
 
 def build_instrumentation_amplifier_ir() -> dict:
-    return {
-        "id": "instrumentation_amp_fixture",
-        "motif": "instrumentation_amplifier",
-        "components": [
-            {
-                "id": "VINP",
-                "type": "input",
-                "role": "sensor",
-                "display_label": "VIN+",
-                "pins": {"out": "VINP"},
-            },
-            {
-                "id": "VINN",
-                "type": "input",
-                "role": "sensor",
-                "display_label": "VIN-",
-                "pins": {"out": "VINN"},
-            },
-            {
-                "id": "U1",
-                "type": "op_amp",
-                "role": "input_buffer_opamp",
-                "display_label": "U1",
-                "pins": {"+": "VINP", "-": "N_GAIN_TOP", "out": "BUF_TOP"},
-            },
-            {
-                "id": "U2",
-                "type": "op_amp",
-                "role": "input_buffer_opamp",
-                "display_label": "U2",
-                "pins": {"+": "VINN", "-": "N_GAIN_BOTTOM", "out": "BUF_BOTTOM"},
-            },
-            {
-                "id": "U3",
-                "type": "op_amp",
-                "role": "differential_stage_opamp",
-                "display_label": "U3",
-                "pins": {"-": "DIFF_NEG", "+": "DIFF_POS", "out": "VOUT"},
-            },
-            {
-                "id": "RF1",
-                "type": "resistor",
-                "role": "feedback_resistor",
-                "value_label": "RF1",
-                "pins": {"a": "N_GAIN_TOP", "b": "BUF_TOP"},
-            },
-            {
-                "id": "RF2",
-                "type": "resistor",
-                "role": "feedback_resistor",
-                "value_label": "RF2",
-                "pins": {"a": "N_GAIN_BOTTOM", "b": "BUF_BOTTOM"},
-            },
-            {
-                "id": "RG",
-                "type": "resistor",
-                "role": "gain_resistor",
-                "value_label": "RG",
-                "pins": {"a": "N_GAIN_TOP", "b": "N_GAIN_BOTTOM"},
-            },
-            {
-                "id": "R1",
-                "type": "resistor",
-                "role": "diff_input_resistor",
-                "value_label": "R1",
-                "pins": {"a": "BUF_TOP", "b": "DIFF_NEG"},
-            },
-            {
-                "id": "R2",
-                "type": "resistor",
-                "role": "diff_input_resistor",
-                "value_label": "R2",
-                "pins": {"a": "BUF_BOTTOM", "b": "DIFF_POS"},
-            },
-            {
-                "id": "RF3",
-                "type": "resistor",
-                "role": "feedback_resistor",
-                "value_label": "RF3",
-                "pins": {"a": "DIFF_NEG", "b": "VOUT"},
-            },
-            {
-                "id": "RREF",
-                "type": "resistor",
-                "role": "ground_resistor",
-                "value_label": "RREF",
-                "pins": {"a": "DIFF_POS", "b": "GND"},
-            },
-            {
-                "id": "VOUT",
-                "type": "output",
-                "role": "output",
-                "display_label": "VOUT",
-                "pins": {"in": "VOUT"},
-            },
-            {
-                "id": "GND",
-                "type": "ground",
-                "role": "ground",
-                "display_label": "GND",
-                "pins": {"gnd": "GND"},
-            },
-        ],
-    }
+    """Backward-compatible fixture hook for older local imports."""
+
+    return instrumentation_amp_ir()
 
 
 def write_text(path: Path, text: str) -> None:
@@ -137,25 +38,15 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def main() -> int:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    circuit_ir = build_instrumentation_amplifier_ir()
+def run_case(case_name: str) -> dict:
+    output_dir = OUTPUT_ROOT / case_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    circuit_ir = EXAMPLE_CASES[case_name]()
 
-    before_plan = plan_instrumentation_amplifier(circuit_ir)
+    before_plan = plan_circuit(circuit_ir)
     verify_equivalence(circuit_ir, before_plan)
     before_render = render_layout(before_plan)
     before_report = critique_layout(before_plan, before_render)
-
-    write_text(OUTPUT_DIR / "before.svg", before_render.svg)
-    write_json(OUTPUT_DIR / "before_plan.json", before_plan.to_dict())
-
-    print("Before critic score:", before_report.total_score)
-    if before_report.violations:
-        print("Before violations:")
-        for violation in before_report.violations:
-            print(f"- {violation.code}: {violation.message} (+{violation.penalty})")
-    else:
-        print("Before violations: none")
 
     result = generate_beautiful_schematic(
         circuit_ir,
@@ -164,19 +55,64 @@ def main() -> int:
     )
     verify_equivalence(circuit_ir, result.layout)
 
-    write_text(OUTPUT_DIR / "after.svg", result.svg)
-    write_json(OUTPUT_DIR / "after_plan.json", result.layout.to_dict())
+    write_text(output_dir / "before.svg", before_render.svg)
+    write_text(output_dir / "after.svg", result.svg)
+    write_json(output_dir / "before_plan.json", before_plan.to_dict())
+    write_json(output_dir / "after_plan.json", result.layout.to_dict())
     write_json(
-        OUTPUT_DIR / "critic_report.json",
+        output_dir / "critic_report.json",
         {
             "before": before_report.to_dict(),
             "after": result.critic_report.to_dict(),
+            "agent_debug_log": result.debug_log,
         },
     )
 
-    print("After critic score:", result.critic_report.total_score)
-    print("Agent iterations:", result.iterations)
-    print("Output directory:", OUTPUT_DIR)
+    return {
+        "case": case_name,
+        "before": before_report.total_score,
+        "after": result.critic_report.total_score,
+        "fatal_after": result.critic_report.fatal_count,
+        "improved": "yes" if result.critic_report.total_score < before_report.total_score else "no",
+        "output_dir": str(output_dir),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        choices=sorted(EXAMPLE_CASES),
+        default=None,
+        help="Single fixture case to export.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Export all fixture cases.",
+    )
+    return parser.parse_args()
+
+
+def print_summary(rows: list[dict]) -> None:
+    print(f"{'case':<24} {'before':>8} {'after':>8} {'fatal_after':>12} {'improved':>10}")
+    for row in rows:
+        print(
+            f"{row['case']:<24} {row['before']:>8} {row['after']:>8} "
+            f"{row['fatal_after']:>12} {row['improved']:>10}"
+        )
+    print("Output root:", OUTPUT_ROOT)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.all:
+        case_names = sorted(EXAMPLE_CASES)
+    else:
+        case_names = [args.case or "instrumentation_amp"]
+
+    rows = [run_case(case_name) for case_name in case_names]
+    print_summary(rows)
     return 0
 
 

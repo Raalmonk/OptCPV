@@ -16,6 +16,8 @@ class CriticViolation:
     penalty: int
     severity: str
     entities: list[str] = field(default_factory=list)
+    coordinates: dict[str, float] | None = None
+    suggested_patch: dict[str, Any] | None = None
 
 
 @dataclass
@@ -25,6 +27,9 @@ class CriticReport:
     fatal_count: int
     warning_count: int
     suggestions: list[str]
+    breakdown: dict[str, int] = field(default_factory=dict)
+    component_bboxes: dict[str, dict[str, float]] = field(default_factory=dict)
+    wire_segment_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +37,9 @@ class CriticReport:
             "violations": [asdict(violation) for violation in self.violations],
             "fatal_count": self.fatal_count,
             "warning_count": self.warning_count,
+            "breakdown": dict(self.breakdown),
+            "component_bboxes": dict(self.component_bboxes),
+            "wire_segment_count": self.wire_segment_count,
             "suggestions": list(self.suggestions),
         }
 
@@ -187,6 +195,8 @@ def _add(
     penalty: int,
     entities: list[str],
     suggestion: str | None = None,
+    coordinates: dict[str, float] | None = None,
+    suggested_patch: dict[str, Any] | None = None,
 ) -> None:
     severity = "fatal" if penalty >= 800 else "warning"
     violations.append(
@@ -196,6 +206,8 @@ def _add(
             penalty=penalty,
             severity=severity,
             entities=entities,
+            coordinates=coordinates,
+            suggested_patch=suggested_patch,
         )
     )
     if suggestion and suggestion not in suggestions:
@@ -211,6 +223,11 @@ def critique_layout(
     geometry = rendered.geometry if isinstance(rendered, RenderResult) else rendered
     components_by_id = {component.id: component for component in layout_plan.components}
     centers = _component_centers(layout_plan)
+    labels_by_id = {label.id: label for label in layout_plan.labels}
+    component_bbox_summary = {
+        component_id: bbox.to_dict()
+        for component_id, bbox in sorted(geometry.component_bboxes.items())
+    }
     violations: list[CriticViolation] = []
     suggestions: list[str] = []
 
@@ -226,6 +243,10 @@ def critique_layout(
                     1000,
                     [left_id, right_id],
                     "Move overlapping components to separate grid slots.",
+                    coordinates={
+                        "x": max(left_bbox.x, right_bbox.x),
+                        "y": max(left_bbox.y, right_bbox.y),
+                    },
                 )
             else:
                 distance = _bbox_distance(left_bbox, right_bbox)
@@ -238,6 +259,10 @@ def critique_layout(
                         50,
                         [left_id, right_id],
                         "Increase spacing between neighboring component bodies.",
+                        coordinates={
+                            "x": (left_bbox.x + right_bbox.x) / 2.0,
+                            "y": (left_bbox.y + right_bbox.y) / 2.0,
+                        },
                     )
 
     for segment in geometry.wire_segments:
@@ -250,6 +275,10 @@ def critique_layout(
                 100,
                 [segment.net_name],
                 "Use orthogonal wire waypoints.",
+                coordinates={
+                    "x": (segment.start.x + segment.end.x) / 2.0,
+                    "y": (segment.start.y + segment.end.y) / 2.0,
+                },
             )
 
         for component_id, bbox in geometry.component_bboxes.items():
@@ -279,11 +308,16 @@ def critique_layout(
                     800,
                     [segment.net_name, component_id],
                     "Route wires around component bodies except at their pin anchors.",
+                    coordinates={
+                        "x": (segment.start.x + segment.end.x) / 2.0,
+                        "y": (segment.start.y + segment.end.y) / 2.0,
+                    },
                 )
 
     for label_id, label_bbox in sorted(geometry.label_bboxes.items()):
         for component_id, component_bbox in sorted(geometry.component_bboxes.items()):
             if label_bbox.intersects(component_bbox):
+                label = labels_by_id.get(label_id)
                 _add(
                     violations,
                     suggestions,
@@ -292,9 +326,20 @@ def critique_layout(
                     300,
                     [label_id, component_id],
                     "Move labels outside component bodies.",
+                    coordinates={"x": label_bbox.x, "y": label_bbox.y},
+                    suggested_patch={
+                        "move_label": [
+                            {
+                                "id": label_id,
+                                "grid_x": (label.grid_x + 1.4) if label else label_bbox.x,
+                                "grid_y": label.grid_y if label else label_bbox.y,
+                            }
+                        ]
+                    },
                 )
         for segment in geometry.wire_segments:
             if _segment_hits_bbox(segment, label_bbox):
+                label = labels_by_id.get(label_id)
                 _add(
                     violations,
                     suggestions,
@@ -303,6 +348,16 @@ def critique_layout(
                     250,
                     [label_id, segment.net_name],
                     "Offset labels away from routed wires.",
+                    coordinates={"x": label_bbox.x, "y": label_bbox.y},
+                    suggested_patch={
+                        "move_label": [
+                            {
+                                "id": label_id,
+                                "grid_x": label.grid_x if label else label_bbox.x,
+                                "grid_y": (label.grid_y - 1.1) if label else label_bbox.y,
+                            }
+                        ]
+                    },
                 )
 
     for component in layout_plan.components:
@@ -315,6 +370,12 @@ def critique_layout(
                 200,
                 [component.id],
                 "Orient op-amps to the right for textbook signal flow.",
+                coordinates={"x": centers[component.id].x, "y": centers[component.id].y},
+                suggested_patch={
+                    "set_orientation": [
+                        {"id": component.id, "orientation": "right"}
+                    ]
+                },
             )
         if _is_ground(component):
             if component.orientation != "down":
@@ -326,6 +387,12 @@ def critique_layout(
                     200,
                     [component.id],
                     "Orient ground symbols down.",
+                    coordinates={"x": centers[component.id].x, "y": centers[component.id].y},
+                    suggested_patch={
+                        "set_orientation": [
+                            {"id": component.id, "orientation": "down"}
+                        ]
+                    },
                 )
             for pin in component.pins:
                 pin_ref = f"{component.id}.{pin.pin_name}"
@@ -345,6 +412,16 @@ def critique_layout(
                         200,
                         [component.id, pin.net_name],
                         "Place ground symbols below the node they reference.",
+                        coordinates={"x": ground_point.x, "y": ground_point.y},
+                        suggested_patch={
+                            "move_component": [
+                                {
+                                    "id": component.id,
+                                    "grid_x": component.grid_x,
+                                    "grid_y": component.grid_y + 2.0,
+                                }
+                            ]
+                        },
                     )
 
     input_centers = [centers[item.id] for item in layout_plan.components if _is_input(item)]
@@ -359,6 +436,10 @@ def critique_layout(
                 150,
                 ["inputs", "outputs"],
                 "Place input sources on the left and output terminals on the right.",
+                coordinates={
+                    "x": min(point.x for point in output_centers),
+                    "y": min(point.y for point in output_centers),
+                },
             )
 
     opamps = [component for component in layout_plan.components if _is_opamp(component)]
@@ -384,6 +465,7 @@ def critique_layout(
                         150,
                         [resistor.id, opamp.id],
                         "Place feedback resistors above their op-amps.",
+                        coordinates={"x": centers[resistor.id].x, "y": centers[resistor.id].y},
                     )
 
     wire_segments = geometry.wire_segments
@@ -400,11 +482,18 @@ def critique_layout(
                     100,
                     [left.net_name, right.net_name],
                     "Separate unrelated nets with additional orthogonal waypoints.",
+                    coordinates={
+                        "x": (left.start.x + left.end.x + right.start.x + right.end.x) / 4.0,
+                        "y": (left.start.y + left.end.y + right.start.y + right.end.y) / 4.0,
+                    },
                 )
 
     total_score = sum(violation.penalty for violation in violations)
     fatal_count = sum(1 for violation in violations if violation.severity == "fatal")
     warning_count = len(violations) - fatal_count
+    breakdown: dict[str, int] = {}
+    for violation in violations:
+        breakdown[violation.code] = breakdown.get(violation.code, 0) + violation.penalty
 
     if total_score == 0:
         suggestions.append("Layout follows the zero-penalty schematic conventions.")
@@ -416,5 +505,8 @@ def critique_layout(
         violations=violations,
         fatal_count=fatal_count,
         warning_count=warning_count,
+        breakdown=breakdown,
+        component_bboxes=component_bbox_summary,
+        wire_segment_count=len(geometry.wire_segments),
         suggestions=suggestions,
     )

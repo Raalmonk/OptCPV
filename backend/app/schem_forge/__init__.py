@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .agent import AgentResult, GeminiLLMClient, LayoutPatch, MockLLMClient, generate_beautiful_schematic
+from .adapters import circuit_problem_to_schem_forge_ir
 from .critic import CriticReport, critique_layout
 from .planner import (
     plan_bridge_or_wheatstone,
@@ -46,6 +47,7 @@ __all__ = [
     "GeminiLLMClient",
     "LayoutPatch",
     "MockLLMClient",
+    "circuit_problem_to_schem_forge_ir",
     "compile_schematic_for_generator",
     "critique_layout",
     "generate_beautiful_schematic",

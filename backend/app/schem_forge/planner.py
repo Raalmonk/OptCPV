@@ -488,12 +488,99 @@ def plan_non_inverting_op_amp(circuit_ir: Any) -> LayoutPlan:
         if gain:
             placements[gain["id"]] = (7.0, 12.0, "down")
 
-    labels = _add_default_labels(normalized, placements)
-    return _finalize_with_generic_routes(
+    special_labels: dict[str, tuple[float, float]] = {}
+    if opamp:
+        out_net = opamp["pins"].get(_pin_name_by_kind(opamp, "output") or "")
+        inv_net = opamp["pins"].get(_pin_name_by_kind(opamp, "inverting") or "")
+        ground_net = _ground_net(normalized)
+        feedback = _resistor_between(normalized, out_net, inv_net, "feedback")
+        gain = _resistor_between(normalized, inv_net, ground_net, "gain")
+        if feedback:
+            special_labels[feedback["id"]] = (10.0, 3.8)
+        if gain:
+            special_labels[gain["id"]] = (5.7, 12.0)
+
+    labels = _add_default_labels(normalized, placements, special_labels)
+    provisional = _build_plan(
+        circuit_ir,
+        dict(placements),
+        labels,
+        wires=[],
+        warnings=["motif: non_inverting_op_amp"],
+    )
+    pin_points = _pin_points_grid(provisional.components)
+    routes_by_net: dict[str, WireRoute] = {}
+
+    def add_route(net_name: str | None, sequence: list[str | Point]) -> None:
+        if not net_name or net_name not in normalized["net_to_pins"]:
+            return
+        routes_by_net[net_name] = _route_from_sequence(
+            net_name,
+            normalized["net_to_pins"][net_name],
+            pin_points,
+            sequence,
+        )
+
+    if opamp and input_component:
+        plus_ref = _pin_ref_by_kind(opamp, "non_inverting") or ""
+        plus_point = pin_points.get(plus_ref)
+        input_net = opamp["pins"].get(_pin_name_by_kind(opamp, "non_inverting") or "")
+        add_route(
+            input_net,
+            [
+                _pin_ref_for_net(input_component, input_net) or "",
+                Point(3.6, 13.5),
+                Point(8.0, 13.5),
+                Point(8.0, plus_point.y if plus_point else 10.0),
+                plus_ref,
+            ],
+        )
+
+    if opamp:
+        out_net = opamp["pins"].get(_pin_name_by_kind(opamp, "output") or "")
+        inv_net = opamp["pins"].get(_pin_name_by_kind(opamp, "inverting") or "")
+        ground_net = _ground_net(normalized)
+        feedback = _resistor_between(normalized, out_net, inv_net, "feedback")
+        gain = _resistor_between(normalized, inv_net, ground_net, "gain")
+        if feedback and gain:
+            add_route(
+                inv_net,
+                [
+                    _pin_ref_for_net(feedback, inv_net) or "",
+                    Point(8.0, 5.0),
+                    _pin_ref_by_kind(opamp, "inverting") or "",
+                    Point(7.0, 8.0),
+                    _pin_ref_for_net(gain, inv_net) or "",
+                ],
+            )
+        if feedback and output_component:
+            add_route(
+                out_net,
+                [
+                    _pin_ref_for_net(feedback, out_net) or "",
+                    Point(12.0, 5.0),
+                    _pin_ref_by_kind(opamp, "output") or "",
+                    _pin_ref_for_net(output_component, out_net) or "",
+                ],
+            )
+        if gain and ground_component:
+            add_route(
+                ground_net,
+                [
+                    _pin_ref_for_net(gain, ground_net) or "",
+                    _pin_ref_for_net(ground_component, ground_net) or "",
+                ],
+            )
+
+    for route in _build_generic_routes(normalized["net_to_pins"], pin_points):
+        routes_by_net.setdefault(route.net_name, route)
+
+    return _build_plan(
         circuit_ir,
         placements,
         labels,
-        ["motif: non_inverting_op_amp"],
+        wires=[routes_by_net[net] for net in sorted(routes_by_net)],
+        warnings=["motif: non_inverting_op_amp"],
     )
 
 
@@ -631,7 +718,7 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
     if r_ref:
         special_labels[r_ref["id"]] = (22.1, 16.0)
     if gain:
-        special_labels[gain["id"]] = (5.0, 10.0)
+        special_labels[gain["id"]] = (3.2, 10.0)
     labels = _add_default_labels(normalized, placements, special_labels)
 
     provisional = _build_plan(
@@ -657,11 +744,16 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
             routes_by_net[net_name] = route
 
     if top_buffer and top_input:
+        top_plus = _pin_ref_by_kind(top_buffer, "non_inverting") or ""
+        top_plus_point = pin_points.get(top_plus)
         add_route(
             top_buffer["pins"].get(_pin_name_by_kind(top_buffer, "non_inverting") or ""),
             [
                 _pin_ref_for_net(top_input, top_buffer["pins"].get(_pin_name_by_kind(top_buffer, "non_inverting") or "")) or "",
-                _pin_ref_by_kind(top_buffer, "non_inverting") or "",
+                Point(3.6, 4.2),
+                Point(6.7, 4.2),
+                Point(6.7, top_plus_point.y if top_plus_point else 7.0),
+                top_plus,
             ],
         )
     if bottom_buffer and bottom_input:
@@ -791,7 +883,12 @@ def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
         placements[ground["id"]] = (12.0, 16.0, "down")
     if output:
         placements[output["id"]] = (17.0, 9.0, "right")
-    labels = _add_default_labels(normalized, placements)
+    special_labels: dict[str, tuple[float, float]] = {}
+    if resistor:
+        special_labels[resistor["id"]] = (8.0, 7.8)
+    if capacitor:
+        special_labels[capacitor["id"]] = (13.4, 12.0)
+    labels = _add_default_labels(normalized, placements, special_labels)
     return _finalize_with_generic_routes(
         circuit_ir,
         placements,
@@ -817,7 +914,12 @@ def plan_voltage_divider(circuit_ir: Any) -> LayoutPlan:
         placements[output["id"]] = (15.0, 9.5, "right")
     if ground:
         placements[ground["id"]] = (9.0, 16.0, "down")
-    labels = _add_default_labels(normalized, placements)
+    special_labels: dict[str, tuple[float, float]] = {}
+    if resistors:
+        special_labels[resistors[0]["id"]] = (10.3, 7.0)
+    if len(resistors) > 1:
+        special_labels[resistors[1]["id"]] = (10.3, 12.0)
+    labels = _add_default_labels(normalized, placements, special_labels)
     return _finalize_with_generic_routes(
         circuit_ir,
         placements,

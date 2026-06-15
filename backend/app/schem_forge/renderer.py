@@ -163,11 +163,12 @@ def _draw_opamp(component: ComponentLayout, grid_size: int) -> str:
         if not pin_point:
             continue
         kind = _pin_kind(pin.pin_name)
+        sign_offset = 0.58 * g if component.orientation == "right" else -0.58 * g
         if kind == "plus":
-            text_point = Point(pin_point.x + 0.45 * g, pin_point.y)
+            text_point = Point(pin_point.x + sign_offset, pin_point.y)
             parts.append(f'<text x="{text_point.x:.2f}" y="{text_point.y:.2f}" class="pin-mark">+</text>')
         elif kind == "minus":
-            text_point = Point(pin_point.x + 0.45 * g, pin_point.y)
+            text_point = Point(pin_point.x + sign_offset, pin_point.y)
             parts.append(f'<text x="{text_point.x:.2f}" y="{text_point.y:.2f}" class="pin-mark">-</text>')
     label = escape(component.display_label or component.id)
     parts.append(f'<text x="{center.x:.2f}" y="{center.y:.2f}" class="component-label">{label}</text>')
@@ -243,11 +244,27 @@ def _draw_source_or_terminal(component: ComponentLayout, grid_size: int) -> str:
     parts = [
         f'<circle cx="{center.x:.2f}" cy="{center.y:.2f}" r="{radius:.2f}" class="component-fill" data-node-id="{escape(component.id)}.node"/>'
     ]
+    if _is_input(component):
+        arrow = [
+            Point(center.x - 1.05 * g, center.y - 0.32 * g),
+            Point(center.x - 0.35 * g, center.y),
+            Point(center.x - 1.05 * g, center.y + 0.32 * g),
+        ]
+        parts.append(f'<polyline points="{_points_attr(arrow)}" class="terminal-arrow"/>')
+    elif _is_output(component):
+        arrow = [
+            Point(center.x + 0.35 * g, center.y - 0.32 * g),
+            Point(center.x + 1.05 * g, center.y),
+            Point(center.x + 0.35 * g, center.y + 0.32 * g),
+        ]
+        parts.append(f'<polyline points="{_points_attr(arrow)}" class="terminal-arrow"/>')
     for pin in component.pins:
         point = _pin_point(component, pin.pin_name, grid_size)
         if point:
             parts.append(
-                f'<line x1="{center.x:.2f}" y1="{center.y:.2f}" x2="{point.x:.2f}" y2="{point.y:.2f}" class="component-stroke"/>'
+                f'<line x1="{center.x:.2f}" y1="{center.y:.2f}" x2="{point.x:.2f}" y2="{point.y:.2f}" '
+                f'class="component-stroke" data-pin-ref="{escape(component.id)}.{escape(pin.pin_name)}" '
+                f'data-net-name="{escape(pin.net_name)}"/>'
             )
     label = escape(component.display_label or component.id)
     if _is_input(component):
@@ -281,7 +298,21 @@ def _draw_component(component: ComponentLayout, grid_size: int) -> str:
         inner = _draw_source_or_terminal(component, grid_size)
     else:
         inner = _draw_default(component, grid_size)
-    return f'<g data-component-id="{escape(component.id)}">\n{inner}\n</g>'
+    pin_anchors = []
+    for pin in component.pins:
+        point = _pin_point(component, pin.pin_name, grid_size)
+        if point:
+            pin_anchors.append(
+                f'<circle cx="{point.x:.2f}" cy="{point.y:.2f}" r="2.2" class="pin-anchor" '
+                f'data-pin-ref="{escape(component.id)}.{escape(pin.pin_name)}" '
+                f'data-net-name="{escape(pin.net_name)}"/>'
+            )
+    return (
+        f'<g data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}">\n'
+        f"{inner}\n"
+        f"{chr(10).join(pin_anchors)}\n"
+        "</g>"
+    )
 
 
 def _segments_from_route(route: WireRoute, grid_size: int) -> list[WireSegment]:
@@ -309,7 +340,7 @@ def _draw_wire_segments(segments: list[WireSegment]) -> str:
             '<line '
             f'x1="{segment.start.x:.2f}" y1="{segment.start.y:.2f}" '
             f'x2="{segment.end.x:.2f}" y2="{segment.end.y:.2f}" '
-            f'class="wire" data-net-name="{escape(segment.net_name)}"/>'
+            f'class="wire" data-net-name="{escape(segment.net_name)}" data-wire-kind="{escape(segment.kind)}"/>'
         )
     return "\n".join(parts)
 
@@ -383,6 +414,14 @@ def render_layout(layout_plan: LayoutPlan) -> RenderResult:
         label.id: _label_bbox(label, layout_plan.grid_size)
         for label in layout_plan.labels
     }
+    max_x = layout_plan.canvas_width
+    max_y = layout_plan.canvas_height
+    for bbox in list(component_bboxes.values()) + list(label_bboxes.values()):
+        max_x = max(max_x, int(bbox.right + 40))
+        max_y = max(max_y, int(bbox.bottom + 40))
+    for segment in wire_segments:
+        max_x = max(max_x, int(max(segment.start.x, segment.end.x) + 40))
+        max_y = max(max_y, int(max(segment.start.y, segment.end.y) + 40))
 
     style = """
 <style>
@@ -393,14 +432,17 @@ def render_layout(layout_plan: LayoutPlan) -> RenderResult:
   .component-fill-none { fill: none; }
   .component-label { font: 600 12px ui-sans-serif, system-ui, sans-serif; fill: #111827; text-anchor: middle; dominant-baseline: middle; }
   .terminal-label { font: 600 12px ui-sans-serif, system-ui, sans-serif; fill: #111827; text-anchor: middle; dominant-baseline: middle; }
+  .terminal-arrow { stroke: #111827; stroke-width: 2.1; fill: none; stroke-linecap: round; stroke-linejoin: round; }
   .pin-mark { font: 700 15px ui-sans-serif, system-ui, sans-serif; fill: #111827; text-anchor: middle; dominant-baseline: middle; }
+  .pin-anchor { fill: #111827; opacity: 0.001; pointer-events: all; }
   .layout-label { font: 600 13px ui-sans-serif, system-ui, sans-serif; fill: #374151; dominant-baseline: middle; }
   .junction { fill: #111827; stroke: none; }
 </style>
 """.strip()
 
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout_plan.canvas_width}" height="{layout_plan.canvas_height}" viewBox="0 0 {layout_plan.canvas_width} {layout_plan.canvas_height}" role="img">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{max_x}" height="{max_y}" viewBox="0 0 {max_x} {max_y}" role="img" data-schem-forge-renderer="{escape(layout_plan.renderer)}" data-circuit-id="{escape(layout_plan.circuit_id)}">',
+        f"<desc>{escape(layout_plan.renderer)} rendering for circuit {escape(layout_plan.circuit_id)}</desc>",
         style,
         '<g class="wires">',
         _draw_wire_segments(wire_segments),
