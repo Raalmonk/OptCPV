@@ -1,4 +1,4 @@
-/backend/app/schem_forge/generated/
+/generated/
 .env
 .env.local
 __pycache__/
