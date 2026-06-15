@@ -1,10 +1,20 @@
 # OptCPV
 
-OptCPV is a lightweight Python circuit schematic drawing library.
+OptCPV is a CV-native circuit schematic drawing optimizer.
 
-It takes a small native circuit description, or a simple adapter-produced circuit, and returns a clean SVG schematic. When useful, it can also return lightweight artifact metadata for components, nets, the viewbox, and warnings.
+It is lightweight in product scope: it is a Python library, not a web product, tutor, arbitrary text parser, or image-to-circuit recognizer. But CV is core. OptCPV renders its own schematic, rasterizes that SVG into a fixed evaluation frame, inspects the pixels with OpenCV, and applies topology-safe layout patches until the drawing is cleaner.
 
-OptCPV core does not parse arbitrary text, parse images, call Gemini, run a tutor workflow, or ship an HTTP API as the core product. Those concerns belong outside the drawing library.
+Pipeline:
+
+```text
+Circuit
+  -> LayoutPlan DSL
+  -> Schemdraw renderer
+  -> fixed-size raster image
+  -> vector + OpenCV critic
+  -> topology-safe patch
+  -> optimized SVG + artifact + visual QA report
+```
 
 ## Install
 
@@ -12,24 +22,31 @@ OptCPV core does not parse arbitrary text, parse images, call Gemini, run a tuto
 python -m pip install -e ".[dev]"
 ```
 
-Core dependencies are intentionally empty:
+Core dependencies are mandatory:
 
 ```toml
-dependencies = []
+dependencies = [
+  "schemdraw>=0.19",
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "pillow>=10",
+  "cairosvg>=2.7",
+]
 ```
 
-Optional extras are available for development, small demos, or future renderer experiments:
+Optional extras:
 
 ```toml
 dev = ["pytest>=7"]
-server = ["fastapi>=0.100", "uvicorn>=0.23"]
-schemdraw = ["schemdraw>=0.19"]
+vision = ["google-genai>=1.0"]
 ```
+
+`vision` is only for an optional patch-proposal client. The default optimizer works without it.
 
 ## Public API
 
 ```python
-from optcpv import Circuit, Component, draw_artifact, draw_svg
+from optcpv import Circuit, Component, draw_optimized_svg
 
 circuit = Circuit(
     id="demo",
@@ -37,43 +54,51 @@ circuit = Circuit(
     components=[
         Component(id="VIN", type="input", pins={"out": "vin"}, label="VIN"),
         Component(id="U1", type="op_amp", pins={"+": "vin", "-": "vm", "out": "vout"}),
-        Component(id="Rf", type="resistor", pins={"a": "vout", "b": "vm"}, label="Rf"),
-        Component(id="Rg", type="resistor", pins={"a": "vm", "b": "gnd"}, label="Rg"),
+        Component(id="Rf", type="resistor", pins={"a": "vout", "b": "vm"}, label="Rf", role="feedback"),
+        Component(id="Rg", type="resistor", pins={"a": "vm", "b": "gnd"}, label="Rg", role="gain"),
         Component(id="GND", type="ground", pins={"gnd": "gnd"}),
         Component(id="VOUT", type="output", pins={"in": "vout"}, label="VOUT"),
     ],
 )
 
-svg = draw_svg(circuit)
-artifact = draw_artifact(circuit)
+svg = draw_optimized_svg(circuit)
 ```
 
-`draw_svg()` also accepts a plain dictionary with the same shape.
+Also available:
 
-## Supported Motifs
+- `draw_svg(circuit)` for one-pass rendering through the same Schemdraw backend
+- `draw_artifact(circuit)` for raw SVG plus critic reports
+- `draw_optimized_artifact(circuit)` for optimized SVG plus QA metadata and optimization log
+- `plan_layout(circuit)` for the LayoutPlan DSL
 
-The deterministic planner currently has direct layouts for:
+## What CV Means Here
 
-- `voltage_divider`
-- `rc_low_pass`
-- `non_inverting_op_amp`
-- `instrumentation_amplifier`
-- `bridge_or_wheatstone`
+CV means OptCPV inspects its own rendered output:
 
-Unknown circuits fall back to a conservative diagnostic left-to-right layout. The fallback is not presented as a polished student-facing diagram.
+- dark-pixel density and local clutter
+- visible label/wire/component collisions
+- huge empty canvas and tiny scale hacks
+- component density and compactness
+- left-to-right balance and schematic conventions
 
-## Adapter Boundary
+CV does not mean OCR or recognizing arbitrary uploaded schematic images.
 
-CiTT-style payload conversion lives outside the core API:
+## Topology Safety
+
+The optimizer may move components, labels, orientations, and wire points. It may not change component IDs, component types, pin names, nets, pin-to-net mappings, topology maps, or canvas size.
+
+The topology verifier runs after deterministic planning, after every patch, and before artifact output.
+
+## Fixed-Scale Evaluation
+
+All visual scoring uses a fixed raster frame:
 
 ```python
-from optcpv.adapters.citt import from_citt_payload
-
-circuit = from_citt_payload(payload)
-svg = draw_svg(circuit)
+EVAL_WIDTH = 1200
+EVAL_HEIGHT = 800
 ```
 
-The adapter only converts simple `components[].nodes`, `ground_node`, and `goals` fields into native OptCPV IR. It does not implement CiTT product behavior.
+Increasing SVG width/height, shrinking the viewBox, or spreading components apart does not reduce penalties. The critic penalizes low fill ratio, excessive whitespace, excessive spread, excessive wire length, and over-large viewboxes.
 
 ## Export Examples
 
@@ -81,7 +106,18 @@ The adapter only converts simple `components[].nodes`, `ground_node`, and `goals
 python examples/export_examples.py
 ```
 
-This writes SVG files to `generated/`, which is gitignored.
+For each bundled example, this writes:
+
+- `generated/<name>.raw.svg`
+- `generated/<name>.optimized.svg`
+- `generated/<name>.artifact.json`
+- `generated/<name>.critic.json`
+
+The command prints raw score to optimized score for each circuit.
+
+## Boundaries
+
+OptCPV core does not ship a FastAPI product surface, arbitrary text parsing, arbitrary image parsing, or CiTT tutor logic. Simple input adapters may live under `optcpv.adapters`.
 
 ## Validation
 

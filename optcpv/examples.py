@@ -75,9 +75,27 @@ def instrumentation_amplifier() -> Circuit:
     )
 
 
+def bridge_or_wheatstone() -> Circuit:
+    return Circuit(
+        id="bridge_or_wheatstone",
+        motif="bridge_or_wheatstone",
+        title="Bridge",
+        components=[
+            Component(id="VIN", type="input", pins={"out": "vin"}, label="VIN"),
+            Component(id="R1", type="resistor", pins={"a": "vin", "b": "vl"}, label="R1"),
+            Component(id="R2", type="resistor", pins={"a": "vl", "b": "gnd"}, label="R2"),
+            Component(id="R3", type="resistor", pins={"a": "vin", "b": "vr"}, label="R3"),
+            Component(id="R4", type="resistor", pins={"a": "vr", "b": "gnd"}, label="R4"),
+            Component(id="VOUT", type="output", pins={"in": "vl"}, label="VOUT"),
+            Component(id="GND", type="ground", pins={"gnd": "gnd"}, label="GND"),
+        ],
+    )
+
+
 EXAMPLES = {
     "voltage_divider": voltage_divider,
     "rc_low_pass": rc_low_pass,
     "non_inverting_op_amp": non_inverting_op_amp,
     "instrumentation_amplifier": instrumentation_amplifier,
+    "bridge_or_wheatstone": bridge_or_wheatstone,
 }

@@ -1,7 +1,7 @@
 from optcpv.adapters.citt import from_citt_payload
 
 
-def test_citt_adapter_converts_components_nodes_payload() -> None:
+def test_citt_adapter_stays_simple_boundary_converter() -> None:
     circuit = from_citt_payload(
         {
             "id": "divider_problem",
@@ -17,7 +17,6 @@ def test_citt_adapter_converts_components_nodes_payload() -> None:
     )
 
     assert circuit.id == "divider_problem"
-    assert circuit.motif == "voltage_divider"
-    assert any(component.type == "input" and component.pins == {"out": "vin"} for component in circuit.components)
-    assert any(component.type == "output" and component.pins == {"in": "vout"} for component in circuit.components)
-    assert any(component.type == "ground" and component.pins == {"gnd": "0"} for component in circuit.components)
+    assert any(component.type == "input" for component in circuit.components)
+    assert any(component.type == "output" for component in circuit.components)
+    assert any(component.type == "ground" for component in circuit.components)

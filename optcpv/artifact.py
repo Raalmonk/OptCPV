@@ -1,33 +1,56 @@
-"""Public drawing entry points for OptCPV."""
+"""Public drawing and artifact entry points for OptCPV."""
 
 from __future__ import annotations
 
-from .models import Circuit, Layout, SchematicArtifact
+from .critic import critique
+from .models import Circuit, CriticReport, LayoutPlan, SchematicArtifact, circuit_from_any
 from .planner import plan_layout
 from .renderer import render_svg
+from .verifier import verify_layout_topology
 
 
 def draw_svg(circuit: Circuit | dict, *, style: str = "textbook") -> str:
-    """Return an SVG schematic for a native OptCPV circuit description."""
+    """Return a one-pass Schemdraw SVG for a native OptCPV circuit description."""
 
-    return render_svg(plan_layout(circuit), style=style)
+    native = circuit_from_any(circuit)
+    layout = plan_layout(native)
+    verify_layout_topology(native, layout)
+    return render_svg(layout, style=style)
 
 
 def draw_artifact(circuit: Circuit | dict, *, style: str = "textbook") -> SchematicArtifact:
-    """Return SVG plus lightweight component and net metadata."""
+    """Return a deterministic artifact with topology, vector, and CV criticism."""
 
-    layout = plan_layout(circuit)
+    native = circuit_from_any(circuit)
+    layout = plan_layout(native)
+    verify_layout_topology(native, layout)
     svg = render_svg(layout, style=style)
+    report = critique(native, layout, svg)
+    return artifact_from_layout(layout, svg, critic_report=report, cv_report=report, optimization_log=[])
+
+
+def artifact_from_layout(
+    layout: LayoutPlan,
+    svg: str,
+    *,
+    critic_report: CriticReport | None,
+    cv_report: CriticReport | None,
+    optimization_log: list[dict],
+) -> SchematicArtifact:
     return SchematicArtifact(
         svg=svg,
         components=_component_metadata(layout),
         nets=_net_metadata(layout),
+        labels=_label_metadata(layout),
         viewbox={"x": 0, "y": 0, "width": layout.width, "height": layout.height},
+        critic_report=critic_report.to_dict() if critic_report else None,
+        cv_report=cv_report.to_dict() if cv_report else None,
+        optimization_log=optimization_log,
         warnings=list(layout.warnings),
     )
 
 
-def _component_metadata(layout: Layout) -> dict[str, dict]:
+def _component_metadata(layout: LayoutPlan) -> dict[str, dict]:
     return {
         component.id: {
             "id": component.id,
@@ -36,16 +59,42 @@ def _component_metadata(layout: Layout) -> dict[str, dict]:
             "pins": dict(component.pins),
             "position": {"x": component.x, "y": component.y},
             "orientation": component.orientation,
+            "bbox": {
+                "x": component.bbox.x,
+                "y": component.bbox.y,
+                "width": component.bbox.width,
+                "height": component.bbox.height,
+            },
         }
         for component in layout.components
     }
 
 
-def _net_metadata(layout: Layout) -> dict[str, dict]:
+def _net_metadata(layout: LayoutPlan) -> dict[str, dict]:
     return {
         wire.net: {
             "name": wire.net,
-            "points": [{"x": x, "y": y} for x, y in wire.points],
+            "connected_pins": list(wire.connected_pins),
+            "points": [{"x": point.x, "y": point.y} for point in wire.points],
         }
         for wire in layout.wires
+    }
+
+
+def _label_metadata(layout: LayoutPlan) -> dict[str, dict]:
+    return {
+        label.id: {
+            "id": label.id,
+            "text": label.text,
+            "owner_id": label.owner_id,
+            "position": {"x": label.x, "y": label.y},
+            "anchor": label.anchor,
+            "bbox": {
+                "x": label.bbox.x,
+                "y": label.bbox.y,
+                "width": label.bbox.width,
+                "height": label.bbox.height,
+            },
+        }
+        for label in layout.labels
     }

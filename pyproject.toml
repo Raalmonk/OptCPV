@@ -5,14 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "optcpv"
 version = "0.1.0"
-description = "Lightweight Python circuit schematic drawing library."
+description = "CV-native circuit schematic drawing optimizer."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "schemdraw>=0.19",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10",
+    "cairosvg>=2.7",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-server = ["fastapi>=0.100", "uvicorn>=0.23"]
-schemdraw = ["schemdraw>=0.19"]
+vision = ["google-genai>=1.0"]
 
 [tool.setuptools.packages.find]
 include = ["optcpv*"]
