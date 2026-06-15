@@ -205,8 +205,12 @@ def pin_layouts_for_component(
         elif _is_source(component) and len(pin_names) >= 2:
             first_pin = index == 0
             if orientation in {"left", "right"}:
-                side = "left" if first_pin else "right"
-                offset_x = -1.0 if first_pin else 1.0
+                if orientation == "right":
+                    side = "right" if first_pin else "left"
+                    offset_x = 1.0 if first_pin else -1.0
+                else:
+                    side = "left" if first_pin else "right"
+                    offset_x = -1.0 if first_pin else 1.0
                 offset_y = 0.0
             else:
                 side = "top" if first_pin else "bottom"
@@ -451,6 +455,15 @@ def _ground_net(normalized: dict[str, Any]) -> str | None:
     return None
 
 
+def _source_for_net(normalized: dict[str, Any], net_name: str | None) -> dict[str, Any] | None:
+    if not net_name:
+        return None
+    return _first_component(
+        normalized,
+        lambda item: _is_source(item) and net_name in set(item["pins"].values()),
+    )
+
+
 def _finalize_with_generic_routes(
     circuit_ir: Any,
     placements: dict[str, tuple[float, float, str]],
@@ -480,9 +493,13 @@ def plan_non_inverting_op_amp(circuit_ir: Any) -> LayoutPlan:
     if opamp:
         out_net = opamp["pins"].get(_pin_name_by_kind(opamp, "output") or "")
         inv_net = opamp["pins"].get(_pin_name_by_kind(opamp, "inverting") or "")
+        input_net = opamp["pins"].get(_pin_name_by_kind(opamp, "non_inverting") or "")
         ground_net = _ground_net(normalized)
+        input_source = _source_for_net(normalized, input_net)
         feedback = _resistor_between(normalized, out_net, inv_net, "feedback")
         gain = _resistor_between(normalized, inv_net, ground_net, "gain")
+        if input_source and input_source["id"] not in placements:
+            placements[input_source["id"]] = (1.2 if input_component else 3.0, 10.0, "right")
         if feedback:
             placements[feedback["id"]] = (10.0, 5.0, "right")
         if gain:
@@ -521,18 +538,26 @@ def plan_non_inverting_op_amp(circuit_ir: Any) -> LayoutPlan:
             sequence,
         )
 
-    if opamp and input_component:
+    if opamp and (input_component or _source_for_net(normalized, opamp["pins"].get(_pin_name_by_kind(opamp, "non_inverting") or ""))):
         plus_ref = _pin_ref_by_kind(opamp, "non_inverting") or ""
         plus_point = pin_points.get(plus_ref)
         input_net = opamp["pins"].get(_pin_name_by_kind(opamp, "non_inverting") or "")
-        add_route(
-            input_net,
+        input_source = _source_for_net(normalized, input_net)
+        input_sequence: list[str | Point] = []
+        if input_source:
+            input_sequence.append(_pin_ref_for_net(input_source, input_net) or "")
+        if input_component:
+            input_sequence.append(_pin_ref_for_net(input_component, input_net) or "")
+        input_sequence.extend(
             [
-                _pin_ref_for_net(input_component, input_net) or "",
                 Point(3.6, 16.5),
                 Point(plus_point.x if plus_point else 8.0, 16.5),
                 plus_ref,
-            ],
+            ]
+        )
+        add_route(
+            input_net,
+            input_sequence,
         )
 
     if opamp:
@@ -627,6 +652,8 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
     bottom_input = input_for_net(bottom_plus_net) or (
         next((item for item in inputs if item != top_input), None)
     )
+    top_source = _source_for_net(normalized, top_plus_net)
+    bottom_source = _source_for_net(normalized, bottom_plus_net)
 
     placements: dict[str, tuple[float, float, str]] = {}
     if top_buffer:
@@ -639,6 +666,10 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
         placements[top_input["id"]] = (3.0, 7.0, "right")
     if bottom_input:
         placements[bottom_input["id"]] = (3.0, 17.0, "right")
+    if top_source and top_source["id"] not in placements:
+        placements[top_source["id"]] = (1.2 if top_input else 3.0, 7.0, "right")
+    if bottom_source and bottom_source["id"] not in placements:
+        placements[bottom_source["id"]] = (1.2 if bottom_input else 3.0, 17.0, "right")
     if output_component:
         placements[output_component["id"]] = (30.0, 11.0, "right")
     if ground_component:
@@ -742,26 +773,30 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
         if len(route.waypoints) >= 1:
             routes_by_net[net_name] = route
 
-    if top_buffer and top_input:
+    if top_buffer and (top_input or top_source):
         top_plus = _pin_ref_by_kind(top_buffer, "non_inverting") or ""
-        top_plus_point = pin_points.get(top_plus)
+        top_plus_net = top_buffer["pins"].get(_pin_name_by_kind(top_buffer, "non_inverting") or "")
+        top_sequence: list[str | Point] = []
+        if top_source:
+            top_sequence.append(_pin_ref_for_net(top_source, top_plus_net) or "")
+        if top_input:
+            top_sequence.append(_pin_ref_for_net(top_input, top_plus_net) or "")
+        top_sequence.append(top_plus)
         add_route(
-            top_buffer["pins"].get(_pin_name_by_kind(top_buffer, "non_inverting") or ""),
-            [
-                _pin_ref_for_net(top_input, top_buffer["pins"].get(_pin_name_by_kind(top_buffer, "non_inverting") or "")) or "",
-                Point(3.6, 4.2),
-                Point(6.7, 4.2),
-                Point(6.7, top_plus_point.y if top_plus_point else 7.0),
-                top_plus,
-            ],
+            top_plus_net,
+            top_sequence,
         )
-    if bottom_buffer and bottom_input:
+    if bottom_buffer and (bottom_input or bottom_source):
+        bottom_plus_net = bottom_buffer["pins"].get(_pin_name_by_kind(bottom_buffer, "non_inverting") or "")
+        bottom_sequence: list[str | Point] = []
+        if bottom_source:
+            bottom_sequence.append(_pin_ref_for_net(bottom_source, bottom_plus_net) or "")
+        if bottom_input:
+            bottom_sequence.append(_pin_ref_for_net(bottom_input, bottom_plus_net) or "")
+        bottom_sequence.append(_pin_ref_by_kind(bottom_buffer, "non_inverting") or "")
         add_route(
-            bottom_buffer["pins"].get(_pin_name_by_kind(bottom_buffer, "non_inverting") or ""),
-            [
-                _pin_ref_for_net(bottom_input, bottom_buffer["pins"].get(_pin_name_by_kind(bottom_buffer, "non_inverting") or "")) or "",
-                _pin_ref_by_kind(bottom_buffer, "non_inverting") or "",
-            ],
+            bottom_plus_net,
+            bottom_sequence,
         )
     if top_buffer and rf_top and gain and top_inv_net:
         add_route(
@@ -770,7 +805,8 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
                 _pin_ref_for_net(rf_top, top_inv_net) or "",
                 Point(7.0, 3.0),
                 _pin_ref_by_kind(top_buffer, "inverting") or "",
-                Point(5.0, 5.0),
+                Point(2.0, 5.0),
+                Point(2.0, 9.0),
                 _pin_ref_for_net(gain, top_inv_net) or "",
             ],
         )
@@ -866,7 +902,7 @@ def plan_instrumentation_amplifier(circuit_ir: Any) -> LayoutPlan:
 
 def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
     normalized = normalize_circuit_ir(circuit_ir)
-    source = _first_component(normalized, lambda item: _is_source(item) or _is_input(item))
+    source = _first_component(normalized, _is_input) or _first_component(normalized, _is_source)
     resistor = _first_component(normalized, _is_resistor)
     capacitor = _first_component(normalized, _is_capacitor)
     ground = _first_component(normalized, _is_ground)
@@ -874,6 +910,11 @@ def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
     placements: dict[str, tuple[float, float, str]] = {}
     if source:
         placements[source["id"]] = (3.0, 9.0, "right")
+    if source:
+        source_net = next(iter(source["pins"].values()))
+        input_source = _source_for_net(normalized, source_net)
+        if input_source and input_source["id"] not in placements:
+            placements[input_source["id"]] = (1.2, 9.0, "right")
     if resistor:
         placements[resistor["id"]] = (8.0, 9.0, "right")
     if capacitor:
@@ -899,12 +940,17 @@ def plan_rc_low_pass(circuit_ir: Any) -> LayoutPlan:
 def plan_voltage_divider(circuit_ir: Any) -> LayoutPlan:
     normalized = normalize_circuit_ir(circuit_ir)
     resistors = _components_matching(normalized, _is_resistor)
-    source = _first_component(normalized, lambda item: _is_source(item) or _is_input(item))
+    source = _first_component(normalized, _is_input) or _first_component(normalized, _is_source)
     ground = _first_component(normalized, _is_ground)
     output = _first_component(normalized, _is_output)
     placements: dict[str, tuple[float, float, str]] = {}
     if source:
         placements[source["id"]] = (3.0, 7.0, "right")
+    if source:
+        source_net = next(iter(source["pins"].values()))
+        input_source = _source_for_net(normalized, source_net)
+        if input_source and input_source["id"] not in placements:
+            placements[input_source["id"]] = (1.2, 7.0, "right")
     if resistors:
         placements[resistors[0]["id"]] = (9.0, 7.0, "down")
     if len(resistors) > 1:
