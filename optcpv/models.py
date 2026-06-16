@@ -166,6 +166,14 @@ class CriticReport:
 
 
 @dataclass(frozen=True)
+class RenderedLayers:
+    final_svg: str
+    wires_svg: str
+    components_svg: str
+    labels_svg: str
+
+
+@dataclass(frozen=True)
 class SchematicArtifact:
     svg: str
     components: dict[str, dict[str, Any]]
@@ -173,7 +181,9 @@ class SchematicArtifact:
     labels: dict[str, dict[str, Any]]
     viewbox: dict[str, float]
     critic_report: dict[str, Any] | None = None
+    vector_report: dict[str, Any] | None = None
     cv_report: dict[str, Any] | None = None
+    combined_report: dict[str, Any] | None = None
     optimization_log: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

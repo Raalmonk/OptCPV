@@ -98,3 +98,5 @@ def _reject_scale_hack(before: LayoutPlan, after: LayoutPlan) -> None:
     after_metrics = critique_layout(after).metrics
     if float(after_metrics["average_component_distance"]) > float(before_metrics["average_component_distance"]) * 1.35 + 0.2:
         raise ValueError("Rejected patch that spreads components excessively.")
+    if float(after_metrics["total_wire_length"]) > float(before_metrics["total_wire_length"]) * 1.35 + 1.0:
+        raise ValueError("Rejected patch that increases wire length excessively.")

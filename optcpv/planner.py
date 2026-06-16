@@ -323,11 +323,10 @@ def _route_wires(
                 route = [start, Point(mid_x, start.y), Point(mid_x, end.y), end]
         else:
             hub = Point(float(median(point.x for point in points)), float(median(point.y for point in points)))
-            route = []
-            for index, point in enumerate(points):
-                if index:
-                    route.append(hub)
-                route.extend([point, Point(hub.x, point.y), hub])
+            route = [hub]
+            for point in points:
+                elbow = Point(hub.x, point.y)
+                route.extend([elbow, point, elbow, hub])
         wires.append(LayoutWire(net=net, points=_dedupe(route), connected_pins=connected))
     return wires
 
@@ -344,10 +343,10 @@ def _pin_point(component: LayoutComponent, pin_name: str) -> tuple[float, float,
     if _is_ground_layout(component):
         return (x, y - 0.7, "top")
     if _is_terminal_layout(component):
-        return (x + 0.5 if not _is_output_layout(component) else x - 0.5, y, "right")
+        return (x - 0.5, y, "left") if _is_output_layout(component) else (x + 0.5, y, "right")
     if component.orientation in {"up", "down"}:
-        return (x, y - 0.95 if _is_first_pin(component, pin_name) else y + 0.95, "top")
-    return (x - 0.95 if _is_first_pin(component, pin_name) else x + 0.95, y, "left")
+        return (x, y - 0.95, "top") if _is_first_pin(component, pin_name) else (x, y + 0.95, "bottom")
+    return (x - 0.95, y, "left") if _is_first_pin(component, pin_name) else (x + 0.95, y, "right")
 
 
 def shifted_layout(layout: LayoutPlan, moves: dict[str, tuple[float, float]]) -> LayoutPlan:

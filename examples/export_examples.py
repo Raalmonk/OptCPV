@@ -40,7 +40,9 @@ def _artifact_json(artifact) -> dict:
         "labels": artifact.labels,
         "viewbox": artifact.viewbox,
         "critic_report": artifact.critic_report,
+        "vector_report": artifact.vector_report,
         "cv_report": artifact.cv_report,
+        "combined_report": artifact.combined_report,
         "optimization_log": artifact.optimization_log,
         "warnings": artifact.warnings,
     }

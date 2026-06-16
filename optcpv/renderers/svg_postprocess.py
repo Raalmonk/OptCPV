@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from html import escape
+from typing import Literal
 
-from ..models import LayoutComponent, LayoutPlan, Point
+from ..models import LayoutComponent, LayoutLabel, LayoutPlan, Point
+
+
+LayerName = Literal["wires", "components", "labels"]
 
 
 def inject_metadata(svg: str, layout: LayoutPlan, *, renderer: str) -> str:
@@ -17,26 +21,73 @@ def inject_metadata(svg: str, layout: LayoutPlan, *, renderer: str) -> str:
 
 
 def render_debug_svg(layout: LayoutPlan, *, renderer: str = "optcpv.raw_svg", style: str = "textbook") -> str:
+    return _render_layout_svg(
+        layout,
+        renderer=renderer,
+        style=style,
+        layers=("wires", "components", "labels"),
+        mask_layer=None,
+    )
+
+
+def render_layer_svg(layout: LayoutPlan, layer: LayerName, *, style: str = "textbook") -> str:
+    return _render_layout_svg(
+        layout,
+        renderer=f"optcpv.layer.{layer}",
+        style=style,
+        layers=(layer,),
+        mask_layer=layer,
+    )
+
+
+def _render_layout_svg(
+    layout: LayoutPlan,
+    *,
+    renderer: str,
+    style: str,
+    layers: tuple[LayerName, ...],
+    mask_layer: LayerName | None,
+) -> str:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {layout.width} {layout.height}" '
         f'width="{layout.width}" height="{layout.height}" data-renderer="{escape(renderer)}" data-style="{escape(style)}">',
         "<defs>",
         "<style>",
+        *_style_rules(mask_layer),
+        "</style>",
+        "</defs>",
+    ]
+    if "wires" in layers:
+        for wire in layout.wires:
+            parts.append(_draw_wire(layout, wire.net, wire.points))
+    if "components" in layers:
+        for component in layout.components:
+            parts.append(_draw_component_symbol(layout, component))
+    if "labels" in layers:
+        for label in layout.labels:
+            parts.append(_draw_label(layout, label))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def _style_rules(mask_layer: LayerName | None) -> list[str]:
+    if mask_layer == "components":
+        return [
+            ".wire{fill:none;stroke:#111827;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}",
+            ".component{fill:#111827;stroke:#111827;stroke-width:2}",
+            ".symbol{fill:none;stroke:#111827;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
+            ".pin{fill:#111827}",
+            ".label{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
+            ".terminal-label{font:12px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
+        ]
+    return [
         ".wire{fill:none;stroke:#111827;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}",
         ".component{fill:#fffaf0;stroke:#111827;stroke-width:2}",
         ".symbol{fill:none;stroke:#111827;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
         ".pin{fill:#111827}",
         ".label{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
         ".terminal-label{font:12px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#374151}",
-        "</style>",
-        "</defs>",
     ]
-    for wire in layout.wires:
-        parts.append(_draw_wire(layout, wire.net, wire.points))
-    for component in layout.components:
-        parts.append(_draw_component(layout, component))
-    parts.append("</svg>")
-    return "\n".join(parts)
 
 
 def _metadata_overlay(layout: LayoutPlan) -> str:
@@ -66,7 +117,7 @@ def _draw_wire(layout: LayoutPlan, net: str, points: list[Point]) -> str:
     return f'<polyline class="wire" points="{px_points}" data-net-name="{escape(net)}"/>'
 
 
-def _draw_component(layout: LayoutPlan, component: LayoutComponent) -> str:
+def _draw_component_symbol(layout: LayoutPlan, component: LayoutComponent) -> str:
     x, y = component.x * layout.grid, component.y * layout.grid
     key = _key(component.type)
     inner = _draw_default(x, y)
@@ -90,16 +141,19 @@ def _draw_component(layout: LayoutPlan, component: LayoutComponent) -> str:
             f'data-net-name="{escape(net)}"/>'
         )
 
-    label = next((item for item in layout.labels if item.owner_id == component.id), None)
-    label_svg = ""
-    if label:
-        label_svg = f'<text class="label" x="{label.x * layout.grid:.1f}" y="{label.y * layout.grid:.1f}">{escape(label.text)}</text>'
     return (
         f'<g data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}">\n'
         f"{inner}\n"
         f"{''.join(pins)}\n"
-        f"{label_svg}\n"
         "</g>"
+    )
+
+
+def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
+    return (
+        f'<text class="label" x="{label.x * layout.grid:.1f}" y="{label.y * layout.grid:.1f}" '
+        f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}">'
+        f"{escape(label.text)}</text>"
     )
 
 

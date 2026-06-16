@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .critic import critique
+from .critic import critique_parts
 from .models import Circuit, CriticReport, LayoutPlan, SchematicArtifact, circuit_from_any
 from .planner import plan_layout
 from .renderer import render_svg
@@ -25,26 +25,37 @@ def draw_artifact(circuit: Circuit | dict, *, style: str = "textbook") -> Schema
     layout = plan_layout(native)
     verify_layout_topology(native, layout)
     svg = render_svg(layout, style=style)
-    report = critique(native, layout, svg)
-    return artifact_from_layout(layout, svg, critic_report=report, cv_report=report, optimization_log=[])
+    reports = critique_parts(native, layout, svg)
+    return artifact_from_layout(
+        layout,
+        svg,
+        vector_report=reports.vector_report,
+        cv_report=reports.cv_report,
+        combined_report=reports.combined_report,
+        optimization_log=[],
+    )
 
 
 def artifact_from_layout(
     layout: LayoutPlan,
     svg: str,
     *,
-    critic_report: CriticReport | None,
+    vector_report: CriticReport | None,
     cv_report: CriticReport | None,
+    combined_report: CriticReport | None,
     optimization_log: list[dict],
 ) -> SchematicArtifact:
+    combined_dict = combined_report.to_dict() if combined_report else None
     return SchematicArtifact(
         svg=svg,
         components=_component_metadata(layout),
         nets=_net_metadata(layout),
         labels=_label_metadata(layout),
         viewbox={"x": 0, "y": 0, "width": layout.width, "height": layout.height},
-        critic_report=critic_report.to_dict() if critic_report else None,
+        critic_report=combined_dict,
+        vector_report=vector_report.to_dict() if vector_report else None,
         cv_report=cv_report.to_dict() if cv_report else None,
+        combined_report=combined_dict,
         optimization_log=optimization_log,
         warnings=list(layout.warnings),
     )
