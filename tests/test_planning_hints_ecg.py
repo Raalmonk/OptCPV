@@ -28,6 +28,8 @@ def test_fake_planning_client_places_ecg_rld_loop_in_bottom_auxiliary_lane() -> 
     layout = plan_layout(circuit, planning_client=FakePlanningClient(ecg_rld_hints()))
     components = {component.id: component for component in layout.components}
     rld = next(wire for wire in layout.wires if wire.net == "rld")
+    report = critique_layout(layout)
+    hard_codes = {violation.code for violation in report.violations if violation.hard}
 
     assert "planning_hints: accepted" in layout.warnings
     assert components["A1"].x == components["A2"].x
@@ -36,6 +38,84 @@ def test_fake_planning_client_places_ecg_rld_loop_in_bottom_auxiliary_lane() -> 
     assert components["Aau"].y > components["A4"].y
     assert max(point.y for point in rld.points) > components["Aau"].bbox.bottom
     assert not any(route_crosses_keepout(rld.points, components[item].bbox.expanded(-0.06)) for item in ["Aau", "A3", "A4"])
+    assert "wire_net_overlap" not in hard_codes
+
+
+def test_rld_feedback_stays_local_while_drive_uses_bottom_corridor() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    components = {component.id: component for component in layout.components}
+    rld_fb = next(wire for wire in layout.wires if wire.net == "rld_fb")
+    rld = next(wire for wire in layout.wires if wire.net == "rld")
+    rld_drive = next(wire for wire in layout.wires if wire.net == "rld_drive")
+
+    assert max(point.y for point in rld_fb.points) < components["Aau"].bbox.bottom + 0.2
+    assert max(point.y for point in rld.points) > components["Aau"].bbox.bottom
+    assert max(point.y for point in rld_drive.points) > components["Ro"].bbox.bottom
+
+
+def test_single_feedback_input_branch_does_not_backtrack_to_fake_corridor() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    components = {component.id: component for component in layout.components}
+    rld_fb = next(wire for wire in layout.wires if wire.net == "rld_fb")
+    feedback_pin = layout.pin_map[("Rf", "b")]
+
+    assert rld_fb.points[-1] == Point(feedback_pin.x, feedback_pin.y)
+    assert rld_fb.points[-1] != rld_fb.points[-3]
+    assert not route_crosses_keepout(rld_fb.points, components["Aau"].bbox.expanded(-0.06))
+
+
+def test_hint_router_flips_crossed_opamp_inputs_and_reanchors_ground_leg() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    components = {component.id: component for component in layout.components}
+
+    assert components["A3"].orientation == "right_flip"
+    assert components["R6"].orientation == "right"
+    assert components["A4"].x < components["R6"].x
+    assert components["A4"].y < components["R6"].y
+
+
+def test_feedback_policy_uses_outer_corridor_instead_of_opamp_body() -> None:
+    hints = ecg_rld_hints().with_updates(
+        route_policies=(
+            *ecg_rld_hints().route_policies,
+            RoutePolicyHint(net="ecg_out", net_role="feedback", policy="top_feedback_corridor"),
+        )
+    )
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(hints))
+    components = {component.id: component for component in layout.components}
+    ecg_out = next(wire for wire in layout.wires if wire.net == "ecg_out")
+
+    assert min(point.y for point in ecg_out.points) < components["R5"].bbox.y
+    assert not route_crosses_keepout(ecg_out.points, components["A4"].bbox.expanded(-0.06))
+
+
+def test_bottom_auxiliary_output_keeps_feedback_resistor_as_local_branch() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    components = {component.id: component for component in layout.components}
+    rld = next(wire for wire in layout.wires if wire.net == "rld")
+    driver = layout.pin_map[("Aau", "out")]
+    feedback_pin = layout.pin_map[("Rf", "a")]
+    bottom_entry = next(
+        index
+        for index, point in enumerate(rld.points)
+        if point.y > components["Aau"].bbox.bottom + 0.25
+    )
+    feedback_index = next(
+        index
+        for index, point in enumerate(rld.points)
+        if abs(point.x - feedback_pin.x) < 1e-6 and abs(point.y - feedback_pin.y) < 1e-6
+    )
+
+    assert rld.points[0] == Point(driver.x, driver.y)
+    assert feedback_index < bottom_entry
+
+
+def test_opamp_supply_symbols_are_not_visible_in_main_svg() -> None:
+    artifact = draw_artifact(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+
+    assert ">VEE<" not in artifact.svg
+    assert ">VCC<" not in artifact.svg
+    assert 'data-terminal-type="negative_supply"' in artifact.svg
 
 
 def test_invalid_planning_hints_with_unknown_component_are_rejected() -> None:

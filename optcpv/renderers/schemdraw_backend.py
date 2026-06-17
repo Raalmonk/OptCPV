@@ -697,6 +697,8 @@ def _semantic_overlays_svg(layout: LayoutPlan) -> str:
         elif motif.motif_type == "summing_opamp":
             parts.append(draw_summing_opamp(layout, motif))
     for terminal in layout.semantic.local_terminals:
+        if _should_hide_local_terminal(layout, terminal):
+            continue
         if _terminal_owner_is_filter_block(layout, terminal):
             continue
         if _terminal_owner_is_resistor(layout, terminal):
@@ -705,6 +707,13 @@ def _semantic_overlays_svg(layout: LayoutPlan) -> str:
             parts.append(draw_local_supply_or_ground(layout, terminal))
     parts.append("</g>")
     return "\n".join(part for part in parts if part)
+
+
+def _should_hide_local_terminal(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    if terminal.terminal_type not in {"positive_supply", "negative_supply"}:
+        return False
+    owner = next((component for component in layout.components if component.id == terminal.component_id), None)
+    return owner is not None and _is_opamp_component(owner)
 
 
 def _draw_motif_metadata(layout: LayoutPlan, motif: Motif) -> str:

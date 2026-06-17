@@ -50,6 +50,7 @@ from .verifier import topology_signature
 GRID = 48
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 800
+CANVAS_EDGE_PADDING = 0.55
 NATIVE_MOTIFS = {
     "voltage_divider",
     "rc_low_pass",
@@ -550,6 +551,12 @@ def _feedback_resistors_for_component_opamp(opamp: Component, resistors: list[Co
     input_nets = set(_opamp_input_nets(opamp))
     if output_net is None:
         return []
+    if output_net in input_nets:
+        return [
+            resistor
+            for resistor in resistors
+            if output_net in set(resistor.pins.values()) and "feedback" in _key(resistor.role)
+        ]
     return [
         resistor
         for resistor in resistors
@@ -924,6 +931,7 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         grid=base_layout.grid,
         support=support,
     )
+    candidate = _improve_hint_opamp_orientations(circuit, candidate)
     try:
         from .vector_critic import critique_layout
         from .verifier import verify_layout_topology
@@ -941,6 +949,61 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
     if candidate_hard > base_hard or candidate_report.score > base_report.score:
         return None
     return candidate
+
+
+def _improve_hint_opamp_orientations(circuit: Circuit, layout: LayoutPlan) -> LayoutPlan:
+    if not layout.support.planning_hints:
+        return layout
+    try:
+        from .vector_critic import critique_layout
+        from .verifier import verify_layout_topology
+
+        verify_layout_topology(circuit, layout)
+        best = layout
+        best_report = critique_layout(layout)
+        for _ in range(2):
+            improved = False
+            for component in sorted(best.components, key=lambda item: item.id):
+                if not _is_opamp_layout(component):
+                    continue
+                placements = {
+                    item.id: (item.x, item.y, item.orientation)
+                    for item in best.components
+                }
+                flipped = "right_flip" if component.orientation == "right" else "right"
+                placements[component.id] = (component.x, component.y, flipped)
+                candidate = _build_layout(
+                    circuit,
+                    placements,
+                    list(best.warnings),
+                    width=best.width,
+                    height=best.height,
+                    grid=best.grid,
+                    support=best.support,
+                )
+                verify_layout_topology(circuit, candidate)
+                candidate_report = critique_layout(candidate)
+                if _orientation_candidate_better(candidate_report, best_report):
+                    best = candidate
+                    best_report = candidate_report
+                    improved = True
+            if not improved:
+                break
+        return best
+    except Exception:
+        return layout
+
+
+def _orientation_candidate_better(candidate_report, best_report) -> bool:
+    candidate_hard = sum(1 for violation in candidate_report.violations if violation.hard)
+    best_hard = sum(1 for violation in best_report.violations if violation.hard)
+    if any(violation.code == "component_overlap" for violation in candidate_report.violations):
+        return False
+    if candidate_hard > best_hard:
+        return False
+    if candidate_hard < best_hard:
+        return True
+    return candidate_report.score < best_report.score - 0.1
 
 
 def _hint_placements(
@@ -967,7 +1030,79 @@ def _hint_placements(
         y = _clamp(lane_positions[hint.lane_y], 0.6, span_y - 0.6)
         x, y = _clamp_anchor_to_canvas(component, x, y, orientation, span_x, span_y)
         placements[component_id] = (x, y, orientation)
+    placements = _anchor_hint_ground_legs(circuit, base_components, placements, span_x, span_y)
+    placements = _orient_hint_feedback_resistors(circuit, base_components, placements, span_x, span_y)
     return _relax_hint_component_overlaps(base_components, placements, span_x, span_y)
+
+
+def _anchor_hint_ground_legs(
+    circuit: Circuit,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    opamps = [component for component in circuit.components if _is_opamp(component) and component.id in result]
+    for component in circuit.components:
+        if component.id not in result or not _is_type(component, "resistor"):
+            continue
+        nets = set(component.pins.values())
+        if not any(is_local_terminal_net(net) for net in nets):
+            continue
+        active_nets = [net for net in nets if not is_local_terminal_net(net)]
+        if len(active_nets) != 1:
+            continue
+        owner = next((opamp for opamp in opamps if active_nets[0] in _opamp_input_nets(opamp)), None)
+        if owner is None:
+            continue
+        owner_x, owner_y, owner_orientation = result[owner.id]
+        x = owner_x + 1.35
+        y = owner_y + (2.75 if _is_flipped_opamp_orientation(owner_orientation) else 2.45)
+        x, y = _clamp_anchor_to_canvas(components[component.id], x, y, "right", span_x, span_y)
+        result[component.id] = (x, y, "right")
+    return result
+
+
+def _orient_hint_feedback_resistors(
+    circuit: Circuit,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    opamps = [component for component in circuit.components if _is_opamp(component) and component.id in result]
+    for component in circuit.components:
+        if component.id not in result or component.id not in components:
+            continue
+        if not _is_type(component, "resistor") or "feedback" not in _key(component.role):
+            continue
+        orientation = _feedback_resistor_orientation(component, opamps)
+        if orientation is None:
+            continue
+        x, y, _ = result[component.id]
+        x, y = _clamp_anchor_to_canvas(components[component.id], x, y, orientation, span_x, span_y)
+        result[component.id] = (x, y, orientation)
+    return result
+
+
+def _feedback_resistor_orientation(resistor: Component, opamps: list[Component]) -> str | None:
+    resistor_pins = resistor.pins
+    for opamp in opamps:
+        output_net = _opamp_output_net(opamp)
+        input_nets = set(_opamp_input_nets(opamp))
+        if output_net is None:
+            continue
+        output_pin = next((pin_name for pin_name, net in resistor_pins.items() if net == output_net), None)
+        input_pin = next((pin_name for pin_name, net in resistor_pins.items() if net in input_nets), None)
+        if output_pin is None or input_pin is None:
+            continue
+        if _pin_kind(output_pin) == "a" and _pin_kind(input_pin) == "b":
+            return "left"
+        if _pin_kind(output_pin) == "b" and _pin_kind(input_pin) == "a":
+            return "right"
+    return None
 
 
 def _hint_stage_positions(
@@ -993,7 +1128,7 @@ def _hint_stage_positions(
 
     minimum_stage = min(stages)
     maximum_stage = max(stages)
-    naive_gap = (span_x - 2.4) / max(1, maximum_stage - minimum_stage)
+    naive_gap = min(4.35, (span_x - 2.4) / max(1, maximum_stage - minimum_stage))
     positions: dict[int, float] = {}
     cursor_right = 0.55
     for stage in stages:
@@ -1072,15 +1207,15 @@ def _clamp_anchor_to_canvas(
     span_y: float,
 ) -> tuple[float, float]:
     bbox = _component_bbox(component.type, x, y, orientation)
-    if bbox.x < 0.25:
-        x += 0.25 - bbox.x
-    if bbox.right > span_x - 0.25:
-        x -= bbox.right - (span_x - 0.25)
+    if bbox.x < CANVAS_EDGE_PADDING:
+        x += CANVAS_EDGE_PADDING - bbox.x
+    if bbox.right > span_x - CANVAS_EDGE_PADDING:
+        x -= bbox.right - (span_x - CANVAS_EDGE_PADDING)
     bbox = _component_bbox(component.type, x, y, orientation)
-    if bbox.y < 0.25:
-        y += 0.25 - bbox.y
-    if bbox.bottom > span_y - 0.25:
-        y -= bbox.bottom - (span_y - 0.25)
+    if bbox.y < CANVAS_EDGE_PADDING:
+        y += CANVAS_EDGE_PADDING - bbox.y
+    if bbox.bottom > span_y - CANVAS_EDGE_PADDING:
+        y -= bbox.bottom - (span_y - CANVAS_EDGE_PADDING)
     return (x, y)
 
 
@@ -1147,7 +1282,7 @@ def _component_layout_priority(component: LayoutComponent) -> int:
 def _try_shift_anchor_y(component: LayoutComponent, x: float, y: float, orientation: str, delta: float, span_y: float) -> float:
     for candidate in (y + delta, y - delta):
         bbox = _component_bbox(component.type, x, candidate, orientation)
-        if bbox.y >= 0.25 and bbox.bottom <= span_y - 0.25:
+        if bbox.y >= CANVAS_EDGE_PADDING and bbox.bottom <= span_y - CANVAS_EDGE_PADDING:
             return candidate
     return y + delta
 
@@ -1155,7 +1290,7 @@ def _try_shift_anchor_y(component: LayoutComponent, x: float, y: float, orientat
 def _try_shift_anchor_x(component: LayoutComponent, x: float, y: float, orientation: str, delta: float, span_x: float) -> float:
     for candidate in (x + delta, x - delta):
         bbox = _component_bbox(component.type, candidate, y, orientation)
-        if bbox.x >= 0.25 and bbox.right <= span_x - 0.25:
+        if bbox.x >= CANVAS_EDGE_PADDING and bbox.right <= span_x - CANVAS_EDGE_PADDING:
             return candidate
     return x + delta
 
@@ -1222,6 +1357,7 @@ def _build_layout(
         components=components,
         labels=labels,
         route_policies=_route_policy_hints(layout_support),
+        canvas_bottom=height / grid,
     )
     layout = LayoutPlan(
         circuit_id=circuit.id,
@@ -1612,6 +1748,7 @@ def _route_wires(
     components: list[LayoutComponent] | None = None,
     labels: list[LayoutLabel] | None = None,
     route_policies: tuple[RoutePolicyHint, ...] = (),
+    canvas_bottom: float | None = None,
 ) -> list[LayoutWire]:
     motif_routes = _route_known_motif(
         pin_map,
@@ -1621,6 +1758,7 @@ def _route_wires(
         components=components,
         labels=labels,
         route_policies=route_policies,
+        canvas_bottom=canvas_bottom,
     )
     if motif_routes is not None:
         return motif_routes
@@ -1629,9 +1767,22 @@ def _route_wires(
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
             continue
-        policy = _policy_for_net(net, route_policies)
+        policy = _policy_for_net_with_context(
+            net,
+            route_policies,
+            semantic=semantic,
+            pins=[pin_map[key] for key in connected],
+            components=components or [],
+        )
         if policy == "bottom_auxiliary_corridor":
-            route = _bottom_auxiliary_corridor_route([pin_map[key] for key in connected], components or [])
+            route = _bottom_auxiliary_corridor_route(
+                [pin_map[key] for key in connected],
+                components or [],
+                net=net,
+                canvas_bottom=canvas_bottom,
+            )
+        elif policy in {"top_feedback_corridor", "bottom_feedback_corridor"}:
+            route = _feedback_corridor_route([pin_map[key] for key in connected], components or [], policy=policy)
         else:
             route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
         if not route:
@@ -1706,9 +1857,98 @@ def _policy_for_net(net: str, policies: tuple[RoutePolicyHint, ...]) -> str | No
     return None
 
 
-def _bottom_auxiliary_corridor_route(pins: list[LayoutPin], components: list[LayoutComponent]) -> list[Point]:
+def _policy_for_net_with_context(
+    net: str,
+    policies: tuple[RoutePolicyHint, ...],
+    *,
+    semantic: TopologySemanticPlan | None,
+    pins: list[LayoutPin],
+    components: list[LayoutComponent],
+) -> str | None:
+    policy = _policy_for_net(net, policies)
+    if (
+        policy == "bottom_auxiliary_corridor"
+        and _has_opamp_input_pin(pins, components)
+        and _has_explicit_feedback_passive(net, pins, components)
+        and not any(_is_opamp_output_pin(pin.pin_name) for pin in pins)
+    ):
+        return _feedback_corridor_policy_for_pins(pins, components)
+    if policy is not None:
+        return policy
+
+    for hint in policies:
+        if hint.net is not None or hint.policy not in {"top_feedback_corridor", "bottom_feedback_corridor"}:
+            continue
+        if "feedback" in _key(hint.net_role) and _is_feedback_related_net(net, semantic):
+            return hint.policy
+
+    if (
+        policies
+        and _is_feedback_related_net(net, semantic)
+        and _has_explicit_feedback_passive(net, pins, components)
+        and not any(_is_opamp_output_pin(pin.pin_name) for pin in pins)
+    ):
+        return _feedback_corridor_policy_for_pins(pins, components)
+    return None
+
+
+def _has_explicit_feedback_passive(net: str, pins: list[LayoutPin], components: list[LayoutComponent]) -> bool:
+    component_by_id = {component.id: component for component in components}
+    return any(
+        net in component.pins.values()
+        and _is_resistor_layout(component)
+        and "feedback" in _key(component.role)
+        for component in (component_by_id.get(pin.component_id) for pin in pins)
+        if component is not None
+    )
+
+
+def _has_opamp_input_pin(pins: list[LayoutPin], components: list[LayoutComponent]) -> bool:
+    component_by_id = {component.id: component for component in components}
+    return any(
+        _is_opamp_input_pin(pin)
+        and (component := component_by_id.get(pin.component_id)) is not None
+        and _is_opamp_layout(component)
+        for pin in pins
+    )
+
+
+def _feedback_corridor_policy_for_pins(pins: list[LayoutPin], components: list[LayoutComponent]) -> str:
+    component_by_id = {component.id: component for component in components}
+    opamp_receivers = [
+        pin
+        for pin in pins
+        if _is_opamp_input_pin(pin) and _is_opamp_layout(component_by_id.get(pin.component_id, _null_component()))
+    ]
+    driver = next((pin for pin in pins if _is_opamp_output_pin(pin.pin_name)), None)
+    if driver is not None and opamp_receivers:
+        receiver = sorted(opamp_receivers, key=lambda pin: abs(pin.y - driver.y))[0]
+        return "bottom_feedback_corridor" if receiver.y > driver.y else "top_feedback_corridor"
+    return "top_feedback_corridor"
+
+
+def _bottom_auxiliary_corridor_route(
+    pins: list[LayoutPin],
+    components: list[LayoutComponent],
+    *,
+    net: str | None = None,
+    canvas_bottom: float | None = None,
+) -> list[Point]:
     if len(pins) < 2:
         return []
+    component_by_id = {component.id: component for component in components}
+    driver = _bottom_auxiliary_opamp_driver(pins, component_by_id)
+    if driver is not None:
+        local_branches = _local_feedback_branches_for_output_net(driver, pins, component_by_id)
+        if local_branches:
+            return _opamp_output_bottom_auxiliary_route(
+                driver,
+                [pin for pin in pins if pin is not driver and pin not in local_branches],
+                local_branches,
+                components,
+                net=net,
+                canvas_bottom=canvas_bottom,
+            )
     ordered = sorted(
         pins,
         key=lambda pin: (
@@ -1719,16 +1959,351 @@ def _bottom_auxiliary_corridor_route(pins: list[LayoutPin], components: list[Lay
             pin.pin_name,
         ),
     )
-    bottom = max([pin.y for pin in pins] + [component.bbox.bottom for component in components])
-    corridor_y = bottom + 0.85
+    attached = [
+        component_by_id[pin.component_id]
+        for pin in pins
+        if pin.component_id in component_by_id and not _is_ground_layout(component_by_id[pin.component_id])
+    ]
+    bottom = max([pin.y for pin in pins] + [component.bbox.bottom for component in attached])
+    corridor_y = bottom + _bottom_auxiliary_corridor_offset(net)
+    corridor_y = _avoid_bottom_corridor_blockers(corridor_y, pins, components)
+    corridor_y = _fit_bottom_corridor_to_canvas(corridor_y, net, canvas_bottom)
     start = ordered[0]
     start_point = Point(start.x, start.y)
-    route = [start_point, Point(start.x, corridor_y)]
+    if _is_opamp_output_pin(start.pin_name):
+        trunk_x = start.x + 0.54
+        route = [start_point, Point(trunk_x, start.y), Point(trunk_x, corridor_y)]
+    else:
+        route = [start_point, Point(start.x, corridor_y)]
     for pin in ordered[1:]:
-        tap = Point(pin.x, corridor_y)
-        pin_point = Point(pin.x, pin.y)
-        route.extend([tap, pin_point, tap])
+        route.extend(_bottom_corridor_branch_route(pin, corridor_y, components))
     return route
+
+
+def _bottom_auxiliary_opamp_driver(
+    pins: list[LayoutPin],
+    component_by_id: dict[str, LayoutComponent],
+) -> LayoutPin | None:
+    return next(
+        (
+            pin
+            for pin in pins
+            if _is_opamp_output_pin(pin.pin_name)
+            and _is_opamp_layout(component_by_id.get(pin.component_id, _null_component()))
+        ),
+        None,
+    )
+
+
+def _local_feedback_branches_for_output_net(
+    driver: LayoutPin,
+    pins: list[LayoutPin],
+    component_by_id: dict[str, LayoutComponent],
+) -> list[LayoutPin]:
+    driver_component = component_by_id.get(driver.component_id)
+    if driver_component is None:
+        return []
+    window_left = driver_component.bbox.x - 1.4
+    window_right = driver_component.bbox.right + 2.8
+    window_top = driver_component.bbox.y - 2.2
+    window_bottom = driver_component.bbox.bottom + 2.2
+    branches: list[LayoutPin] = []
+    for pin in pins:
+        if pin is driver:
+            continue
+        component = component_by_id.get(pin.component_id)
+        if component is None or not _is_resistor_layout(component):
+            continue
+        if "feedback" not in _key(component.role):
+            continue
+        if window_left <= pin.x <= window_right and window_top <= pin.y <= window_bottom:
+            branches.append(pin)
+    return branches
+
+
+def _opamp_output_bottom_auxiliary_route(
+    driver: LayoutPin,
+    corridor_branches: list[LayoutPin],
+    local_branches: list[LayoutPin],
+    components: list[LayoutComponent],
+    *,
+    net: str | None,
+    canvas_bottom: float | None,
+) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    route = [driver_point]
+    for branch in sorted(local_branches, key=lambda pin: (abs(pin.y - driver.y), pin.x, pin.component_id, pin.pin_name)):
+        route.extend(_local_output_feedback_branch(driver, branch))
+    if not corridor_branches:
+        return route
+
+    corridor_pins = [driver, *corridor_branches]
+    component_by_id = {component.id: component for component in components}
+    attached = [
+        component_by_id[pin.component_id]
+        for pin in corridor_pins
+        if pin.component_id in component_by_id and not _is_ground_layout(component_by_id[pin.component_id])
+    ]
+    bottom = max([pin.y for pin in corridor_pins] + [component.bbox.bottom for component in attached])
+    corridor_y = bottom + _bottom_auxiliary_corridor_offset(net)
+    corridor_y = _avoid_bottom_corridor_blockers(corridor_y, corridor_pins, components)
+    corridor_y = _fit_bottom_corridor_to_canvas(corridor_y, net, canvas_bottom)
+    trunk_x = driver.x + 0.54
+    route.extend([Point(trunk_x, driver.y), Point(trunk_x, corridor_y)])
+    for pin in sorted(corridor_branches, key=lambda pin: (pin.x, pin.y, pin.component_id, pin.pin_name)):
+        route.extend(_bottom_corridor_branch_route(pin, corridor_y, components))
+    return route
+
+
+def _local_output_feedback_branch(driver: LayoutPin, branch: LayoutPin) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    branch_point = Point(branch.x, branch.y)
+    if abs(branch.y - driver.y) < 0.25:
+        return [branch_point, driver_point]
+    bus_x = max(driver.x + 0.54, branch.x + 0.56)
+    return [
+        Point(bus_x, driver.y),
+        Point(bus_x, branch.y),
+        branch_point,
+        Point(bus_x, branch.y),
+        Point(bus_x, driver.y),
+        driver_point,
+    ]
+
+
+def _bottom_auxiliary_corridor_offset(net: str | None) -> float:
+    key = _key(net)
+    if any(token in key for token in ("fb", "feedback", "sense")):
+        return 0.52
+    if any(token in key for token in ("drive", "output", "out")):
+        return 1.16
+    return 0.84
+
+
+def _fit_bottom_corridor_to_canvas(corridor_y: float, net: str | None, canvas_bottom: float | None) -> float:
+    if canvas_bottom is None:
+        return corridor_y
+    limit = canvas_bottom - 0.58
+    if corridor_y <= limit:
+        return corridor_y
+    return max(0.45, limit - _bottom_auxiliary_overflow_slot(net) * 0.34)
+
+
+def _bottom_auxiliary_overflow_slot(net: str | None) -> int:
+    key = _key(net)
+    if any(token in key for token in ("drive", "output", "out")):
+        return 0
+    if any(token in key for token in ("fb", "feedback", "sense")):
+        return 2
+    return 1
+
+
+def _avoid_bottom_corridor_blockers(
+    corridor_y: float,
+    pins: list[LayoutPin],
+    components: list[LayoutComponent],
+) -> float:
+    if len(pins) < 2:
+        return corridor_y
+    attached_ids = {pin.component_id for pin in pins}
+    left = min(pin.x for pin in pins)
+    right = max(pin.x for pin in pins)
+    adjusted = corridor_y
+    for component in components:
+        if component.id in attached_ids:
+            continue
+        if component.bbox.right < left or component.bbox.x > right:
+            continue
+        if component.bbox.y - 0.06 <= adjusted <= component.bbox.bottom + 0.06:
+            adjusted = component.bbox.bottom + 0.32
+    return adjusted
+
+
+def _bottom_corridor_branch_route(
+    pin: LayoutPin,
+    corridor_y: float,
+    components: list[LayoutComponent],
+) -> list[Point]:
+    pin_point = Point(pin.x, pin.y)
+    blocker = _vertical_branch_blocker(pin, corridor_y, components)
+    if blocker is None:
+        tap = Point(pin.x, corridor_y)
+        return [tap, pin_point, tap]
+    via_x = _branch_dogleg_x(pin, blocker)
+    corridor_tap = Point(via_x, corridor_y)
+    side_tap = Point(via_x, pin.y)
+    return [corridor_tap, side_tap, pin_point, side_tap, corridor_tap]
+
+
+def _branch_dogleg_x(pin: LayoutPin, blocker: LayoutComponent) -> float:
+    if pin.side == "right":
+        return blocker.bbox.right + 0.56
+    if pin.side == "left":
+        return blocker.bbox.x - 0.56
+    return blocker.bbox.x - 0.56 if pin.x <= blocker.bbox.center.x else blocker.bbox.right + 0.56
+
+
+def _vertical_branch_blocker(
+    pin: LayoutPin,
+    corridor_y: float,
+    components: list[LayoutComponent],
+) -> LayoutComponent | None:
+    top = min(pin.y, corridor_y)
+    bottom = max(pin.y, corridor_y)
+    for component in components:
+        if component.id == pin.component_id or not _is_opamp_layout(component):
+            continue
+        if component.bbox.x - 0.04 <= pin.x <= component.bbox.right + 0.04 and _intervals_overlap(
+            top,
+            bottom,
+            component.bbox.y + 0.08,
+            component.bbox.bottom - 0.08,
+        ):
+            return component
+    return None
+
+
+def _feedback_corridor_route(
+    pins: list[LayoutPin],
+    components: list[LayoutComponent],
+    *,
+    policy: str,
+) -> list[Point]:
+    if len(pins) < 2:
+        return []
+    component_by_id = {component.id: component for component in components}
+    driver = next(
+        (
+            pin
+            for pin in pins
+            if _is_opamp_output_pin(pin.pin_name)
+            and _is_opamp_layout(component_by_id.get(pin.component_id, _null_component()))
+        ),
+        None,
+    )
+    receivers = [
+        pin
+        for pin in pins
+        if pin is not driver
+        and _is_opamp_input_pin(pin)
+        and _is_opamp_layout(component_by_id.get(pin.component_id, _null_component()))
+    ]
+    branches = [pin for pin in pins if pin is not driver and pin not in receivers]
+    if driver is None:
+        if receivers:
+            return _input_feedback_corridor_route(
+                receivers[0],
+                [pin for pin in pins if pin not in receivers],
+                components,
+                policy=policy,
+            )
+        return _generic_route([Point(pin.x, pin.y) for pin in pins])
+
+    driver_point = Point(driver.x, driver.y)
+    corridor_y = _feedback_corridor_y(pins, components, policy)
+    min_x = min([pin.x for pin in pins] + [component_by_id[pin.component_id].bbox.x for pin in pins if pin.component_id in component_by_id])
+    max_x = max([pin.x for pin in pins] + [component_by_id[pin.component_id].bbox.right for pin in pins if pin.component_id in component_by_id])
+    right_x = max(driver.x + 0.64, max_x + 0.45)
+    left_x = min(min_x - 0.45, min((_opamp_input_approach(pin).x for pin in receivers), default=min_x) - 0.2)
+    route = [driver_point, Point(right_x, driver.y), Point(right_x, corridor_y)]
+
+    for branch in sorted(branches, key=lambda pin: (pin.x, pin.y, pin.component_id, pin.pin_name)):
+        branch_point = Point(branch.x, branch.y)
+        if _is_output_terminal_pin(branch, component_by_id) and abs(branch.y - driver.y) < 0.3:
+            route.extend([Point(branch.x, corridor_y), branch_point, Point(branch.x, corridor_y)])
+            continue
+        tap = Point(branch.x, corridor_y)
+        route.extend([tap, branch_point, tap])
+
+    for receiver in sorted(receivers, key=lambda pin: (pin.y, pin.x, pin.component_id, pin.pin_name)):
+        receiver_point = Point(receiver.x, receiver.y)
+        approach = _opamp_input_approach(receiver)
+        entry_x = min(left_x, approach.x)
+        route.extend(
+            [
+                Point(entry_x, corridor_y),
+                Point(entry_x, receiver.y),
+                approach,
+                receiver_point,
+                approach,
+                Point(entry_x, receiver.y),
+                Point(entry_x, corridor_y),
+            ]
+        )
+    return route
+
+
+def _input_feedback_corridor_route(
+    receiver: LayoutPin,
+    branches: list[LayoutPin],
+    components: list[LayoutComponent],
+    *,
+    policy: str,
+) -> list[Point]:
+    receiver_point = Point(receiver.x, receiver.y)
+    approach = _opamp_input_approach(receiver)
+    if len(branches) == 1:
+        return _single_feedback_input_branch_route(receiver, branches[0], components, policy=policy)
+    corridor_y = _feedback_corridor_y([receiver, *branches], components, policy)
+    route = [receiver_point, approach, Point(approach.x, corridor_y)]
+    for branch in sorted(branches, key=lambda pin: (pin.x, pin.y, pin.component_id, pin.pin_name)):
+        branch_point = Point(branch.x, branch.y)
+        tap = Point(branch.x, corridor_y)
+        route.extend([tap, branch_point, tap])
+    return route
+
+
+def _single_feedback_input_branch_route(
+    receiver: LayoutPin,
+    branch: LayoutPin,
+    components: list[LayoutComponent],
+    *,
+    policy: str,
+) -> list[Point]:
+    receiver_point = Point(receiver.x, receiver.y)
+    branch_point = Point(branch.x, branch.y)
+    approach = _opamp_input_approach(receiver)
+    owner = next((component for component in components if component.id == receiver.component_id), None)
+    if owner is not None and _axis_segment_intersects_bbox(approach, Point(branch.x, approach.y), owner.bbox.expanded(-0.05)):
+        outer_y = _feedback_corridor_y([receiver, branch], components, policy)
+        return [
+            receiver_point,
+            approach,
+            Point(approach.x, outer_y),
+            Point(branch.x, outer_y),
+            branch_point,
+        ]
+    if abs(branch.y - approach.y) < 0.15:
+        return [receiver_point, approach, branch_point]
+    return [
+        receiver_point,
+        approach,
+        Point(approach.x, branch.y),
+        branch_point,
+    ]
+
+
+def _feedback_corridor_y(pins: list[LayoutPin], components: list[LayoutComponent], policy: str) -> float:
+    component_by_id = {component.id: component for component in components}
+    attached = [component_by_id[pin.component_id] for pin in pins if pin.component_id in component_by_id]
+    if policy == "bottom_feedback_corridor":
+        bottom = max([pin.y for pin in pins] + [component.bbox.bottom for component in attached])
+        return bottom + 0.68
+    top = min([pin.y for pin in pins] + [component.bbox.y for component in attached])
+    return max(0.45, top - 0.68)
+
+
+def _is_opamp_input_pin(pin: LayoutPin) -> bool:
+    return _pin_kind(pin.pin_name) in {"+", "-", "plus", "minus", "non_inverting", "inverting"}
+
+
+def _is_output_terminal_pin(pin: LayoutPin, component_by_id: dict[str, LayoutComponent]) -> bool:
+    component = component_by_id.get(pin.component_id)
+    return component is not None and _is_output_layout(component)
+
+
+def _null_component() -> LayoutComponent:
+    return LayoutComponent("", "", None, None, None, 0.0, 0.0, "right", {}, BBox(0.0, 0.0, 0.0, 0.0))
 
 
 def _finalize_route(
@@ -1894,6 +2469,7 @@ def _route_known_motif(
     components: list[LayoutComponent] | None = None,
     labels: list[LayoutLabel] | None = None,
     route_policies: tuple[RoutePolicyHint, ...] = (),
+    canvas_bottom: float | None = None,
 ) -> list[LayoutWire] | None:
     motif_key = _key(motif)
     builders: dict[str, Callable[[dict[tuple[str, str], LayoutPin], dict[str, list[tuple[str, str]]]], dict[str, list[Point]] | None]] = {
@@ -1914,9 +2490,22 @@ def _route_known_motif(
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
             continue
-        policy = _policy_for_net(net, route_policies)
+        policy = _policy_for_net_with_context(
+            net,
+            route_policies,
+            semantic=semantic,
+            pins=[pin_map[key] for key in connected],
+            components=components or [],
+        )
         if policy == "bottom_auxiliary_corridor":
-            route = _bottom_auxiliary_corridor_route([pin_map[key] for key in connected], components or [])
+            route = _bottom_auxiliary_corridor_route(
+                [pin_map[key] for key in connected],
+                components or [],
+                net=net,
+                canvas_bottom=canvas_bottom,
+            )
+        elif policy in {"top_feedback_corridor", "bottom_feedback_corridor"}:
+            route = _feedback_corridor_route([pin_map[key] for key in connected], components or [], policy=policy)
         else:
             route = routes.get(net)
         if route is None:
@@ -2184,7 +2773,7 @@ def _single_input_route(receiver: LayoutPin, source: LayoutPin) -> list[Point]:
     approach = _opamp_input_approach(receiver)
     if abs(source.y - approach.y) < 1e-6:
         return [source_point, approach, receiver_point]
-    mid_x = (source.x + approach.x) / 2.0
+    mid_x = _single_input_mid_x(source, receiver, approach)
     return [
         source_point,
         Point(mid_x, source.y),
@@ -2192,6 +2781,17 @@ def _single_input_route(receiver: LayoutPin, source: LayoutPin) -> list[Point]:
         approach,
         receiver_point,
     ]
+
+
+def _single_input_mid_x(source: LayoutPin, receiver: LayoutPin, approach: Point) -> float:
+    left = min(source.x, approach.x)
+    right = max(source.x, approach.x)
+    span = max(0.1, right - left)
+    ratio = 0.4 if receiver.y > source.y else 0.62
+    if _pin_kind(receiver.pin_name) in {"-", "minus", "inverting"}:
+        ratio = 0.62 if receiver.y < source.y else 0.4
+    mid_x = left + span * ratio
+    return max(left + 0.42, min(right - 0.42, mid_x))
 
 
 def _op_amp_ground_route(pins: list[LayoutPin], *, right_gutter: float) -> list[Point]:
@@ -2268,7 +2868,7 @@ def _opamp_passive_input_route(receiver: LayoutPin, branches: list[LayoutPin]) -
 
 
 def _opamp_passive_input_bus_x(receiver: LayoutPin, branches: list[LayoutPin]) -> float:
-    return receiver.x + 0.18
+    return receiver.x - 0.62
 
 
 def _op_amp_output_route(
@@ -2291,6 +2891,8 @@ def _op_amp_output_route(
         receiver_point = Point(receiver.x, receiver.y)
         if receiver.component_id == driver.component_id:
             route.extend(_local_feedback_detour(driver, receiver, top_gutter=top_gutter, bottom_gutter=bottom_gutter))
+        elif receiver.x > driver.x + 0.45:
+            route.extend(_forward_opamp_input_detour(driver, receiver, branches))
         elif receiver.x < driver.x - 0.5 or abs(receiver.y - driver.y) > 2.0:
             if receiver.y > driver.y + 2.0:
                 bend_y = bottom_gutter
@@ -2330,6 +2932,33 @@ def _op_amp_output_route(
                 ]
             )
     return route
+
+
+def _forward_opamp_input_detour(driver: LayoutPin, receiver: LayoutPin, branches: list[LayoutPin]) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    receiver_point = Point(receiver.x, receiver.y)
+    approach = _opamp_input_approach(receiver)
+    available = max(0.85, approach.x - driver.x)
+    trunk_x = min(approach.x - 0.58, driver.x + min(3.2, available * 0.48))
+    same_lane_branches = [
+        branch.x
+        for branch in branches
+        if branch.x > driver.x + 0.25 and abs(branch.y - driver.y) < 0.35
+    ]
+    if same_lane_branches:
+        trunk_x = min(trunk_x, min(same_lane_branches) - 0.34)
+    if trunk_x <= driver.x + 0.2:
+        trunk_x = min(approach.x - 0.58, driver.x + 0.22)
+    return [
+        Point(trunk_x, driver.y),
+        Point(trunk_x, approach.y),
+        approach,
+        receiver_point,
+        approach,
+        Point(trunk_x, approach.y),
+        Point(trunk_x, driver.y),
+        driver_point,
+    ]
 
 
 def _local_feedback_detour(driver: LayoutPin, receiver: LayoutPin, *, top_gutter: float, bottom_gutter: float) -> list[Point]:
@@ -2628,6 +3257,12 @@ def _feedback_resistors_for_opamp(opamp: LayoutComponent, resistors: list[Layout
     input_nets = set(_opamp_input_nets_layout(opamp))
     if output_net is None:
         return []
+    if output_net in input_nets:
+        return [
+            resistor
+            for resistor in resistors
+            if output_net in set(resistor.pins.values()) and "feedback" in _key(resistor.role)
+        ]
     return [
         resistor
         for resistor in resistors

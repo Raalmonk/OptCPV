@@ -73,6 +73,8 @@ def _render_layout_svg(
                 continue
             parts.append(_draw_component_symbol(layout, component))
         for terminal in layout.semantic.local_terminals:
+            if _should_hide_local_terminal(layout, terminal):
+                continue
             parts.append(_draw_local_terminal_symbol(layout, terminal))
     if "labels" in layers:
         for label in layout.labels:
@@ -225,6 +227,13 @@ def _draw_local_terminal_symbol(layout: LayoutPlan, terminal: LocalTerminalInten
     )
 
 
+def _should_hide_local_terminal(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    if terminal.terminal_type not in {"positive_supply", "negative_supply"}:
+        return False
+    owner = next((component for component in layout.components if component.id == terminal.component_id), None)
+    return owner is not None and _is_opamp_component(owner)
+
+
 def _local_terminal_label(x: float, y: float, label: str) -> str:
     return f'<text class="terminal-label" x="{x:.1f}" y="{y:.1f}">{escape(label)}</text>'
 
@@ -356,3 +365,8 @@ def _bool_attr(value: bool) -> str:
 
 def _key(value: str | None) -> str:
     return (value or "").lower().replace("-", "_").replace(" ", "_")
+
+
+def _is_opamp_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
