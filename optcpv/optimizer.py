@@ -14,6 +14,7 @@ from .raster import rasterize_svg
 from .renderer import render_svg_layers
 from .semantic_repair import repair_circuit
 from .verifier import verify_layout_topology
+from .visual_review import VisualReview, VisualReviewClient, layout_patch_from_visual_review
 from .vision_agent import VisionLayoutClient
 
 
@@ -23,12 +24,16 @@ def draw_optimized_svg(
     max_iterations: int = 5,
     vision_client: VisionLayoutClient | None = None,
     planning_client: SemanticPlanningClient | None = None,
+    visual_review_client: VisualReviewClient | None = None,
+    reference_image: bytes | None = None,
 ) -> str:
     return draw_optimized_artifact(
         circuit,
         max_iterations=max_iterations,
         vision_client=vision_client,
         planning_client=planning_client,
+        visual_review_client=visual_review_client,
+        reference_image=reference_image,
     ).svg
 
 
@@ -38,9 +43,11 @@ def draw_optimized_artifact(
     max_iterations: int = 5,
     vision_client: VisionLayoutClient | None = None,
     planning_client: SemanticPlanningClient | None = None,
+    visual_review_client: VisualReviewClient | None = None,
+    reference_image: bytes | None = None,
 ) -> SchematicArtifact:
     native = circuit_from_any(circuit)
-    layout = plan_layout(native, planning_client=planning_client)
+    layout = plan_layout(native, planning_client=planning_client, reference_image=reference_image)
     verify_layout_topology(native, layout)
     layers = render_svg_layers(layout)
     reports = critique_parts(native, layout, layers.final_svg, layers=layers)
@@ -50,7 +57,13 @@ def draw_optimized_artifact(
     current_layout = layout
     current_svg = layers.final_svg
     current_reports = reports
-    repair_result = _evaluate_repair_candidate(native, current_reports, log=log, planning_client=planning_client)
+    repair_result = _evaluate_repair_candidate(
+        native,
+        current_reports,
+        log=log,
+        planning_client=planning_client,
+        reference_image=reference_image,
+    )
     if repair_result is not None:
         native, current_layout, current_svg, current_reports = repair_result
         best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
@@ -71,6 +84,22 @@ def draw_optimized_artifact(
             if current_reports.combined_report.score < best_reports.combined_report.score:
                 best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
             continue
+
+        if visual_review_client is not None:
+            visual_result = _evaluate_visual_review(
+                native,
+                current_layout,
+                current_svg,
+                current_reports,
+                visual_review_client,
+                iteration=iteration,
+                log=log,
+            )
+            if visual_result is not None:
+                current_layout, current_svg, current_reports = visual_result
+                if current_reports.combined_report.score <= best_reports.combined_report.score:
+                    best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
+                continue
 
         if vision_client is None:
             break
@@ -126,12 +155,13 @@ def _evaluate_repair_candidate(
     *,
     log: list[dict],
     planning_client: SemanticPlanningClient | None,
+    reference_image: bytes | None,
 ) -> tuple[Circuit, LayoutPlan, str, CriticBreakdown] | None:
     repaired = repair_circuit(circuit)
     if repaired == circuit:
         return None
     try:
-        candidate_layout = plan_layout(repaired, planning_client=planning_client)
+        candidate_layout = plan_layout(repaired, planning_client=planning_client, reference_image=reference_image)
         verify_layout_topology(repaired, candidate_layout)
         candidate_layers = render_svg_layers(candidate_layout)
         candidate_reports = critique_parts(
@@ -177,6 +207,7 @@ def _evaluate_patch(
     iteration: int,
     source: str,
     log: list[dict],
+    visual_review: VisualReview | None = None,
 ) -> tuple[LayoutPlan, str, CriticBreakdown] | None:
     if _empty_patch(patch):
         log.append(
@@ -204,18 +235,83 @@ def _evaluate_patch(
         return None
     candidate_layers = render_svg_layers(candidate_layout)
     candidate_reports = critique_parts(circuit, candidate_layout, candidate_layers.final_svg, layers=candidate_layers)
-    accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5
+    hard_before = sum(1 for violation in current_reports.combined_report.violations if violation.hard)
+    hard_after = sum(1 for violation in candidate_reports.combined_report.violations if violation.hard)
+    accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5 or hard_after < hard_before
+    if accepted and visual_review is not None:
+        candidate_layout = replace(
+            candidate_layout,
+            support=replace(candidate_layout.support, visual_review=visual_review.to_dict()),
+        )
     log.append(
         {
             "iteration": iteration,
             "source": source,
             "score": candidate_reports.combined_report.score,
             "accepted": accepted,
+            "hard_failures_before": hard_before,
+            "hard_failures_after": hard_after,
         }
     )
     if not accepted:
         return None
     return candidate_layout, candidate_layers.final_svg, candidate_reports
+
+
+def _evaluate_visual_review(
+    circuit: Circuit,
+    current_layout: LayoutPlan,
+    current_svg: str,
+    current_reports: CriticBreakdown,
+    visual_review_client: VisualReviewClient,
+    *,
+    iteration: int,
+    log: list[dict],
+) -> tuple[LayoutPlan, str, CriticBreakdown] | None:
+    try:
+        raster = rasterize_svg(current_svg)
+        review = visual_review_client.review(circuit, current_layout, current_svg, raster, current_reports.combined_report)
+        reviewed_layout = replace(
+            current_layout,
+            support=replace(current_layout.support, visual_review=review.to_dict()),
+        )
+        patch = layout_patch_from_visual_review(review, reviewed_layout)
+    except Exception as exc:
+        log.append(
+            {
+                "iteration": iteration,
+                "source": "visual_review",
+                "score": current_reports.combined_report.score,
+                "accepted": False,
+                "reason": f"visual_review_client_error: {exc}",
+            }
+        )
+        return None
+
+    result = _evaluate_patch(
+        circuit,
+        reviewed_layout,
+        current_reports,
+        patch,
+        iteration=iteration,
+        source="visual_review",
+        log=log,
+        visual_review=review,
+    )
+    if result is not None:
+        return result
+    if review.passed:
+        log.append(
+            {
+                "iteration": iteration,
+                "source": "visual_review",
+                "score": current_reports.combined_report.score,
+                "accepted": True,
+                "reason": "review_passed_no_patch",
+            }
+        )
+        return reviewed_layout, current_svg, current_reports
+    return None
 
 
 def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:

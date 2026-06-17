@@ -15,11 +15,12 @@ def draw_svg(
     *,
     style: str = "textbook",
     planning_client: SemanticPlanningClient | None = None,
+    reference_image: bytes | None = None,
 ) -> str:
     """Return a one-pass Schemdraw SVG for a native OptCPV circuit description."""
 
     native = circuit_from_any(circuit)
-    layout = plan_layout(native, planning_client=planning_client)
+    layout = plan_layout(native, planning_client=planning_client, reference_image=reference_image)
     verify_layout_topology(native, layout)
     return render_svg(layout, style=style)
 
@@ -29,11 +30,12 @@ def draw_artifact(
     *,
     style: str = "textbook",
     planning_client: SemanticPlanningClient | None = None,
+    reference_image: bytes | None = None,
 ) -> SchematicArtifact:
     """Return a deterministic artifact with topology, vector, and CV criticism."""
 
     native = circuit_from_any(circuit)
-    layout = plan_layout(native, planning_client=planning_client)
+    layout = plan_layout(native, planning_client=planning_client, reference_image=reference_image)
     verify_layout_topology(native, layout)
     svg = render_svg(layout, style=style)
     reports = critique_parts(native, layout, svg)
@@ -65,6 +67,11 @@ def artifact_from_layout(
         viewbox={"x": 0, "y": 0, "width": layout.width, "height": layout.height},
         layout_support=layout.support.to_dict(),
         semantic_plan=layout.semantic.to_dict(),
+        planning_hints_used=layout.support.planning_hints,
+        visual_review_result=layout.support.visual_review,
+        tutor_explanation=_tutor_explanation(layout),
+        fallback_used=layout.support.fallback_used,
+        layout_confidence=layout.support.layout_confidence,
         critic_report=combined_dict,
         vector_report=vector_report.to_dict() if vector_report else None,
         cv_report=cv_report.to_dict() if cv_report else None,
@@ -131,3 +138,16 @@ def _label_metadata(layout: LayoutPlan) -> dict[str, dict]:
         }
         for label in layout.labels
     }
+
+
+def _tutor_explanation(layout: LayoutPlan) -> str:
+    if layout.support.tutor_explanation:
+        return layout.support.tutor_explanation
+    if layout.support.planning_hints:
+        text = str(layout.support.planning_hints.get("tutor_explanation") or "")
+        if text:
+            return text
+    motif = ", ".join(layout.support.matched_motifs)
+    if motif:
+        return f"OptCPV arranged this schematic as a {motif} teaching layout."
+    return "OptCPV arranged this schematic with topology-preserving deterministic placement."

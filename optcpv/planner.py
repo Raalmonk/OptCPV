@@ -28,7 +28,10 @@ from .models import (
     TopologySemanticPlan,
     circuit_from_any,
 )
-from .planning_agent import PlanningHints, SemanticPlanningClient
+from .hint_legalizer import legalize_planning_hints
+from .planning_agent import SemanticPlanningClient
+from .planning_hints import RoutePolicyHint, SchematicLayoutHints
+from .route_contract import assert_no_diagonal_wires, orthogonalize_route
 from .semantics import (
     classify_net,
     is_local_terminal_net,
@@ -59,12 +62,18 @@ NATIVE_MOTIFS = {
 def plan_layout(
     circuit: Circuit | dict,
     *,
-    planning_hints: PlanningHints | dict | None = None,
+    planning_hints: SchematicLayoutHints | dict | None = None,
     planning_client: SemanticPlanningClient | None = None,
+    reference_image: bytes | None = None,
 ) -> LayoutPlan:
     native = circuit_from_any(circuit)
     base_layout = _plan_layout_deterministic(native)
-    hints = _resolve_planning_hints(native, planning_hints=planning_hints, planning_client=planning_client)
+    hints = _resolve_planning_hints(
+        native,
+        planning_hints=planning_hints,
+        planning_client=planning_client,
+        reference_image=reference_image,
+    )
     if hints is None:
         return base_layout
     candidate = _layout_from_planning_hints(native, base_layout, hints)
@@ -869,23 +878,30 @@ def _route_motif(circuit: Circuit, support: LayoutSupport) -> str:
 def _resolve_planning_hints(
     circuit: Circuit,
     *,
-    planning_hints: PlanningHints | dict | None,
+    planning_hints: SchematicLayoutHints | dict | None,
     planning_client: SemanticPlanningClient | None,
-) -> PlanningHints | None:
+    reference_image: bytes | None,
+) -> SchematicLayoutHints | None:
     if planning_hints is not None and planning_client is not None:
         raise ValueError("Pass either planning_hints or planning_client, not both.")
     if isinstance(planning_hints, dict):
-        return PlanningHints.from_dict(planning_hints)
+        return SchematicLayoutHints.from_dict(planning_hints)
     if planning_hints is not None:
         return planning_hints
     if planning_client is None:
         return None
-    return planning_client.propose_hints(circuit)
-
-
-def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints: PlanningHints) -> LayoutPlan | None:
     try:
-        placements = _legalize_hint_placements(circuit, base_layout, hints)
+        return planning_client.propose_hints(circuit, reference_image=reference_image)
+    except TypeError:
+        return planning_client.propose_hints(circuit)
+
+
+def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints: SchematicLayoutHints) -> LayoutPlan | None:
+    legal_hints = legalize_planning_hints(circuit, hints)
+    if legal_hints is None:
+        return None
+    try:
+        placements = _hint_placements(circuit, base_layout, legal_hints)
     except ValueError:
         return None
     if placements is None:
@@ -893,7 +909,11 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
 
     support = replace(
         base_layout.support,
-        notes=_unique((*base_layout.support.notes, "pre-layout semantic planning hints accepted")),
+        layout_confidence=max(base_layout.support.layout_confidence, legal_hints.confidence),
+        fallback_used=False,
+        notes=_unique((*base_layout.support.notes, "external semantic planning hints applied")),
+        planning_hints=legal_hints.to_dict(),
+        tutor_explanation=legal_hints.tutor_explanation or base_layout.support.tutor_explanation,
     )
     candidate = _build_layout(
         circuit,
@@ -911,105 +931,233 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         verify_layout_topology(circuit, candidate)
         base_report = critique_layout(base_layout)
         candidate_report = critique_layout(candidate)
+        assert_no_diagonal_wires(candidate)
     except Exception:
         return None
-    if candidate_report.score > base_report.score:
+    base_hard = sum(1 for violation in base_report.violations if violation.hard)
+    candidate_hard = sum(1 for violation in candidate_report.violations if violation.hard)
+    if any(violation.code == "component_overlap" for violation in candidate_report.violations):
+        return None
+    if candidate_hard > base_hard or candidate_report.score > base_report.score:
         return None
     return candidate
 
 
-def _legalize_hint_placements(
+def _hint_placements(
     circuit: Circuit,
     base_layout: LayoutPlan,
-    hints: PlanningHints,
+    hints: SchematicLayoutHints,
 ) -> dict[str, tuple[float, float, str]] | None:
-    component_ids = {component.id for component in circuit.components}
-    net_names = {net for component in circuit.components for net in component.pins.values()}
-    if not hints.placement_hints:
-        return None
-    if unknown := (set(hints.placement_hints) - component_ids):
-        raise ValueError(f"Planning hints reference unknown components: {sorted(unknown)}")
-
-    for stage in hints.stage_order:
-        _reject_unknown_members(stage.members, component_ids, "stage")
-    for lane in hints.lanes:
-        if lane.source and lane.source not in component_ids:
-            raise ValueError(f"Planning lane source {lane.source} is not a known component.")
-        _reject_unknown_members(lane.members, component_ids, "lane")
-    for motif in hints.motifs:
-        _reject_unknown_members(motif.members, component_ids, "motif")
-
-    terminal_nets = {
-        net
-        for net in net_names
-        if classify_net(net) in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}
-    }
-    unknown_policy_nets = set(hints.local_terminal_policy) - net_names
-    if unknown_policy_nets:
-        raise ValueError(f"Planning hints reference unknown terminal nets: {sorted(unknown_policy_nets)}")
-    for net in terminal_nets:
-        policy = hints.local_terminal_policy.get(net)
-        if policy is not None and policy != "local_symbol_only":
-            raise ValueError(f"Planning hints may not route terminal net {net}.")
-    for rule in hints.routing_rules:
-        lowered = _key(rule)
-        if any(_key(net) in lowered for net in terminal_nets) and any(token in lowered for token in ["route", "global", "rail", "bus"]):
-            raise ValueError("Planning routing rules may not ask for routed terminal rails.")
-
-    grid_cells = _resolve_duplicate_hint_cells(hints)
-    _reject_backward_signal_flow(base_layout, grid_cells)
-
     base_components = {component.id: component for component in base_layout.components}
     placements = {component.id: (component.x, component.y, component.orientation) for component in base_layout.components}
     span_x = base_layout.width / base_layout.grid
     span_y = base_layout.height / base_layout.grid
-    max_col = max((col for col, _ in grid_cells.values()), default=0)
-    col_spacing = max(2.8, min(4.6, (span_x - 3.0) / max(1, max_col)))
-    x_origin = 1.4
-    center_y = _median_component_y(base_layout.components)
-    row_spacing = 2.35
+    orientations = {
+        hint.component_id: _legalized_hint_orientation(base_components[hint.component_id], hint.orientation)
+        for hint in hints.placements
+    }
+    stage_positions = _hint_stage_positions(hints, base_components, orientations, span_x)
+    lane_positions = _hint_lane_positions(hints, base_components, orientations, span_y)
 
-    for component_id, (col, row) in grid_cells.items():
+    for hint in hints.placements:
+        component_id = hint.component_id
         component = base_components[component_id]
-        hint = hints.placement_hints[component_id]
-        orientation = _legalized_hint_orientation(component, hint.orientation)
-        x = _clamp(x_origin + col * col_spacing, 1.1, span_x - 1.2)
-        y = _clamp(center_y + row * row_spacing, 1.05, span_y - 1.05)
+        orientation = orientations[component_id]
+        x = _clamp(stage_positions[hint.stage_x], 0.6, span_x - 0.6)
+        y = _clamp(lane_positions[hint.lane_y], 0.6, span_y - 0.6)
+        x, y = _clamp_anchor_to_canvas(component, x, y, orientation, span_x, span_y)
         placements[component_id] = (x, y, orientation)
-    return placements
+    return _relax_hint_component_overlaps(base_components, placements, span_x, span_y)
 
 
-def _reject_unknown_members(members: tuple[str, ...], component_ids: set[str], owner: str) -> None:
-    if unknown := (set(members) - component_ids):
-        raise ValueError(f"Planning {owner} references unknown components: {sorted(unknown)}")
+def _hint_stage_positions(
+    hints: SchematicLayoutHints,
+    components: dict[str, LayoutComponent],
+    orientations: dict[str, str],
+    span_x: float,
+) -> dict[int, float]:
+    stages = sorted({hint.stage_x for hint in hints.placements})
+    if not stages:
+        return {}
+    extents: dict[int, tuple[float, float]] = {}
+    for stage in stages:
+        left = right = 0.0
+        for hint in hints.placements:
+            if hint.stage_x != stage:
+                continue
+            component = components[hint.component_id]
+            component_left, component_right, _, _ = _hint_bbox_extents(component, orientations[component.id])
+            left = max(left, component_left)
+            right = max(right, component_right)
+        extents[stage] = (left, right)
+
+    minimum_stage = min(stages)
+    maximum_stage = max(stages)
+    naive_gap = (span_x - 2.4) / max(1, maximum_stage - minimum_stage)
+    positions: dict[int, float] = {}
+    cursor_right = 0.55
+    for stage in stages:
+        left, right = extents[stage]
+        semantic_target = 1.2 + (stage - minimum_stage) * naive_gap
+        x = max(semantic_target, cursor_right + left + 0.32)
+        positions[stage] = x
+        cursor_right = x + right
+
+    overflow = cursor_right - (span_x - 0.55)
+    if overflow > 0 and len(stages) > 1:
+        first = positions[stages[0]]
+        last = positions[stages[-1]]
+        usable = max(1.0, last - first)
+        scale = max(0.72, (usable - overflow) / usable)
+        for stage in stages:
+            positions[stage] = first + (positions[stage] - first) * scale
+    return positions
 
 
-def _resolve_duplicate_hint_cells(hints: PlanningHints) -> dict[str, tuple[int, int]]:
-    occupied: set[tuple[int, int]] = set()
-    result: dict[str, tuple[int, int]] = {}
-    ordered = sorted(hints.placement_hints.values(), key=lambda hint: (hint.col, hint.row, hint.component_id))
-    for hint in ordered:
-        row = hint.row
-        cell = (hint.col, row)
-        while cell in occupied:
-            row += 1
-            cell = (hint.col, row)
-        occupied.add(cell)
-        result[hint.component_id] = cell
+def _hint_lane_positions(
+    hints: SchematicLayoutHints,
+    components: dict[str, LayoutComponent],
+    orientations: dict[str, str],
+    span_y: float,
+) -> dict[int, float]:
+    lanes = sorted({hint.lane_y for hint in hints.placements})
+    if not lanes:
+        return {}
+    extents: dict[int, tuple[float, float]] = {}
+    for lane in lanes:
+        top = bottom = 0.0
+        for hint in hints.placements:
+            if hint.lane_y != lane:
+                continue
+            component = components[hint.component_id]
+            _, _, component_top, component_bottom = _hint_bbox_extents(component, orientations[component.id])
+            top = max(top, component_top)
+            bottom = max(bottom, component_bottom)
+        extents[lane] = (top, bottom)
+
+    minimum_lane = min(lanes)
+    maximum_lane = max(lanes)
+    naive_gap = (span_y - 1.6) / max(1, maximum_lane - minimum_lane)
+    positions: dict[int, float] = {}
+    cursor_bottom = 0.45
+    for lane in lanes:
+        top, bottom = extents[lane]
+        semantic_target = 0.8 + (lane - minimum_lane) * naive_gap
+        y = max(semantic_target, cursor_bottom + top + 0.18)
+        positions[lane] = y
+        cursor_bottom = y + bottom
+
+    overflow = cursor_bottom - (span_y - 0.45)
+    if overflow > 0 and len(lanes) > 1:
+        first = positions[lanes[0]]
+        last = positions[lanes[-1]]
+        usable = max(1.0, last - first)
+        scale = max(0.78, (usable - overflow) / usable)
+        for lane in lanes:
+            positions[lane] = first + (positions[lane] - first) * scale
+    return positions
+
+
+def _hint_bbox_extents(component: LayoutComponent, orientation: str) -> tuple[float, float, float, float]:
+    bbox = _component_bbox(component.type, 0.0, 0.0, orientation)
+    return (-bbox.x, bbox.right, -bbox.y, bbox.bottom)
+
+
+def _clamp_anchor_to_canvas(
+    component: LayoutComponent,
+    x: float,
+    y: float,
+    orientation: str,
+    span_x: float,
+    span_y: float,
+) -> tuple[float, float]:
+    bbox = _component_bbox(component.type, x, y, orientation)
+    if bbox.x < 0.25:
+        x += 0.25 - bbox.x
+    if bbox.right > span_x - 0.25:
+        x -= bbox.right - (span_x - 0.25)
+    bbox = _component_bbox(component.type, x, y, orientation)
+    if bbox.y < 0.25:
+        y += 0.25 - bbox.y
+    if bbox.bottom > span_y - 0.25:
+        y -= bbox.bottom - (span_y - 0.25)
+    return (x, y)
+
+
+def _relax_hint_component_overlaps(
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    hinted_ids = [component_id for component_id in result if component_id in components]
+    for _ in range(80):
+        boxes = {
+            component_id: _component_bbox(components[component_id].type, *result[component_id])
+            for component_id in hinted_ids
+        }
+        overlap = _first_component_overlap(boxes)
+        if overlap is None:
+            return result
+        left_id, right_id = overlap
+        moving_id, fixed_id = _overlap_move_order(components[left_id], components[right_id])
+        moving_box = boxes[moving_id]
+        fixed_box = boxes[fixed_id]
+        x, y, orientation = result[moving_id]
+        overlap_x = min(moving_box.right, fixed_box.right) - max(moving_box.x, fixed_box.x)
+        overlap_y = min(moving_box.bottom, fixed_box.bottom) - max(moving_box.y, fixed_box.y)
+        if overlap_y <= overlap_x + 0.08:
+            direction = 1.0 if moving_box.center.y >= fixed_box.center.y else -1.0
+            y = _try_shift_anchor_y(components[moving_id], x, y, orientation, direction * (overlap_y + 0.22), span_y)
+        else:
+            direction = 1.0 if moving_box.center.x >= fixed_box.center.x else -1.0
+            x = _try_shift_anchor_x(components[moving_id], x, y, orientation, direction * (overlap_x + 0.22), span_x)
+        result[moving_id] = _clamp_anchor_to_canvas(components[moving_id], x, y, orientation, span_x, span_y) + (orientation,)
     return result
 
 
-def _reject_backward_signal_flow(base_layout: LayoutPlan, grid_cells: dict[str, tuple[int, int]]) -> None:
-    feedback_nets = {net for motif in base_layout.semantic.motifs for net in motif.feedback_nets}
-    for route in base_layout.semantic.routes:
-        if route.net in feedback_nets:
-            continue
-        source_cell = grid_cells.get(route.source[0])
-        target_cell = grid_cells.get(route.target[0])
-        if source_cell is None or target_cell is None:
-            continue
-        if target_cell[0] < source_cell[0]:
-            raise ValueError(f"Planning hints route {route.net} backward from {route.source[0]} to {route.target[0]}.")
+def _first_component_overlap(boxes: dict[str, BBox]) -> tuple[str, str] | None:
+    ids = sorted(boxes)
+    for index, left_id in enumerate(ids):
+        for right_id in ids[index + 1 :]:
+            if boxes[left_id].intersects(boxes[right_id], padding=0.05):
+                return (left_id, right_id)
+    return None
+
+
+def _overlap_move_order(left: LayoutComponent, right: LayoutComponent) -> tuple[str, str]:
+    if _component_layout_priority(left) < _component_layout_priority(right):
+        return (left.id, right.id)
+    if _component_layout_priority(right) < _component_layout_priority(left):
+        return (right.id, left.id)
+    return (right.id, left.id) if (right.x, right.y) >= (left.x, left.y) else (left.id, right.id)
+
+
+def _component_layout_priority(component: LayoutComponent) -> int:
+    if _is_opamp_layout(component):
+        return 100
+    if _is_input_or_source_layout(component) or _is_output_layout(component):
+        return 80
+    if _is_ground_layout(component):
+        return 25
+    return 50
+
+
+def _try_shift_anchor_y(component: LayoutComponent, x: float, y: float, orientation: str, delta: float, span_y: float) -> float:
+    for candidate in (y + delta, y - delta):
+        bbox = _component_bbox(component.type, x, candidate, orientation)
+        if bbox.y >= 0.25 and bbox.bottom <= span_y - 0.25:
+            return candidate
+    return y + delta
+
+
+def _try_shift_anchor_x(component: LayoutComponent, x: float, y: float, orientation: str, delta: float, span_x: float) -> float:
+    for candidate in (x + delta, x - delta):
+        bbox = _component_bbox(component.type, candidate, y, orientation)
+        if bbox.x >= 0.25 and bbox.right <= span_x - 0.25:
+            return candidate
+    return x + delta
 
 
 def _legalized_hint_orientation(component: LayoutComponent, orientation: str | None) -> str:
@@ -1066,20 +1214,22 @@ def _build_layout(
         fallback_component_ids,
     )
     semantic = _build_semantic_plan(circuit, components, pin_map, net_to_pins)
-    return LayoutPlan(
+    wires = _route_wires(
+        pin_map,
+        net_to_pins,
+        motif=_route_motif(circuit, layout_support),
+        semantic=semantic,
+        components=components,
+        labels=labels,
+        route_policies=_route_policy_hints(layout_support),
+    )
+    layout = LayoutPlan(
         circuit_id=circuit.id,
         width=width,
         height=height,
         grid=grid,
         components=components,
-        wires=_route_wires(
-            pin_map,
-            net_to_pins,
-            motif=_route_motif(circuit, layout_support),
-            semantic=semantic,
-            components=components,
-            labels=labels,
-        ),
+        wires=wires,
         labels=labels,
         pin_map=pin_map,
         net_to_pins=net_to_pins,
@@ -1088,6 +1238,8 @@ def _build_layout(
         support=layout_support,
         semantic=semantic,
     )
+    assert_no_diagonal_wires(layout)
+    return layout
 
 
 def _build_semantic_plan(
@@ -1459,8 +1611,17 @@ def _route_wires(
     semantic: TopologySemanticPlan | None = None,
     components: list[LayoutComponent] | None = None,
     labels: list[LayoutLabel] | None = None,
+    route_policies: tuple[RoutePolicyHint, ...] = (),
 ) -> list[LayoutWire]:
-    motif_routes = _route_known_motif(pin_map, net_to_pins, motif, semantic=semantic, components=components, labels=labels)
+    motif_routes = _route_known_motif(
+        pin_map,
+        net_to_pins,
+        motif,
+        semantic=semantic,
+        components=components,
+        labels=labels,
+        route_policies=route_policies,
+    )
     if motif_routes is not None:
         return motif_routes
 
@@ -1468,13 +1629,26 @@ def _route_wires(
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
             continue
-        route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
+        policy = _policy_for_net(net, route_policies)
+        if policy == "bottom_auxiliary_corridor":
+            route = _bottom_auxiliary_corridor_route([pin_map[key] for key in connected], components or [])
+        else:
+            route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
         if not route:
             continue
         wires.append(
             LayoutWire(
                 net=net,
-                points=_finalize_route(net, connected, route, pin_map, semantic=semantic, components=components, labels=labels),
+                points=_finalize_route(
+                    net,
+                    connected,
+                    route,
+                    pin_map,
+                    semantic=semantic,
+                    components=components,
+                    labels=labels,
+                    preferred_policy=policy,
+                ),
                 connected_pins=connected,
             )
         )
@@ -1498,6 +1672,65 @@ def _generic_route(points: list[Point]) -> list[Point]:
     return route
 
 
+def _route_policy_hints(support: LayoutSupport) -> tuple[RoutePolicyHint, ...]:
+    raw = (support.planning_hints or {}).get("route_policies", [])
+    policies: list[RoutePolicyHint] = []
+    if not isinstance(raw, list):
+        return ()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            policies.append(RoutePolicyHint.from_dict(item))
+        except ValueError:
+            continue
+    return tuple(policies)
+
+
+def _policy_for_net(net: str, policies: tuple[RoutePolicyHint, ...]) -> str | None:
+    for policy in policies:
+        if policy.net == net:
+            return policy.policy
+    net_key = _key(net)
+    for policy in policies:
+        role_key = _key(policy.net_role)
+        if policy.net is not None:
+            continue
+        if policy.policy == "bottom_auxiliary_corridor" and (
+            any(token in role_key for token in ("right_leg", "rld", "aux", "common_mode", "cmfb"))
+            or any(token in net_key for token in ("right_leg", "rld", "aux", "cmfb"))
+        ):
+            return policy.policy
+    if any(token in net_key for token in ("rld", "right_leg", "driven_right_leg", "cmfb")):
+        return "bottom_auxiliary_corridor"
+    return None
+
+
+def _bottom_auxiliary_corridor_route(pins: list[LayoutPin], components: list[LayoutComponent]) -> list[Point]:
+    if len(pins) < 2:
+        return []
+    ordered = sorted(
+        pins,
+        key=lambda pin: (
+            0 if _is_opamp_output_pin(pin.pin_name) else 1,
+            pin.x,
+            pin.y,
+            pin.component_id,
+            pin.pin_name,
+        ),
+    )
+    bottom = max([pin.y for pin in pins] + [component.bbox.bottom for component in components])
+    corridor_y = bottom + 0.85
+    start = ordered[0]
+    start_point = Point(start.x, start.y)
+    route = [start_point, Point(start.x, corridor_y)]
+    for pin in ordered[1:]:
+        tap = Point(pin.x, corridor_y)
+        pin_point = Point(pin.x, pin.y)
+        route.extend([tap, pin_point, tap])
+    return route
+
+
 def _finalize_route(
     net: str,
     connected: list[tuple[str, str]],
@@ -1507,6 +1740,7 @@ def _finalize_route(
     semantic: TopologySemanticPlan | None,
     components: list[LayoutComponent] | None,
     labels: list[LayoutLabel] | None,
+    preferred_policy: str | None = None,
 ) -> list[Point]:
     route = _dedupe(route)
     return _dedupe(
@@ -1518,6 +1752,7 @@ def _finalize_route(
             semantic=semantic,
             components=components or [],
             labels=labels or [],
+            preferred_policy=preferred_policy,
         )
     )
 
@@ -1531,6 +1766,7 @@ def _orthogonalize_route(
     semantic: TopologySemanticPlan | None,
     components: list[LayoutComponent],
     labels: list[LayoutLabel],
+    preferred_policy: str | None = None,
 ) -> list[Point]:
     if len(points) < 2:
         return points
@@ -1542,6 +1778,7 @@ def _orthogonalize_route(
         if _is_feedback_related_net(net, semantic) and _is_opamp_layout(component)
     ]
     endpoint_kinds = _route_endpoint_kinds(pin_map, components)
+    points = orthogonalize_route(points, [*component_keepouts, *feedback_keepouts], preferred_policy=preferred_policy)
 
     fixed = [points[0]]
     for end in points[1:]:
@@ -1656,6 +1893,7 @@ def _route_known_motif(
     semantic: TopologySemanticPlan | None = None,
     components: list[LayoutComponent] | None = None,
     labels: list[LayoutLabel] | None = None,
+    route_policies: tuple[RoutePolicyHint, ...] = (),
 ) -> list[LayoutWire] | None:
     motif_key = _key(motif)
     builders: dict[str, Callable[[dict[tuple[str, str], LayoutPin], dict[str, list[tuple[str, str]]]], dict[str, list[Point]] | None]] = {
@@ -1676,14 +1914,27 @@ def _route_known_motif(
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
             continue
-        route = routes.get(net)
+        policy = _policy_for_net(net, route_policies)
+        if policy == "bottom_auxiliary_corridor":
+            route = _bottom_auxiliary_corridor_route([pin_map[key] for key in connected], components or [])
+        else:
+            route = routes.get(net)
         if route is None:
             route = _generic_route([_point(pin_map, key) for key in connected])
         if route:
             wires.append(
                 LayoutWire(
                     net=net,
-                    points=_finalize_route(net, connected, route, pin_map, semantic=semantic, components=components, labels=labels),
+                    points=_finalize_route(
+                        net,
+                        connected,
+                        route,
+                        pin_map,
+                        semantic=semantic,
+                        components=components,
+                        labels=labels,
+                        preferred_policy=policy,
+                    ),
                     connected_pins=connected,
                 )
             )

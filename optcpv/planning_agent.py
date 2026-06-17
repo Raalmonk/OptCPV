@@ -1,179 +1,127 @@
-"""Optional pre-layout semantic planning client boundary."""
+"""Optional pre-render semantic planning client boundary."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
+import os
 import re
 from typing import Any
 
 from .models import Circuit
+from .planning_hints import (
+    GridPlacementHint,
+    LaneHint,
+    MotifHint,
+    PlanningHints,
+    RoutePolicyHint,
+    SchematicLayoutHints,
+    SchematicPlanningRequest,
+    StageHint,
+)
+
+
+DEFAULT_GEMINI_PLANNER_MODEL = "gemini-3.5-flash"
 
 
 class SemanticPlanningClient:
-    """Boundary for heuristic pre-layout planning hints."""
+    """Boundary for pre-layout semantic planning hints."""
 
-    def propose_hints(self, circuit: Circuit) -> "PlanningHints":
+    def propose_hints(self, circuit: Circuit, reference_image: bytes | None = None) -> SchematicLayoutHints:
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
-class StageHint:
-    stage: int
-    stage_type: str
-    members: tuple[str, ...]
+@dataclass
+class FakePlanningClient(SemanticPlanningClient):
+    """Test double that returns a pre-baked hint object."""
 
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "StageHint":
-        return cls(
-            stage=int(raw["stage"]),
-            stage_type=str(raw.get("type", raw.get("stage_type", ""))),
-            members=tuple(str(item) for item in raw.get("members", ())),
-        )
+    hints: SchematicLayoutHints
 
-
-@dataclass(frozen=True)
-class LaneHint:
-    lane: int
-    source: str
-    members: tuple[str, ...]
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "LaneHint":
-        return cls(
-            lane=int(raw["lane"]),
-            source=str(raw.get("source", "")),
-            members=tuple(str(item) for item in raw.get("members", ())),
-        )
-
-
-@dataclass(frozen=True)
-class MotifHint:
-    motif_type: str
-    members: tuple[str, ...]
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "MotifHint":
-        return cls(
-            motif_type=str(raw.get("type", raw.get("motif_type", ""))),
-            members=tuple(str(item) for item in raw.get("members", ())),
-        )
-
-
-@dataclass(frozen=True)
-class GridPlacementHint:
-    component_id: str
-    col: int
-    row: int
-    orientation: str | None = None
-    motif_role: str | None = None
-
-    @classmethod
-    def from_dict(cls, component_id: str, raw: dict[str, Any]) -> "GridPlacementHint":
-        if "x" in raw or "y" in raw:
-            raise ValueError("Planning hints must use integer grid col/row, not absolute x/y coordinates.")
-        return cls(
-            component_id=component_id,
-            col=int(raw["col"]),
-            row=int(raw["row"]),
-            orientation=str(raw["orientation"]) if raw.get("orientation") is not None else None,
-            motif_role=str(raw["motif_role"]) if raw.get("motif_role") is not None else None,
-        )
-
-
-@dataclass(frozen=True)
-class PlanningHints:
-    recognized_topology: str = ""
-    confidence: float = 0.0
-    stage_order: tuple[StageHint, ...] = field(default_factory=tuple)
-    lanes: tuple[LaneHint, ...] = field(default_factory=tuple)
-    placement_hints: dict[str, GridPlacementHint] = field(default_factory=dict)
-    local_terminal_policy: dict[str, str] = field(default_factory=dict)
-    routing_rules: tuple[str, ...] = field(default_factory=tuple)
-    motifs: tuple[MotifHint, ...] = field(default_factory=tuple)
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "PlanningHints":
-        placements_raw = raw.get("placement_hints", {})
-        if not isinstance(placements_raw, dict):
-            raise ValueError("planning_hints.placement_hints must be an object.")
-        return cls(
-            recognized_topology=str(raw.get("recognized_topology", "")),
-            confidence=float(raw.get("confidence", 0.0)),
-            stage_order=tuple(StageHint.from_dict(item) for item in raw.get("stage_order", ())),
-            lanes=tuple(LaneHint.from_dict(item) for item in raw.get("lanes", ())),
-            placement_hints={
-                str(component_id): GridPlacementHint.from_dict(str(component_id), hint)
-                for component_id, hint in placements_raw.items()
-            },
-            local_terminal_policy={str(net): str(policy) for net, policy in raw.get("local_terminal_policy", {}).items()},
-            routing_rules=tuple(str(rule) for rule in raw.get("routing_rules", ())),
-            motifs=tuple(MotifHint.from_dict(item) for item in raw.get("motifs", ())),
-        )
+    def propose_hints(self, circuit: Circuit, reference_image: bytes | None = None) -> SchematicLayoutHints:
+        return self.hints.with_updates(source="fake")
 
 
 class GeminiPlanningClient(SemanticPlanningClient):
     """Optional Gemini-backed semantic warm-start client."""
 
-    def __init__(self, api_key: str | None = None, model: str = "gemini-3.5-flash") -> None:
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         try:
             from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
         except ImportError as exc:
             raise RuntimeError("Install optcpv[vision] to use GeminiPlanningClient.") from exc
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
-        self._model = model
+        self._model = model or os.getenv("OPTCPV_GEMINI_PLANNER_MODEL", DEFAULT_GEMINI_PLANNER_MODEL)
+        self._types = types
 
-    def propose_hints(self, circuit: Circuit) -> PlanningHints:
+    def propose_hints(self, circuit: Circuit, reference_image: bytes | None = None) -> SchematicLayoutHints:
+        input_mode = "image_guided" if reference_image else "model_guided"
+        prompt = _planning_prompt(circuit, input_mode=input_mode, has_reference_image=reference_image is not None)
+        contents: list[Any] = [prompt]
+        if reference_image is not None:
+            contents.append(self._types.Part.from_bytes(data=reference_image, mime_type="image/png"))
         response = self._client.models.generate_content(
             model=self._model,
-            contents=[_planning_prompt(circuit)],
+            contents=contents,
             config={"response_mime_type": "application/json"},
         )
         text = (getattr(response, "text", "") or "").strip()
-        return PlanningHints.from_dict(_json_object(text))
+        return SchematicLayoutHints.from_dict(_json_object(text)).with_updates(source="gemini")
 
 
-def _planning_prompt(circuit: Circuit) -> str:
+def _planning_prompt(circuit: Circuit, *, input_mode: str, has_reference_image: bool) -> str:
+    request = SchematicPlanningRequest.from_circuit(
+        circuit,
+        input_mode=input_mode,
+        reference_image={"provided": True, "role": "relative teaching schematic reference"} if has_reference_image else None,
+    )
     payload = {
-        "task": "Return OptCPV pre-layout semantic planning hints as strict JSON only.",
+        "task": "Return OptCPV pre-render semantic schematic layout hints as strict JSON only.",
+        "input_mode": input_mode,
         "hard_rules": [
-            "Do not create, delete, rename, or rewire components, pins, or nets.",
-            "Do not output absolute pixel coordinates.",
-            "Use only integer grid col and row placement hints.",
-            "Ground, supply, and reference nets must use local symbols only, not routed rails.",
-            "All physical wires must be Manhattan.",
+            "Return JSON only. No markdown, comments, or prose outside the object.",
+            "Output only discrete stage_x, lane_y, and orientation hints. Never output absolute pixel coordinates.",
+            "Never create, delete, rename, or rewire components, pins, or nets.",
+            "Never create new components for anatomy, electrode art, annotations, or labels unless they already exist in the netlist.",
+            "Never create new nets.",
+            "Never route GND, VCC, VEE, VDD, VSS, or REF/reference nets as global physical wires.",
+            "Identify auxiliary feedback loops, especially right-leg-drive, RLD, driven-right-leg, and common-mode feedback.",
+            "Put auxiliary feedback loops in a bottom auxiliary lane using bottom_auxiliary_corridor route policies.",
+            "Keep the main signal flow left-to-right.",
+            "Keep parallel differential inputs aligned by stage and separated by lane.",
+            "Treat reference-image anatomy or electrode art as annotation, not core electrical layout, unless represented in the netlist.",
         ],
+        "mode_guidance": {
+            "image_guided": "Use the reference image only to infer relative teaching-schematic stages, lanes, and motifs.",
+            "model_guided": "Infer a teaching-schematic layout from netlist semantics only.",
+        },
         "schema": {
             "recognized_topology": "string",
             "confidence": "number from 0 to 1",
-            "stage_order": [{"stage": "integer", "type": "string", "members": ["component_id"]}],
-            "lanes": [{"lane": "integer", "source": "component_id", "members": ["component_id"]}],
-            "placement_hints": {
-                "component_id": {
-                    "col": "integer",
-                    "row": "integer",
-                    "orientation": "right|right_flip|left|up|down",
-                    "motif_role": "optional string",
-                }
-            },
-            "local_terminal_policy": {"net_name": "local_symbol_only"},
-            "routing_rules": ["string"],
-        },
-        "circuit": {
-            "id": circuit.id,
-            "motif": circuit.motif,
-            "components": [
+            "tutor_explanation": "short teaching explanation",
+            "stages": [{"stage_x": "integer", "stage_type": "string", "members": ["component_id"]}],
+            "lanes": [{"lane_y": "integer", "lane_type": "string", "members": ["component_id"]}],
+            "placements": [
                 {
-                    "id": component.id,
-                    "type": component.type,
-                    "role": component.role,
-                    "label": component.label,
-                    "value": component.value,
-                    "pins": dict(component.pins),
+                    "component_id": "existing component id",
+                    "stage_x": "integer",
+                    "lane_y": "integer",
+                    "orientation": "RIGHT|LEFT|UP|DOWN",
+                    "role": "optional semantic role",
+                    "confidence": "number from 0 to 1",
                 }
-                for component in circuit.components
             ],
+            "route_policies": [
+                {
+                    "net": "existing net name or null",
+                    "net_role": "signal|feedback|right_leg_drive|ground|supply|reference",
+                    "policy": "left_to_right_manhattan|top_feedback_corridor|bottom_feedback_corridor|bottom_auxiliary_corridor|local_terminal_only|avoid_opamp_body",
+                }
+            ],
+            "local_terminal_policy": {"net_name": "local_symbol_only"},
+            "source": "gemini",
         },
+        "request": request.to_dict(),
     }
     return json.dumps(payload, indent=2, sort_keys=True)
 
@@ -189,3 +137,19 @@ def _json_object(text: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("GeminiPlanningClient must return a JSON object.")
     return raw
+
+
+__all__ = [
+    "DEFAULT_GEMINI_PLANNER_MODEL",
+    "FakePlanningClient",
+    "GeminiPlanningClient",
+    "GridPlacementHint",
+    "LaneHint",
+    "MotifHint",
+    "PlanningHints",
+    "RoutePolicyHint",
+    "SchematicLayoutHints",
+    "SchematicPlanningRequest",
+    "SemanticPlanningClient",
+    "StageHint",
+]

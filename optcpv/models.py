@@ -245,6 +245,9 @@ class LayoutSupport:
     fallback_used: bool = True
     unsupported_regions: tuple[str, ...] = field(default_factory=tuple)
     notes: tuple[str, ...] = field(default_factory=tuple)
+    planning_hints: dict[str, Any] | None = None
+    visual_review: dict[str, Any] | None = None
+    tutor_explanation: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -254,6 +257,9 @@ class LayoutSupport:
             "fallback_used": self.fallback_used,
             "unsupported_regions": list(self.unsupported_regions),
             "notes": list(self.notes),
+            "planning_hints": self.planning_hints,
+            "visual_review": self.visual_review,
+            "tutor_explanation": self.tutor_explanation,
         }
 
 
@@ -334,6 +340,11 @@ class SchematicArtifact:
     warnings: list[str] = field(default_factory=list)
     layout_support: dict[str, Any] = field(default_factory=dict)
     semantic_plan: dict[str, Any] = field(default_factory=dict)
+    planning_hints_used: dict[str, Any] | None = None
+    visual_review_result: dict[str, Any] | None = None
+    tutor_explanation: str = ""
+    fallback_used: bool = True
+    layout_confidence: float = 0.0
 
 
 def circuit_from_any(circuit: Circuit | dict[str, Any]) -> Circuit:

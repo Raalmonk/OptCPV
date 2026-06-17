@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 
 from .models import Circuit, LayoutLabel, LayoutPlan, Point
 from .planner import rebuild_layout_geometry
+from .route_contract import assert_no_diagonal_wires, orthogonalize_route
 from .verifier import verify_layout_topology
 from .vector_critic import critique_layout
 
@@ -66,7 +67,7 @@ def apply_patch(circuit: Circuit, layout: LayoutPlan, patch: LayoutPatch) -> Lay
     candidate = rebuild_layout_geometry(candidate)
 
     if patch.set_wire_points:
-        wire_points = {item.net: item.points for item in patch.set_wire_points}
+        wire_points = {item.net: orthogonalize_route(item.points) for item in patch.set_wire_points}
         candidate = replace(
             candidate,
             wires=[
@@ -76,6 +77,7 @@ def apply_patch(circuit: Circuit, layout: LayoutPlan, patch: LayoutPatch) -> Lay
         )
 
     verify_layout_topology(circuit, candidate)
+    assert_no_diagonal_wires(candidate)
     _reject_scale_hack(layout, candidate)
     return candidate
 
