@@ -75,6 +75,8 @@ class SchemdrawRenderer:
             element = element.at(_sd(anchor))
             if _is_two_terminal(component) and hasattr(element, "length"):
                 element = element.length(_terminal_length(component))
+            if _is_flipped_opamp(component) and hasattr(element, "flip"):
+                element = element.flip()
             if component.orientation in {"left", "west"} and hasattr(element, "left"):
                 element = element.left()
             elif component.orientation in {"up", "north"} and hasattr(element, "up"):
@@ -193,7 +195,7 @@ def _native_voltage_divider(drawing, elm, labels: dict[str, str]) -> None:
     drawing.pop()
     drawing += elm.ResistorIEC().down().label(labels.get("R2", "R2"), loc="bottom")
     drawing += elm.Line().down(0.35)
-    drawing += elm.Ground().label(labels.get("GND", "GND"), loc="bottom")
+    drawing += elm.Ground()
 
 
 def _native_rc_low_pass(drawing, elm, labels: dict[str, str]) -> None:
@@ -207,7 +209,7 @@ def _native_rc_low_pass(drawing, elm, labels: dict[str, str]) -> None:
     drawing.pop()
     drawing += elm.Capacitor().down().label(labels.get("C1", "C"), loc="bottom")
     drawing += elm.Line().down(0.45)
-    drawing += elm.Ground().label(labels.get("GND", "GND"), loc="bottom")
+    drawing += elm.Ground()
 
 
 def _native_non_inverting_op_amp(drawing, elm, labels: dict[str, str]) -> None:
@@ -234,7 +236,7 @@ def _native_non_inverting_op_amp(drawing, elm, labels: dict[str, str]) -> None:
 
     drawing += elm.ResistorIEC().at(feedback).down().label(labels.get("Rg", "Rg"), loc="bottom")
     drawing += elm.Line().down(0.45)
-    drawing += elm.Ground().label(labels.get("GND", "GND"), loc="bottom")
+    drawing += elm.Ground()
 
 
 def _native_instrumentation_amplifier(drawing, elm, labels: dict[str, str]) -> None:
@@ -281,7 +283,7 @@ def _native_instrumentation_amplifier(drawing, elm, labels: dict[str, str]) -> N
 
     drawing += elm.ResistorIEC().at((u3_plus.x - 0.75, u3_plus.y)).down().label(labels.get("R4", "R4"), loc="bottom")
     drawing += elm.Line().down(0.35)
-    drawing += elm.Ground().label(labels.get("GND", "GND"), loc="bottom")
+    drawing += elm.Ground()
 
     out_node = (u3_out.x + 1.3, u3_out.y)
     drawing += elm.Line().at(u3_out).to(out_node)
@@ -311,7 +313,7 @@ def _native_bridge(drawing, elm, labels: dict[str, str]) -> None:
     drawing += elm.Line().at(mid_left).right(2.3)
     drawing += elm.Dot(open=True).label(labels.get("VOUT", "VOUT"), loc="right")
     drawing += elm.Line().at(((bottom_left[0] + bottom_right[0]) / 2.0, bottom_left[1])).down(0.8)
-    drawing += elm.Ground().label(labels.get("GND", "GND"), loc="bottom")
+    drawing += elm.Ground()
 
 
 def _normalize_svg_canvas(svg: str, layout: LayoutPlan) -> str:
@@ -547,9 +549,6 @@ def _draw_ground_terminal(
             'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
             f'<line x1="{x - 5:.1f}" y1="{bar_y + sign * 16:.1f}" x2="{x + 5:.1f}" y2="{bar_y + sign * 16:.1f}" '
             'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
-            f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" dominant-baseline="middle" '
-            'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
-            f"{escape(label)}</text>",
             "</g>",
         ]
     )
@@ -628,6 +627,15 @@ def _terminal_owner_is_resistor(layout: LayoutPlan, terminal: LocalTerminalInten
 def _is_resistor(component: LayoutComponent) -> bool:
     key = _key(component.type)
     return "resistor" in key or key.startswith("r")
+
+
+def _is_flipped_opamp(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return (
+        "op_amp" in key
+        or "opamp" in key
+        or "operational_amplifier" in key
+    ) and "flip" in _key(component.orientation)
 
 
 def _is_filter_block(component: LayoutComponent) -> bool:

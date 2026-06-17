@@ -97,6 +97,20 @@ def test_opamp_input_route_uses_horizontal_entry_stub_before_pin() -> None:
     assert wire.points[-2].y == pin.y
 
 
+def test_non_inverting_chain_flips_opamp_inputs_to_avoid_ground_leg_crossing() -> None:
+    layout = plan_layout(two_stage_local_ground_chain())
+    u1 = next(component for component in layout.components if component.id == "U1")
+    plus_pin = layout.pin_map[("U1", "+")]
+    minus_pin = layout.pin_map[("U1", "-")]
+    feedback = next(component for component in layout.components if component.id == "Rf1")
+    gain_leg = next(component for component in layout.components if component.id == "Rg1")
+
+    assert u1.orientation == "right_flip"
+    assert plus_pin.y < u1.y < minus_pin.y
+    assert feedback.y > u1.y
+    assert gain_leg.y > minus_pin.y
+
+
 def test_opamp_input_keepout_has_no_false_junction_dot() -> None:
     layout = plan_layout(two_stage_local_ground_chain())
     pin = layout.pin_map[("U2", "+")]
@@ -111,15 +125,20 @@ def test_feedback_gain_leg_does_not_overlap_opamp_input_edge() -> None:
     plus_pin = layout.pin_map[("U1", "+")]
     edge_x = minus_pin.x + OPAMP_LEAD_LENGTH
     wire = next(wire for wire in layout.wires if wire.net == "fb1")
-    input_span_segments = [
+    input_gap_segments = [
         (start, end)
         for start, end in merged_axis_aligned_segments(wire.points)
         if start.x == end.x and min(start.y, end.y) < plus_pin.y and max(start.y, end.y) > minus_pin.y
     ]
+    lower_feedback_segments = [
+        (start, end)
+        for start, end in merged_axis_aligned_segments(wire.points)
+        if start.x == end.x and min(start.y, end.y) >= minus_pin.y
+    ]
 
-    assert input_span_segments
-    assert all(abs(start.x - edge_x) > 0.16 for start, _ in input_span_segments)
-    assert all(minus_pin.x < start.x < edge_x - 0.16 for start, _ in input_span_segments)
+    assert not input_gap_segments
+    assert lower_feedback_segments
+    assert all(abs(start.x - edge_x) > 0.16 for start, _ in lower_feedback_segments)
 
 
 def test_redundant_global_ground_label_is_hidden_when_local_terminals_exist() -> None:

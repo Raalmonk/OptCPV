@@ -149,7 +149,7 @@ def _draw_component_symbol(layout: LayoutPlan, component: LayoutComponent) -> st
     key = _key(component.type)
     inner = _draw_default(x, y)
     if "op_amp" in key or "opamp" in key or "operational_amplifier" in key:
-        inner = _draw_opamp(x, y)
+        inner = _draw_opamp(x, y, flipped="flip" in _key(component.orientation))
     elif "resistor" in key or key.startswith("r"):
         inner = _draw_resistor(component, x, y)
     elif "capacitor" in key or key.startswith("c"):
@@ -218,9 +218,13 @@ def _draw_local_terminal_symbol(layout: LayoutPlan, terminal: LocalTerminalInten
         f'data-pin-name="{escape(terminal.pin_name)}" data-net-name="{escape(terminal.net)}" '
         f'data-terminal-type="{escape(terminal.terminal_type)}">'
         f"{symbol}"
-        f'<text class="terminal-label" x="{x:.1f}" y="{label_y:.1f}">{escape(terminal.label)}</text>'
+        f"{'' if terminal.terminal_type == 'ground' else _local_terminal_label(x, label_y, terminal.label)}"
         "</g>"
     )
+
+
+def _local_terminal_label(x: float, y: float, label: str) -> str:
+    return f'<text class="terminal-label" x="{x:.1f}" y="{y:.1f}">{escape(label)}</text>'
 
 
 def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
@@ -242,13 +246,14 @@ def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
     )
 
 
-def _draw_opamp(x: float, y: float) -> str:
+def _draw_opamp(x: float, y: float, *, flipped: bool = False) -> str:
     polygon = " ".join(f"{px:.1f},{py:.1f}" for px, py in [(x - 58, y - 44), (x - 58, y + 44), (x + 72, y)])
+    top_label, bottom_label = ("+", "-") if flipped else ("-", "+")
     return "\n".join(
         [
             f'<polygon class="component" points="{polygon}"/>',
-            f'<text class="terminal-label" x="{x - 44:.1f}" y="{y - 22:.1f}">-</text>',
-            f'<text class="terminal-label" x="{x - 44:.1f}" y="{y + 30:.1f}">+</text>',
+            f'<text class="terminal-label" x="{x - 44:.1f}" y="{y - 22:.1f}">{top_label}</text>',
+            f'<text class="terminal-label" x="{x - 44:.1f}" y="{y + 30:.1f}">{bottom_label}</text>',
         ]
     )
 

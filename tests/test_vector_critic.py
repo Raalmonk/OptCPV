@@ -77,6 +77,7 @@ def test_opamp_pin_contract_matches_renderer_leads() -> None:
 
     assert layout.pin_map[("U1", "+")].x == u1.x
     assert layout.pin_map[("U1", "-")].x == u1.x
+    assert layout.pin_map[("U1", "+")].y < u1.y < layout.pin_map[("U1", "-")].y
     assert layout.pin_map[("U1", "out")].x == u1.x + OPAMP_OUTPUT_LEAD_X
 
 

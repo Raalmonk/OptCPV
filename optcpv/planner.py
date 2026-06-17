@@ -260,7 +260,7 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
 
     for index, opamp in enumerate(opamps):
         row, col = divmod(index, columns)
-        placements[opamp.id] = (x0 + col * dx, y0 + row * dy, "right")
+        placements[opamp.id] = (x0 + col * dx, y0 + row * dy, _opamp_orientation(opamp, circuit.components))
 
     output_net_to_opamp = _output_net_to_opamp(opamps)
     input_net_to_opamps = _input_net_to_opamps(opamps)
@@ -272,7 +272,11 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
         target = _first_net_opamp(terminal.pins.values(), input_net_to_opamps)
         if target and target.id in placements:
             tx, ty, _ = placements[target.id]
-            placements[terminal.id] = (max(1.2, tx - 2.4), _nearest_input_y(target, terminal.pins.values(), ty), "right")
+            placements[terminal.id] = (
+                max(1.2, tx - 2.4),
+                _nearest_input_y(target, terminal.pins.values(), ty, placements[target.id][2]),
+                "right",
+            )
         else:
             placements[terminal.id] = (1.5, 2.6 + fallback_inputs * 1.5, "right")
             fallback_inputs += 1
@@ -392,7 +396,7 @@ def _plan_parallel_summing_signal_chain(circuit: Circuit, opamps: list[Component
     placements: dict[str, tuple[float, float, str]] = {}
 
     for opamp in input_buffers:
-        placements[opamp.id] = (4.0, lane_by_source[opamp.id], "right")
+        placements[opamp.id] = (4.0, lane_by_source[opamp.id], _opamp_orientation(opamp, circuit.components))
 
     for component in [item for item in circuit.components if _is_input_or_source(item)]:
         target = _first_net_opamp(component.pins.values(), _input_net_to_opamps(input_buffers))
@@ -406,7 +410,7 @@ def _plan_parallel_summing_signal_chain(circuit: Circuit, opamps: list[Component
         y = lane_by_source.get(source.id, center_y) if source else center_y
         placements[resistor.id] = (8.6, y, "right")
 
-    placements[summing.id] = (12.4, center_y, "right")
+    placements[summing.id] = (12.4, center_y, _opamp_orientation(summing, circuit.components))
     for resistor in _feedback_resistors_for_component_opamp(summing, resistors):
         placements[resistor.id] = (13.5, max(1.25, center_y - 2.4), "left")
 
@@ -422,7 +426,7 @@ def _plan_parallel_summing_signal_chain(circuit: Circuit, opamps: list[Component
         x_cursor += 5.4
     if downstream_opamps:
         gain = downstream_opamps[0]
-        placements[gain.id] = (x_cursor, center_y, "right")
+        placements[gain.id] = (x_cursor, center_y, _opamp_orientation(gain, circuit.components))
         for resistor in _feedback_resistors_for_component_opamp(gain, resistors):
             if resistor.id in placements:
                 continue
@@ -604,6 +608,8 @@ def _op_amp_passive_slot(
         output_net = _opamp_output_net(opamp)
         if output_net and output_net in nets and any(net in nets for net in _opamp_input_nets(opamp)):
             x, y, _ = placements[opamp.id]
+            if _is_flipped_opamp_orientation(placements[opamp.id][2]):
+                return (x + 2.25, y + 1.75, "left")
             return (x + 1.75, max(1.2, y - 1.95), "left")
 
     active_nets = [net for net in nets if net not in ground_nets]
@@ -611,6 +617,8 @@ def _op_amp_passive_slot(
         owner = _first_net_opamp(active_nets, input_net_to_opamps) or _first_net_driver(active_nets, output_net_to_opamp)
         if owner and owner.id in placements:
             x, y, _ = placements[owner.id]
+            if _is_flipped_opamp_orientation(placements[owner.id][2]):
+                return (x + 0.7, y + 2.75, "down")
             return (x + 0.7, y + 2.45, "down")
 
     driver = _first_net_driver(nets, output_net_to_opamp)
@@ -621,6 +629,44 @@ def _op_amp_passive_slot(
         return ((sx + tx) / 2.0 + 1.6, (sy + ty) / 2.0, "right" if sx <= tx else "left")
 
     return None
+
+
+def _opamp_orientation(opamp: Component, components: list[Component]) -> str:
+    return "right_flip" if _should_flip_non_inverting_stage(opamp, components) else "right"
+
+
+def _should_flip_non_inverting_stage(opamp: Component, components: list[Component]) -> bool:
+    plus_net = _opamp_named_input_net(opamp, "+")
+    minus_net = _opamp_named_input_net(opamp, "-")
+    output_net = _opamp_output_net(opamp)
+    if plus_net is None or minus_net is None or output_net is None:
+        return False
+    if is_local_terminal_net(plus_net):
+        return False
+    if minus_net == output_net:
+        return True
+    attached = [
+        component
+        for component in components
+        if component.id != opamp.id and minus_net in component.pins.values()
+    ]
+    has_feedback = any(output_net in component.pins.values() for component in attached)
+    has_ground_leg = any(
+        any(is_local_terminal_net(net) for net in component.pins.values() if net != minus_net)
+        for component in attached
+    )
+    return has_feedback and has_ground_leg
+
+
+def _opamp_named_input_net(opamp: Component, target_kind: str) -> str | None:
+    for pin_name, net in opamp.pins.items():
+        if _pin_kind(pin_name) == target_kind:
+            return net
+    return None
+
+
+def _is_flipped_opamp_orientation(orientation: str) -> bool:
+    return "flip" in _key(orientation)
 
 
 def _spread_offset(index: int, step: float) -> float:
@@ -705,16 +751,17 @@ def _first_net_driver(nets, output_net_to_opamp: dict[str, Component]) -> Compon
     return None
 
 
-def _nearest_input_y(opamp: Component, nets, opamp_y: float) -> float:
+def _nearest_input_y(opamp: Component, nets, opamp_y: float, orientation: str = "right") -> float:
     net_set = set(nets)
+    flip = _is_flipped_opamp_orientation(orientation)
     for pin_name, net in opamp.pins.items():
         if net not in net_set:
             continue
         kind = _pin_kind(pin_name)
         if kind in {"-", "minus", "inverting"}:
-            return opamp_y - 0.625
+            return opamp_y + 0.625 if flip else opamp_y - 0.625
         if kind in {"+", "plus", "non_inverting"}:
-            return opamp_y + 0.625
+            return opamp_y - 0.625 if flip else opamp_y + 0.625
     return opamp_y
 
 
@@ -1724,10 +1771,11 @@ def _pin_point(component: LayoutComponent, pin_name: str) -> tuple[float, float,
     x, y = component.x, component.y
     if _is_opamp_layout(component):
         net = component.pins.get(pin_name)
+        flip = _is_flipped_opamp_orientation(component.orientation)
         if kind in {"-", "minus", "inverting"}:
-            return (x + OPAMP_INPUT_LEAD_X, y - OPAMP_INPUT_LEAD_Y, "left")
+            return (x + OPAMP_INPUT_LEAD_X, y + OPAMP_INPUT_LEAD_Y if flip else y - OPAMP_INPUT_LEAD_Y, "left")
         if kind in {"+", "plus", "non_inverting"}:
-            return (x + OPAMP_INPUT_LEAD_X, y + OPAMP_INPUT_LEAD_Y, "left")
+            return (x + OPAMP_INPUT_LEAD_X, y - OPAMP_INPUT_LEAD_Y if flip else y + OPAMP_INPUT_LEAD_Y, "left")
         if is_positive_supply_pin(pin_name, net):
             return (x + OPAMP_OUTPUT_LEAD_X * 0.45, y - OPAMP_HALF_HEIGHT, "top")
         if is_negative_supply_pin(pin_name, net) or is_reference_pin(pin_name, net):

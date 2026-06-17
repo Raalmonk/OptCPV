@@ -130,9 +130,16 @@ def _pin_contract_violations(layout: LayoutPlan, violations: list[CriticViolatio
         component_key = _key(component.type)
         if "op_amp" not in component_key and "opamp" not in component_key and "operational_amplifier" not in component_key:
             continue
+        flip = _is_flipped_opamp(component)
         expected = {
-            "-": Point(component.x + OPAMP_INPUT_LEAD_X, component.y - OPAMP_INPUT_LEAD_Y),
-            "+": Point(component.x + OPAMP_INPUT_LEAD_X, component.y + OPAMP_INPUT_LEAD_Y),
+            "-": Point(
+                component.x + OPAMP_INPUT_LEAD_X,
+                component.y + OPAMP_INPUT_LEAD_Y if flip else component.y - OPAMP_INPUT_LEAD_Y,
+            ),
+            "+": Point(
+                component.x + OPAMP_INPUT_LEAD_X,
+                component.y - OPAMP_INPUT_LEAD_Y if flip else component.y + OPAMP_INPUT_LEAD_Y,
+            ),
             "out": Point(component.x + OPAMP_OUTPUT_LEAD_X, component.y),
         }
         for pin_name in component.pins:
@@ -163,15 +170,26 @@ def _convention_violations(layout: LayoutPlan, violations: list[CriticViolation]
         violations.append(CriticViolation("output_not_right", "Output is not to the right of input.", 8))
     for component in layout.components:
         key = _key(component.type)
-        if ("op_amp" in key or "opamp" in key) and component.orientation != "right":
+        if ("op_amp" in key or "opamp" in key) and component.orientation not in {"right", "right_flip"}:
             violations.append(CriticViolation("opamp_orientation", f"{component.id} is not right-facing.", 10, subject=component.id))
         if key in {"ground", "gnd"}:
             median_y = sorted(item.y for item in layout.components)[len(layout.components) // 2]
             if component.y < median_y:
                 violations.append(CriticViolation("ground_not_low", f"{component.id} is not below signal path.", 7, subject=component.id))
         if "resistor" in key and "feedback" in _key(component.role):
-            owner_y = _feedback_owner_y(layout, component)
-            if component.y > owner_y:
+            owner = _feedback_owner(layout, component)
+            owner_y = owner.y if owner is not None else _opamp_y(layout)
+            if owner is not None and _is_flipped_opamp(owner):
+                if component.y < owner_y:
+                    violations.append(
+                        CriticViolation(
+                            "feedback_not_below",
+                            f"{component.id} feedback resistor is not below flipped op amp.",
+                            8,
+                            subject=component.id,
+                        )
+                    )
+            elif component.y > owner_y:
                 violations.append(CriticViolation("feedback_not_above", f"{component.id} feedback resistor is not above op amp.", 8, subject=component.id))
 
 
@@ -497,6 +515,10 @@ def _is_opamp(component: LayoutComponent) -> bool:
     return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
 
 
+def _is_flipped_opamp(component: LayoutComponent) -> bool:
+    return _is_opamp(component) and "flip" in _key(component.orientation)
+
+
 def _is_input_component(component: LayoutComponent) -> bool:
     key = _key(component.type)
     role = _key(component.role)
@@ -532,6 +554,11 @@ def _opamp_y(layout: LayoutPlan) -> float:
 
 
 def _feedback_owner_y(layout: LayoutPlan, feedback) -> float:
+    owner = _feedback_owner(layout, feedback)
+    return owner.y if owner is not None else _opamp_y(layout)
+
+
+def _feedback_owner(layout: LayoutPlan, feedback) -> LayoutComponent | None:
     feedback_nets = set(feedback.pins.values())
     for component in layout.components:
         if "op" not in _key(component.type):
@@ -544,8 +571,8 @@ def _feedback_owner_y(layout: LayoutPlan, feedback) -> float:
             else:
                 input_nets.add(net)
         if output_net in feedback_nets and feedback_nets & input_nets:
-            return component.y
-    return _opamp_y(layout)
+            return component
+    return None
 
 
 def _opamp_output_net(opamp: LayoutComponent) -> str | None:
