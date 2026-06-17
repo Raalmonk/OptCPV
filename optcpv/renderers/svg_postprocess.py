@@ -6,7 +6,7 @@ from html import escape
 from typing import Literal
 
 from ..labels import wrap_label_lines
-from ..models import LayoutComponent, LayoutLabel, LayoutPlan, Point
+from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LocalTerminalIntent, Point
 from ..segments import merged_axis_aligned_segments
 
 
@@ -69,9 +69,16 @@ def _render_layout_svg(
             parts.append(_draw_wire(layout, wire.net, wire.points))
     if "components" in layers:
         for component in layout.components:
+            if _is_redundant_terminal_component(layout, component):
+                continue
             parts.append(_draw_component_symbol(layout, component))
+        for terminal in layout.semantic.local_terminals:
+            parts.append(_draw_local_terminal_symbol(layout, terminal))
     if "labels" in layers:
         for label in layout.labels:
+            owner = next((component for component in layout.components if component.id == label.owner_id), None)
+            if owner is not None and _is_redundant_terminal_component(layout, owner):
+                continue
             parts.append(_draw_label(layout, label))
     parts.append("</svg>")
     return "\n".join(parts)
@@ -115,6 +122,16 @@ def _metadata_overlay(layout: LayoutPlan) -> str:
             f'width="{component.bbox.width * layout.grid:.1f}" height="{component.bbox.height * layout.grid:.1f}" '
             f'data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}"/>'
         )
+    for terminal in layout.semantic.local_terminals:
+        pin = layout.pin_map.get((terminal.component_id, terminal.pin_name))
+        if pin is None:
+            continue
+        parts.append(
+            f'<circle cx="{pin.x * layout.grid:.1f}" cy="{pin.y * layout.grid:.1f}" r="3" '
+            f'data-local-terminal="true" data-component-id="{escape(terminal.component_id)}" '
+            f'data-pin-name="{escape(terminal.pin_name)}" data-net-name="{escape(terminal.net)}" '
+            f'data-terminal-type="{escape(terminal.terminal_type)}"/>'
+        )
     parts.append("</g>")
     return "\n".join(parts)
 
@@ -155,6 +172,53 @@ def _draw_component_symbol(layout: LayoutPlan, component: LayoutComponent) -> st
         f'<g data-component-id="{escape(component.id)}" data-component-type="{escape(component.type)}">\n'
         f"{inner}\n"
         f"{''.join(pins)}\n"
+        "</g>"
+    )
+
+
+def _is_redundant_terminal_component(layout: LayoutPlan, component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    if key not in {"ground", "gnd", "supply", "power", "vcc", "vdd", "vee", "vss"}:
+        return False
+    local_nets = {terminal.net for terminal in layout.semantic.local_terminals}
+    return bool(set(component.pins.values()) & local_nets)
+
+
+def _draw_local_terminal_symbol(layout: LayoutPlan, terminal: LocalTerminalIntent) -> str:
+    pin = layout.pin_map.get((terminal.component_id, terminal.pin_name))
+    if pin is None:
+        return ""
+    x = pin.x * layout.grid
+    y = pin.y * layout.grid
+    sign = -1 if terminal.preferred_direction == "up" else 1
+    y1 = y + sign * 24
+    label_y = y + sign * 44
+    if terminal.terminal_type == "positive_supply":
+        symbol = (
+            f'<line class="symbol" x1="{x:.1f}" y1="{y:.1f}" x2="{x:.1f}" y2="{y1:.1f}"/>'
+            f'<path class="symbol" d="M {x - 7:.1f} {y1 + sign * 7:.1f} L {x:.1f} {y1:.1f} '
+            f'L {x + 7:.1f} {y1 + sign * 7:.1f}"/>'
+        )
+    elif terminal.terminal_type == "negative_supply":
+        symbol = (
+            f'<line class="symbol" x1="{x:.1f}" y1="{y:.1f}" x2="{x:.1f}" y2="{y1:.1f}"/>'
+            f'<path class="symbol" d="M {x - 7:.1f} {y1 - sign * 7:.1f} L {x:.1f} {y1:.1f} '
+            f'L {x + 7:.1f} {y1 - sign * 7:.1f}"/>'
+        )
+    else:
+        bar_y = y + sign * 26
+        symbol = (
+            f'<line class="symbol" x1="{x:.1f}" y1="{y:.1f}" x2="{x:.1f}" y2="{bar_y:.1f}"/>'
+            f'<line class="symbol" x1="{x - 15:.1f}" y1="{bar_y:.1f}" x2="{x + 15:.1f}" y2="{bar_y:.1f}"/>'
+            f'<line class="symbol" x1="{x - 9:.1f}" y1="{bar_y + sign * 7:.1f}" x2="{x + 9:.1f}" y2="{bar_y + sign * 7:.1f}"/>'
+            f'<line class="symbol" x1="{x - 4:.1f}" y1="{bar_y + sign * 14:.1f}" x2="{x + 4:.1f}" y2="{bar_y + sign * 14:.1f}"/>'
+        )
+    return (
+        f'<g data-local-terminal="true" data-component-id="{escape(terminal.component_id)}" '
+        f'data-pin-name="{escape(terminal.pin_name)}" data-net-name="{escape(terminal.net)}" '
+        f'data-terminal-type="{escape(terminal.terminal_type)}">'
+        f"{symbol}"
+        f'<text class="terminal-label" x="{x:.1f}" y="{label_y:.1f}">{escape(terminal.label)}</text>'
         "</g>"
     )
 

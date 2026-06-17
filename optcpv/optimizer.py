@@ -250,8 +250,14 @@ def _propose_label_moves(layout: LayoutPlan, report) -> list[MoveLabel]:
     move_all = any(violation.code == "label_visual_collision" and not violation.subject for violation in report.violations)
     if not affected and not move_all:
         return moves
+    moving_ids = {
+        label.id
+        for label in layout.labels
+        if move_all or label.id in affected
+    }
+    occupied_label_boxes = [label.bbox for label in layout.labels if label.id not in moving_ids]
     for label in layout.labels:
-        if not move_all and label.id not in affected:
+        if label.id not in moving_ids:
             continue
         owner = next((component for component in layout.components if component.id == label.owner_id), None)
         if owner is None:
@@ -259,8 +265,17 @@ def _propose_label_moves(layout: LayoutPlan, report) -> list[MoveLabel]:
         candidates = [(label.x, label.y), *_label_candidates(owner)]
         best_x, best_y = min(
             candidates,
-            key=lambda candidate: _label_candidate_score(layout, label, owner, candidate[0], candidate[1]),
+            key=lambda candidate: _label_candidate_score(
+                layout,
+                label,
+                owner,
+                candidate[0],
+                candidate[1],
+                occupied_label_boxes,
+            ),
         )
+        moved_bbox = _moved_label_bbox(label, best_x, best_y)
+        occupied_label_boxes.append(moved_bbox)
         if abs(best_x - label.x) > 1e-6 or abs(best_y - label.y) > 1e-6:
             moves.append(MoveLabel(label.id, best_x, best_y))
     return moves
@@ -273,15 +288,38 @@ def _label_candidates(owner: LayoutComponent) -> list[tuple[float, float]]:
     left = (owner.bbox.x - 0.45, owner.y)
     far_above = (owner.x, owner.bbox.y - 1.15)
     far_below = (owner.x, owner.bbox.bottom + 1.25)
+    very_far_above = (owner.x, owner.bbox.y - 1.85)
+    very_far_below = (owner.x, owner.bbox.bottom + 1.95)
     upper_right = (owner.bbox.right + 1.15, owner.bbox.y - 0.55)
     lower_right = (owner.bbox.right + 1.15, owner.bbox.bottom + 0.75)
     upper_left = (owner.bbox.x - 1.15, owner.bbox.y - 0.55)
     lower_left = (owner.bbox.x - 1.15, owner.bbox.bottom + 0.75)
+    far_right = (owner.bbox.right + 1.65, owner.y)
+    far_left = (owner.bbox.x - 1.65, owner.y)
+    if _is_terminal_layout(owner):
+        if _is_output_layout(owner):
+            near_right = (owner.x + 0.95, owner.y - 0.62)
+            return [near_right, right, far_right, upper_right, lower_right, above, below, left, far_left]
+        near_left = (owner.x - 0.72, owner.y - 0.62)
+        return [near_left, left, far_left, upper_left, lower_left, above, below, right, far_right]
+    if _is_opamp_layout(owner):
+        return [
+            very_far_above,
+            (owner.x + 1.55, owner.bbox.y - 0.75),
+            (owner.x + 2.15, owner.bbox.y - 0.95),
+            upper_right,
+            upper_left,
+            very_far_below,
+            lower_right,
+            lower_left,
+            far_right,
+            far_left,
+        ]
     if owner.orientation in {"up", "down"} and owner.type.lower() not in {"ground", "gnd"}:
-        return [right, left, upper_right, lower_right, upper_left, lower_left, above, below, far_above, far_below]
+        return [right, far_right, left, far_left, upper_right, lower_right, upper_left, lower_left, above, below, far_above, far_below]
     if owner.type.lower() in {"ground", "gnd"}:
         return [below, far_below, right, left, above]
-    return [above, upper_right, upper_left, below, lower_right, lower_left, right, left, far_above, far_below]
+    return [above, far_above, upper_right, upper_left, below, far_below, lower_right, lower_left, right, far_right, left, far_left]
 
 
 def _label_candidate_score(
@@ -290,6 +328,7 @@ def _label_candidate_score(
     owner: LayoutComponent,
     x: float,
     y: float,
+    occupied_label_boxes: list[BBox] | None = None,
 ) -> float:
     bbox = _moved_label_bbox(label, x, y)
     score = abs(x - label.x) * 0.08 + abs(y - label.y) * 0.08
@@ -300,12 +339,47 @@ def _label_candidate_score(
             continue
         if bbox.intersects(component.bbox, padding=0.05):
             score += 35.0
+    for other in occupied_label_boxes or []:
+        if bbox.intersects(other, padding=0.08):
+            score += 28.0
     for wire in layout.wires:
         if _polyline_intersects_bbox(wire.points, bbox.expanded(0.03)):
             score += 20.0
+    for terminal_box in _local_terminal_boxes(layout):
+        if bbox.intersects(terminal_box, padding=0.04):
+            score += 24.0
+    for keepout in _opamp_input_keepouts(layout):
+        if bbox.intersects(keepout, padding=0.03):
+            score += 18.0
     if bbox.intersects(owner.bbox, padding=0.02):
-        score += 10.0
+        score += 18.0
     return score
+
+
+def _local_terminal_boxes(layout: LayoutPlan) -> list[BBox]:
+    boxes: list[BBox] = []
+    for terminal in layout.semantic.local_terminals:
+        pin = layout.pin_map.get((terminal.component_id, terminal.pin_name))
+        if pin is None:
+            continue
+        sign = -1.0 if terminal.preferred_direction == "up" else 1.0
+        y0 = min(pin.y, pin.y + sign * 1.08)
+        boxes.append(BBox(pin.x - 0.48, y0 - 0.12, 0.96, 1.32))
+    return boxes
+
+
+def _opamp_input_keepouts(layout: LayoutPlan) -> list[BBox]:
+    boxes: list[BBox] = []
+    for component in layout.components:
+        if not _is_opamp_layout(component):
+            continue
+        for (component_id, pin_name), pin in layout.pin_map.items():
+            if component_id != component.id:
+                continue
+            if _pin_kind(pin_name) not in {"+", "-"}:
+                continue
+            boxes.append(BBox(pin.x - 0.62, pin.y - 0.22, 0.82, 0.44))
+    return boxes
 
 
 def _moved_label_bbox(label: LayoutLabel, x: float, y: float) -> BBox:
@@ -365,6 +439,35 @@ def _opamp_y(layout: LayoutPlan) -> float:
 
 def _is_feedback(component: LayoutComponent) -> bool:
     return "feedback" in (component.role or "").lower()
+
+
+def _is_opamp_layout(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
+
+
+def _is_terminal_layout(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return key in {"input", "output", "input_terminal", "voltage_source", "source"} or "source" in key
+
+
+def _is_output_layout(component: LayoutComponent) -> bool:
+    return _key(component.type) == "output" or "output" in _key(component.role)
+
+
+def _pin_kind(pin_name: str) -> str:
+    compact = _key(pin_name).replace("_", "")
+    if pin_name in {"+", "-"}:
+        return pin_name
+    if compact in {"plus", "noninverting", "noninv", "inp", "vp"}:
+        return "+"
+    if compact in {"minus", "inverting", "inv", "inn", "vn"}:
+        return "-"
+    return compact
+
+
+def _key(value: str | None) -> str:
+    return (value or "").lower().replace("-", "_").replace(" ", "_")
 
 
 def _polyline_intersects_bbox(points: list[Point], bbox: BBox) -> bool:

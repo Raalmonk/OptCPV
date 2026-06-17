@@ -52,6 +52,31 @@ def merged_axis_aligned_segments(points: list[Point]) -> list[tuple[Point, Point
     return merged
 
 
+def junction_points(points: list[Point]) -> list[Point]:
+    """Return true branch junctions from a routed net traversal.
+
+    A route traversal can revisit waypoints while walking a tree-shaped net.
+    After visual segment merging, those waypoints may sit inside a longer line,
+    but they are not necessarily electrical junctions. Count the incident
+    visual directions at each original waypoint so bends and entry stubs do not
+    get false junction dots.
+    """
+
+    segments = merged_axis_aligned_segments(points)
+    candidates: dict[tuple[float, float], Point] = {}
+    for point in points:
+        candidates[_point_key(point)] = point
+    for start, end in segments:
+        candidates[_point_key(start)] = start
+        candidates[_point_key(end)] = end
+
+    junctions = []
+    for point in candidates.values():
+        if _incident_direction_count(point, segments) >= 3:
+            junctions.append(point)
+    return sorted(junctions, key=lambda point: (point.y, point.x))
+
+
 def layout_wire_segments(layout: LayoutPlan) -> list[tuple[str, Point, Point]]:
     return [
         (wire.net, start, end)
@@ -78,6 +103,48 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
 
 def _point_key(point: Point) -> tuple[float, float]:
     return (round(point.x, 4), round(point.y, 4))
+
+
+def _incident_direction_count(point: Point, segments: list[tuple[Point, Point]]) -> int:
+    directions: set[tuple[int, int]] = set()
+    for start, end in segments:
+        if not _point_on_segment(point, start, end):
+            continue
+        if _same(start.x, end.x):
+            if point.y > min(start.y, end.y) + EPSILON:
+                directions.add((0, -1))
+            if point.y < max(start.y, end.y) - EPSILON:
+                directions.add((0, 1))
+        elif _same(start.y, end.y):
+            if point.x > min(start.x, end.x) + EPSILON:
+                directions.add((-1, 0))
+            if point.x < max(start.x, end.x) - EPSILON:
+                directions.add((1, 0))
+        else:
+            directions.add(_diagonal_direction(point, start))
+            directions.add(_diagonal_direction(point, end))
+    return len(directions)
+
+
+def _point_on_segment(point: Point, start: Point, end: Point) -> bool:
+    if _same(start.x, end.x):
+        return _same(point.x, start.x) and _between(point.y, start.y, end.y)
+    if _same(start.y, end.y):
+        return _same(point.y, start.y) and _between(point.x, start.x, end.x)
+    cross = (point.x - start.x) * (end.y - start.y) - (point.y - start.y) * (end.x - start.x)
+    if abs(cross) > EPSILON:
+        return False
+    return _between(point.x, start.x, end.x) and _between(point.y, start.y, end.y)
+
+
+def _between(value: float, left: float, right: float) -> bool:
+    return min(left, right) - EPSILON <= value <= max(left, right) + EPSILON
+
+
+def _diagonal_direction(point: Point, other: Point) -> tuple[int, int]:
+    dx = 0 if _same(point.x, other.x) else 1 if other.x > point.x else -1
+    dy = 0 if _same(point.y, other.y) else 1 if other.y > point.y else -1
+    return (dx, dy)
 
 
 def _same(left: float, right: float) -> bool:

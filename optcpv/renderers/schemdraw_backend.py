@@ -6,8 +6,8 @@ from html import escape
 from io import StringIO
 
 from ..labels import component_display_label, display_label_text, wrap_label_lines
-from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LayoutWire, Point
-from ..segments import merged_axis_aligned_segments
+from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LayoutWire, LocalTerminalIntent, Motif, Point
+from ..segments import junction_points, merged_axis_aligned_segments
 from .svg_postprocess import inject_metadata, render_debug_svg, _set_root_attr
 
 
@@ -64,6 +64,10 @@ class SchemdrawRenderer:
 
     def _add_components(self, drawing, elm, layout: LayoutPlan) -> None:
         for component in layout.components:
+            if _is_redundant_terminal_component(layout, component):
+                continue
+            if _is_filter_block(component):
+                continue
             element = self._element_for(elm, component)
             if element is None:
                 continue
@@ -89,6 +93,8 @@ class SchemdrawRenderer:
             return _first_attr(elm, ["ResistorIEC", "Resistor"])
         if "capacitor" in key or key.startswith("c"):
             return _first_attr(elm, ["Capacitor"])
+        if _is_filter_block(component):
+            return None
         if key in {"ground", "gnd"}:
             return _first_attr(elm, ["GroundSignal", "Ground"])
         if key in {"input", "output", "voltage_source", "source", "input_terminal"} or "source" in key:
@@ -336,6 +342,8 @@ def _normalize_svg_canvas(svg: str, layout: LayoutPlan) -> str:
         + ">\n"
         + _visible_wires_svg(layout)
         + "\n"
+        + _semantic_overlays_svg(layout)
+        + "\n"
         + f'<g id="schemdraw-canvas" transform="scale({scale:.8g})">\n'
         + inner
         + "\n</g>\n</svg>"
@@ -390,7 +398,7 @@ def _visible_wires_svg(layout: LayoutPlan) -> str:
         'stroke-linecap="round" stroke-linejoin="round">'
     ]
     for wire in layout.wires:
-        parts.append(_wire_svg(layout, wire))
+        parts.append(draw_signal_route(layout, wire))
     parts.append("</g>")
     parts.append('<g id="optcpv-visible-junctions" fill="#111827" stroke="none">')
     for wire in layout.wires:
@@ -404,7 +412,9 @@ def _visible_wires_svg(layout: LayoutPlan) -> str:
     return "\n".join(parts)
 
 
-def _wire_svg(layout: LayoutPlan, wire: LayoutWire) -> str:
+def draw_signal_route(layout: LayoutPlan, wire: LayoutWire) -> str:
+    """Draw an orthogonal signal route from the topology-semantic plan."""
+
     segments = []
     for start, end in _unique_segments(wire.points):
         segments.append(
@@ -415,45 +425,220 @@ def _wire_svg(layout: LayoutPlan, wire: LayoutWire) -> str:
     return "\n".join(segments)
 
 
+def draw_local_supply_or_ground(layout: LayoutPlan, terminal: LocalTerminalIntent) -> str:
+    """Draw one local terminal symbol near its owning pin, with no global bus."""
+
+    pin = layout.pin_map.get((terminal.component_id, terminal.pin_name))
+    if pin is None:
+        return ""
+    direction = terminal.preferred_direction
+    label = terminal.label or terminal.net
+    if terminal.terminal_type == "positive_supply":
+        return _draw_supply_terminal(layout, terminal, Point(pin.x, pin.y), label, up=True)
+    if terminal.terminal_type == "negative_supply":
+        return _draw_supply_terminal(layout, terminal, Point(pin.x, pin.y), label, up=False)
+    return _draw_ground_terminal(layout, terminal, Point(pin.x, pin.y), label, down=direction != "up")
+
+
+def draw_resistor_to_ground_leg(layout: LayoutPlan, terminal: LocalTerminalIntent) -> str:
+    return draw_local_supply_or_ground(layout, terminal)
+
+
+def draw_filter_block(layout: LayoutPlan, component: LayoutComponent) -> str:
+    x = component.bbox.x * layout.grid
+    y = component.bbox.y * layout.grid
+    width = component.bbox.width * layout.grid
+    height = component.bbox.height * layout.grid
+    label = display_label_text(component_display_label(component.id, component.type, component.label, component.value))
+    return "\n".join(
+        [
+            f'<g class="optcpv-filter-block" data-component-id="{escape(component.id)}" '
+            f'data-component-type="{escape(component.type)}" data-motif-type="filter_block">',
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" rx="6" '
+            'fill="#ffffff" stroke="#111827" stroke-width="2.2"/>',
+            f'<text x="{(component.x * layout.grid):.1f}" y="{(component.y * layout.grid):.1f}" '
+            'text-anchor="middle" dominant-baseline="middle" '
+            'font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#111827">'
+            f"{escape(label)}</text>",
+            "</g>",
+        ]
+    )
+
+
+def draw_opamp_buffer(layout: LayoutPlan, motif: Motif) -> str:
+    return _draw_motif_metadata(layout, motif)
+
+
+def draw_opamp_feedback_stage(layout: LayoutPlan, motif: Motif) -> str:
+    return _draw_motif_metadata(layout, motif)
+
+
+def draw_summing_opamp(layout: LayoutPlan, motif: Motif) -> str:
+    return _draw_motif_metadata(layout, motif)
+
+
+def _semantic_overlays_svg(layout: LayoutPlan) -> str:
+    parts = ['<g id="optcpv-semantic-overlays">']
+    for component in layout.components:
+        if _is_filter_block(component):
+            parts.append(draw_filter_block(layout, component))
+    for motif in layout.semantic.motifs:
+        if motif.motif_type == "opamp_buffer":
+            parts.append(draw_opamp_buffer(layout, motif))
+        elif motif.motif_type == "op_amp_feedback_stage":
+            parts.append(draw_opamp_feedback_stage(layout, motif))
+        elif motif.motif_type == "summing_opamp":
+            parts.append(draw_summing_opamp(layout, motif))
+    for terminal in layout.semantic.local_terminals:
+        if _terminal_owner_is_filter_block(layout, terminal):
+            continue
+        if _terminal_owner_is_resistor(layout, terminal):
+            parts.append(draw_resistor_to_ground_leg(layout, terminal))
+        else:
+            parts.append(draw_local_supply_or_ground(layout, terminal))
+    parts.append("</g>")
+    return "\n".join(part for part in parts if part)
+
+
+def _draw_motif_metadata(layout: LayoutPlan, motif: Motif) -> str:
+    boxes = [
+        component.bbox
+        for component in layout.components
+        if component.id in set(motif.component_ids)
+    ]
+    if not boxes:
+        return ""
+    x = min(box.x for box in boxes) * layout.grid
+    y = min(box.y for box in boxes) * layout.grid
+    right = max(box.right for box in boxes) * layout.grid
+    bottom = max(box.bottom for box in boxes) * layout.grid
+    return (
+        f'<rect class="optcpv-motif-metadata" x="{x:.1f}" y="{y:.1f}" '
+        f'width="{right - x:.1f}" height="{bottom - y:.1f}" fill="none" stroke="none" opacity="0" '
+        f'data-motif-id="{escape(motif.motif_id)}" data-motif-type="{escape(motif.motif_type)}" '
+        f'data-component-ids="{escape(",".join(motif.component_ids))}"/>'
+    )
+
+
+def _draw_ground_terminal(
+    layout: LayoutPlan,
+    terminal: LocalTerminalIntent,
+    pin: Point,
+    label: str,
+    *,
+    down: bool,
+) -> str:
+    sign = 1 if down else -1
+    x = pin.x * layout.grid
+    y0 = pin.y * layout.grid
+    stem_end = (pin.y + sign * 0.38) * layout.grid
+    bar_y = (pin.y + sign * 0.5) * layout.grid
+    label_y = (pin.y + sign * 1.05) * layout.grid
+    return "\n".join(
+        [
+            f'<g class="optcpv-local-terminal" data-local-terminal="true" '
+            f'data-component-id="{escape(terminal.component_id)}" data-pin-name="{escape(terminal.pin_name)}" '
+            f'data-net-name="{escape(terminal.net)}" data-terminal-type="{escape(terminal.terminal_type)}">',
+            f'<line x1="{x:.1f}" y1="{y0:.1f}" x2="{x:.1f}" y2="{stem_end:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<line x1="{x - 18:.1f}" y1="{bar_y:.1f}" x2="{x + 18:.1f}" y2="{bar_y:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<line x1="{x - 11:.1f}" y1="{bar_y + sign * 8:.1f}" x2="{x + 11:.1f}" y2="{bar_y + sign * 8:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<line x1="{x - 5:.1f}" y1="{bar_y + sign * 16:.1f}" x2="{x + 5:.1f}" y2="{bar_y + sign * 16:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" dominant-baseline="middle" '
+            'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
+            f"{escape(label)}</text>",
+            "</g>",
+        ]
+    )
+
+
+def _draw_supply_terminal(
+    layout: LayoutPlan,
+    terminal: LocalTerminalIntent,
+    pin: Point,
+    label: str,
+    *,
+    up: bool,
+) -> str:
+    sign = -1 if up else 1
+    x = pin.x * layout.grid
+    y0 = pin.y * layout.grid
+    y1 = (pin.y + sign * 0.58) * layout.grid
+    label_y = (pin.y + sign * 0.98) * layout.grid
+    arrow = "M {:.1f} {:.1f} L {:.1f} {:.1f} L {:.1f} {:.1f}".format(
+        x - 8,
+        y1 + sign * 7,
+        x,
+        y1,
+        x + 8,
+        y1 + sign * 7,
+    )
+    return "\n".join(
+        [
+            f'<g class="optcpv-local-terminal" data-local-terminal="true" '
+            f'data-component-id="{escape(terminal.component_id)}" data-pin-name="{escape(terminal.pin_name)}" '
+            f'data-net-name="{escape(terminal.net)}" data-terminal-type="{escape(terminal.terminal_type)}">',
+            f'<line x1="{x:.1f}" y1="{y0:.1f}" x2="{x:.1f}" y2="{y1:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<path d="{arrow}" fill="none" stroke="#111827" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
+            f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" dominant-baseline="middle" '
+            'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
+            f"{escape(label)}</text>",
+            "</g>",
+        ]
+    )
+
+
 def _unique_segments(points: list[Point]) -> list[tuple[Point, Point]]:
     return merged_axis_aligned_segments(points)
 
 
 def _junction_points(wire: LayoutWire) -> list[Point]:
-    segments = _unique_segments(wire.points)
-    endpoint_counts: dict[tuple[float, float], int] = {}
-    point_by_key: dict[tuple[float, float], Point] = {}
-    for point in wire.points:
-        point_by_key[_point_key(point)] = point
-    for start, end in segments:
-        for point in (start, end):
-            key = _point_key(point)
-            endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
-            point_by_key[key] = point
-
-    junctions: dict[tuple[float, float], Point] = {
-        key: point_by_key[key]
-        for key, count in endpoint_counts.items()
-        if count >= 3
-    }
-    for point in point_by_key.values():
-        if any(_point_on_segment_interior(point, start, end) for start, end in segments):
-            junctions[_point_key(point)] = point
-    return sorted(junctions.values(), key=lambda point: (point.y, point.x))
+    return junction_points(wire.points)
 
 
-def _point_key(point: Point) -> tuple[float, float]:
-    return (round(point.x, 4), round(point.y, 4))
+def _terminal_owner_is_filter_block(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    component = next((item for item in layout.components if item.id == terminal.component_id), None)
+    return component is not None and _is_filter_block(component)
 
 
-def _point_on_segment_interior(point: Point, start: Point, end: Point) -> bool:
-    if point == start or point == end:
+def _is_redundant_terminal_component(layout: LayoutPlan, component: LayoutComponent) -> bool:
+    if not _is_standalone_terminal_component(component):
         return False
-    if abs(start.x - end.x) < 1e-6 and abs(point.x - start.x) < 1e-6:
-        return min(start.y, end.y) + 1e-6 < point.y < max(start.y, end.y) - 1e-6
-    if abs(start.y - end.y) < 1e-6 and abs(point.y - start.y) < 1e-6:
-        return min(start.x, end.x) + 1e-6 < point.x < max(start.x, end.x) - 1e-6
-    return False
+    nets = set(component.pins.values())
+    if not nets:
+        return False
+    local_nets = {terminal.net for terminal in layout.semantic.local_terminals}
+    return bool(nets & local_nets)
+
+
+def _is_standalone_terminal_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return key in {"ground", "gnd", "supply", "power", "vcc", "vdd", "vee", "vss"}
+
+
+def _terminal_owner_is_resistor(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    component = next((item for item in layout.components if item.id == terminal.component_id), None)
+    return component is not None and _is_resistor(component)
+
+
+def _is_resistor(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "resistor" in key or key.startswith("r")
+
+
+def _is_filter_block(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    label = _key(component.label)
+    value = _key(component.value)
+    return any(_filter_token(text) for text in [key, label, value])
+
+
+def _filter_token(value: str) -> bool:
+    return any(token in value for token in ["filter", "lpf", "hpf", "bpf", "bessel", "butterworth", "chebyshev"])
 
 
 def _element_anchor(component: LayoutComponent) -> Point:
@@ -479,10 +664,15 @@ def _terminal_length(component: LayoutComponent) -> float:
 
 
 def _add_visible_labels(svg: str, layout: LayoutPlan) -> str:
-    label_svg = "\n".join(_label_svg(layout, label) for label in layout.labels)
+    label_svg = "\n".join(_label_svg(layout, label) for label in layout.labels if _is_visible_label(layout, label))
     if "</svg>" in svg:
         return svg.replace("</svg>", label_svg + "\n</svg>")
     return svg + label_svg
+
+
+def _is_visible_label(layout: LayoutPlan, label: LayoutLabel) -> bool:
+    owner = next((component for component in layout.components if component.id == label.owner_id), None)
+    return owner is None or not _is_redundant_terminal_component(layout, owner)
 
 
 def _label_svg(layout: LayoutPlan, label: LayoutLabel) -> str:

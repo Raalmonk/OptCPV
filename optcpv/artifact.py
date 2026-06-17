@@ -53,6 +53,7 @@ def artifact_from_layout(
         labels=_label_metadata(layout),
         viewbox={"x": 0, "y": 0, "width": layout.width, "height": layout.height},
         layout_support=layout.support.to_dict(),
+        semantic_plan=layout.semantic.to_dict(),
         critic_report=combined_dict,
         vector_report=vector_report.to_dict() if vector_report else None,
         cv_report=cv_report.to_dict() if cv_report else None,
@@ -83,14 +84,23 @@ def _component_metadata(layout: LayoutPlan) -> dict[str, dict]:
 
 
 def _net_metadata(layout: LayoutPlan) -> dict[str, dict]:
-    return {
-        wire.net: {
-            "name": wire.net,
-            "connected_pins": list(wire.connected_pins),
-            "points": [{"x": point.x, "y": point.y} for point in wire.points],
+    wires_by_net = {wire.net: wire for wire in layout.wires}
+    terminals_by_net: dict[str, list[dict]] = {}
+    for terminal in layout.semantic.local_terminals:
+        terminals_by_net.setdefault(terminal.net, []).append(terminal.to_dict())
+    result: dict[str, dict] = {}
+    for net, pins in layout.net_to_pins.items():
+        wire = wires_by_net.get(net)
+        net_class = layout.semantic.net_classes.get(net)
+        result[net] = {
+            "name": net,
+            "class": net_class.value if net_class else "signal",
+            "connected_pins": list(pins),
+            "points": [{"x": point.x, "y": point.y} for point in wire.points] if wire else [],
+            "local_terminals": terminals_by_net.get(net, []),
+            "routed": wire is not None,
         }
-        for wire in layout.wires
-    }
+    return result
 
 
 def _label_metadata(layout: LayoutPlan) -> dict[str, dict]:

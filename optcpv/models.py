@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 
@@ -113,6 +114,129 @@ class LayoutWire:
     connected_pins: list[tuple[str, str]]
 
 
+class NetClass(str, Enum):
+    SIGNAL = "signal"
+    GROUND = "ground"
+    POSITIVE_SUPPLY = "positive_supply"
+    NEGATIVE_SUPPLY = "negative_supply"
+    REFERENCE = "reference"
+    INTERNAL = "internal"
+
+
+@dataclass(frozen=True)
+class LocalTerminalIntent:
+    component_id: str
+    pin_name: str
+    net: str
+    terminal_type: str
+    label: str
+    preferred_direction: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "component_id": self.component_id,
+            "pin_name": self.pin_name,
+            "net": self.net,
+            "terminal_type": self.terminal_type,
+            "label": self.label,
+            "preferred_direction": self.preferred_direction,
+        }
+
+
+@dataclass(frozen=True)
+class Stage:
+    stage_id: str
+    stage_type: str
+    component_ids: tuple[str, ...]
+    x_order: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage_id": self.stage_id,
+            "stage_type": self.stage_type,
+            "component_ids": list(self.component_ids),
+            "x_order": self.x_order,
+        }
+
+
+@dataclass(frozen=True)
+class Lane:
+    lane_id: str
+    source: str
+    y_order: int
+    component_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lane_id": self.lane_id,
+            "source": self.source,
+            "y_order": self.y_order,
+            "component_ids": list(self.component_ids),
+        }
+
+
+@dataclass(frozen=True)
+class Motif:
+    motif_id: str
+    motif_type: str
+    component_ids: tuple[str, ...]
+    input_nets: tuple[str, ...] = field(default_factory=tuple)
+    output_nets: tuple[str, ...] = field(default_factory=tuple)
+    local_reference_nets: tuple[str, ...] = field(default_factory=tuple)
+    feedback_nets: tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "motif_id": self.motif_id,
+            "motif_type": self.motif_type,
+            "component_ids": list(self.component_ids),
+            "input_nets": list(self.input_nets),
+            "output_nets": list(self.output_nets),
+            "local_reference_nets": list(self.local_reference_nets),
+            "feedback_nets": list(self.feedback_nets),
+        }
+
+
+@dataclass(frozen=True)
+class RouteIntent:
+    route_type: str
+    source: tuple[str, str]
+    target: tuple[str, str]
+    net: str
+    preferred_side: str = "right"
+    avoid_component_ids: tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route_type": self.route_type,
+            "source": list(self.source),
+            "target": list(self.target),
+            "net": self.net,
+            "preferred_side": self.preferred_side,
+            "avoid_component_ids": list(self.avoid_component_ids),
+        }
+
+
+@dataclass(frozen=True)
+class TopologySemanticPlan:
+    net_classes: dict[str, NetClass] = field(default_factory=dict)
+    local_terminals: tuple[LocalTerminalIntent, ...] = field(default_factory=tuple)
+    stages: tuple[Stage, ...] = field(default_factory=tuple)
+    lanes: tuple[Lane, ...] = field(default_factory=tuple)
+    motifs: tuple[Motif, ...] = field(default_factory=tuple)
+    routes: tuple[RouteIntent, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "net_classes": {net: net_class.value for net, net_class in self.net_classes.items()},
+            "local_terminals": [terminal.to_dict() for terminal in self.local_terminals],
+            "stages": [stage.to_dict() for stage in self.stages],
+            "lanes": [lane.to_dict() for lane in self.lanes],
+            "motifs": [motif.to_dict() for motif in self.motifs],
+            "routes": [route.to_dict() for route in self.routes],
+        }
+
+
 @dataclass(frozen=True)
 class LayoutSupport:
     layout_mode: str = "unknown"
@@ -147,6 +271,7 @@ class LayoutPlan:
     topology_signature: str
     warnings: list[str] = field(default_factory=list)
     support: LayoutSupport = field(default_factory=LayoutSupport)
+    semantic: TopologySemanticPlan = field(default_factory=TopologySemanticPlan)
 
 
 Layout = LayoutPlan
@@ -208,6 +333,7 @@ class SchematicArtifact:
     optimization_log: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     layout_support: dict[str, Any] = field(default_factory=dict)
+    semantic_plan: dict[str, Any] = field(default_factory=dict)
 
 
 def circuit_from_any(circuit: Circuit | dict[str, Any]) -> Circuit:

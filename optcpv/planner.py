@@ -18,9 +18,27 @@ from .models import (
     LayoutPlan,
     LayoutSupport,
     LayoutWire,
+    Lane,
+    LocalTerminalIntent,
+    Motif,
+    NetClass,
     Point,
+    RouteIntent,
+    Stage,
+    TopologySemanticPlan,
     circuit_from_any,
 )
+from .semantics import (
+    classify_net,
+    is_local_terminal_net,
+    is_negative_supply_pin,
+    is_positive_supply_pin,
+    is_reference_pin,
+    preferred_terminal_direction,
+    terminal_label,
+    terminal_type_for_net,
+)
+from .symbols import OPAMP_HALF_HEIGHT, OPAMP_INPUT_LEAD_X, OPAMP_INPUT_LEAD_Y, OPAMP_OUTPUT_LEAD_X
 from .verifier import topology_signature
 
 
@@ -220,6 +238,9 @@ def _plan_bridge(circuit: Circuit) -> LayoutPlan:
 def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
     placements: dict[str, tuple[float, float, str]] = {}
     opamps = _ordered_opamps(circuit, [component for component in circuit.components if _is_opamp(component)])
+    semantic_chain = _plan_parallel_summing_signal_chain(circuit, opamps)
+    if semantic_chain is not None:
+        return semantic_chain
     single_row_network = 5 <= len(opamps) <= 7
     if single_row_network:
         width = 1680
@@ -265,7 +286,7 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
             if single_row_network and _is_monitor_output(terminal):
                 placements[terminal.id] = (
                     min(span_x - 1.3, dx0 + 3.57),
-                    max(1.2, dy0 - 1.8 - output_index * 0.75),
+                    max(1.35, dy0 - 2.45 - output_index * 0.8),
                     "right",
                 )
             else:
@@ -317,7 +338,15 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
             elif placements[component.id][1] > row_split_y:
                 label_offsets[component.id] = (0.0, -1.5)
         if _is_output(component) and _is_monitor_output(component):
-            label_offsets[component.id] = (0.0, -1.45)
+            label_offsets[component.id] = (0.0, -0.82 if single_row_network else -1.45)
+        elif single_row_network and _is_output(component):
+            label_offsets[component.id] = (0.95, -0.62)
+        elif single_row_network and _is_input_or_source(component):
+            label_offsets[component.id] = (-0.72, -0.62)
+        if single_row_network and _is_opamp(component) and component.id in placements:
+            label_offsets[component.id] = (1.7, -2.08)
+        if single_row_network and _is_type(component, "resistor") and "feedback" not in _key(component.role):
+            label_offsets[component.id] = (1.0, 0.0)
 
     routed_circuit = Circuit(id=circuit.id, motif="op_amp_network", title=circuit.title, components=circuit.components)
     return _build_layout(
@@ -329,6 +358,201 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
         label_offsets=label_offsets,
         support=_op_amp_network_support(),
     )
+
+
+def _plan_parallel_summing_signal_chain(circuit: Circuit, opamps: list[Component]) -> LayoutPlan | None:
+    if len(opamps) < 2:
+        return None
+    resistors = [component for component in circuit.components if _is_type(component, "resistor")]
+    filters = [component for component in circuit.components if _is_filter_block_component(component)]
+    summing = _find_summing_opamp(opamps, resistors)
+    if summing is None:
+        return None
+
+    input_resistors = _summing_input_resistors(summing, resistors)
+    if len(input_resistors) < 2:
+        return None
+
+    output_to_opamp = _output_net_to_opamp(opamps)
+    input_buffers: list[Component] = []
+    for resistor in input_resistors:
+        source_net = next((net for net in resistor.pins.values() if net not in _opamp_input_nets(summing)), None)
+        source = output_to_opamp.get(source_net or "")
+        if source is not None and source.id != summing.id and source not in input_buffers:
+            input_buffers.append(source)
+    if len(input_buffers) < 2:
+        return None
+
+    width = 1600
+    height = 740
+    span_x = width / GRID
+    lanes = _lane_y_values(len(input_buffers), center=6.4, spacing=2.8)
+    lane_by_source = {opamp.id: lanes[index] for index, opamp in enumerate(input_buffers)}
+    center_y = sum(lanes) / len(lanes)
+    placements: dict[str, tuple[float, float, str]] = {}
+
+    for opamp in input_buffers:
+        placements[opamp.id] = (4.0, lane_by_source[opamp.id], "right")
+
+    for component in [item for item in circuit.components if _is_input_or_source(item)]:
+        target = _first_net_opamp(component.pins.values(), _input_net_to_opamps(input_buffers))
+        y = lane_by_source.get(target.id, center_y) if target else center_y
+        placements[component.id] = (1.4, y, "right")
+
+    sum_input_nets = set(_opamp_input_nets(summing))
+    for resistor in input_resistors:
+        source_net = next((net for net in resistor.pins.values() if net not in sum_input_nets), None)
+        source = output_to_opamp.get(source_net or "")
+        y = lane_by_source.get(source.id, center_y) if source else center_y
+        placements[resistor.id] = (8.6, y, "right")
+
+    placements[summing.id] = (12.4, center_y, "right")
+    for resistor in _feedback_resistors_for_component_opamp(summing, resistors):
+        placements[resistor.id] = (13.5, max(1.25, center_y - 2.4), "left")
+
+    x_cursor = 17.6
+    downstream_opamps = [
+        opamp
+        for opamp in opamps
+        if opamp.id not in {summing.id, *(buffer.id for buffer in input_buffers)}
+    ]
+    remaining_filters = list(filters)
+    if remaining_filters:
+        placements[remaining_filters.pop(0).id] = (x_cursor, center_y, "right")
+        x_cursor += 5.4
+    if downstream_opamps:
+        gain = downstream_opamps[0]
+        placements[gain.id] = (x_cursor, center_y, "right")
+        for resistor in _feedback_resistors_for_component_opamp(gain, resistors):
+            if resistor.id in placements:
+                continue
+            placements[resistor.id] = (x_cursor + 1.05, max(1.25, center_y - 2.4), "left")
+        for resistor in _ground_leg_resistors(gain, resistors):
+            if resistor.id in placements:
+                continue
+            placements[resistor.id] = (x_cursor + 0.85, center_y + 2.55, "down")
+        x_cursor += 5.4
+    for filter_block in remaining_filters:
+        placements[filter_block.id] = (x_cursor, center_y, "right")
+        x_cursor += 4.5
+
+    for terminal in [component for component in circuit.components if _is_output(component)]:
+        placements[terminal.id] = (min(span_x - 1.4, x_cursor), center_y, "right")
+
+    grounds = [component for component in circuit.components if _is_ground(component)]
+    for index, ground in enumerate(grounds):
+        placements[ground.id] = (2.1 + index * 2.6, max(lanes) + 2.75, "right")
+
+    passive_index = 0
+    for component in circuit.components:
+        if component.id in placements:
+            continue
+        if _is_type(component, "resistor"):
+            slot = _semantic_resistor_slot(component, placements, opamps, resistors)
+            if slot is not None:
+                placements[component.id] = slot
+                continue
+        if _is_filter_block_component(component):
+            placements[component.id] = (x_cursor, center_y, "right")
+            x_cursor += 4.5
+            continue
+        col = passive_index % 4
+        row = passive_index // 4
+        placements[component.id] = (7.0 + col * 2.8, max(lanes) + 2.2 + row * 1.25, "right")
+        passive_index += 1
+
+    label_offsets: dict[str, tuple[float, float]] = {}
+    for opamp in opamps:
+        if opamp.id in placements:
+            label_offsets[opamp.id] = (1.75, -1.28)
+    for filter_block in filters:
+        label_offsets[filter_block.id] = (0.0, -1.22)
+    for component in circuit.components:
+        if _is_input_or_source(component) or _is_output(component):
+            label_offsets[component.id] = (0.0, -0.85)
+
+    routed_circuit = Circuit(id=circuit.id, motif="op_amp_network", title=circuit.title, components=circuit.components)
+    return _build_layout(
+        routed_circuit,
+        placements,
+        ["motif: op_amp_network", "semantic: parallel_summing_signal_chain"],
+        width=width,
+        height=height,
+        label_offsets=label_offsets,
+        support=_op_amp_network_support(),
+    )
+
+
+def _lane_y_values(count: int, *, center: float, spacing: float) -> list[float]:
+    if count <= 1:
+        return [center]
+    start = center - spacing * (count - 1) / 2.0
+    return [start + index * spacing for index in range(count)]
+
+
+def _find_summing_opamp(opamps: list[Component], resistors: list[Component]) -> Component | None:
+    candidates: list[tuple[int, Component]] = []
+    for opamp in opamps:
+        count = len(_summing_input_resistors(opamp, resistors))
+        if count >= 2:
+            candidates.append((count, opamp))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _summing_input_resistors(opamp: Component, resistors: list[Component]) -> list[Component]:
+    input_nets = set(_opamp_input_nets(opamp))
+    output_net = _opamp_output_net(opamp)
+    result: list[Component] = []
+    for resistor in resistors:
+        nets = set(resistor.pins.values())
+        if output_net in nets:
+            continue
+        if input_nets & nets and not any(is_local_terminal_net(net) for net in nets):
+            result.append(resistor)
+    return result
+
+
+def _feedback_resistors_for_component_opamp(opamp: Component, resistors: list[Component]) -> list[Component]:
+    output_net = _opamp_output_net(opamp)
+    input_nets = set(_opamp_input_nets(opamp))
+    if output_net is None:
+        return []
+    return [
+        resistor
+        for resistor in resistors
+        if output_net in set(resistor.pins.values())
+        and (input_nets & set(resistor.pins.values()) or "feedback" in _key(resistor.role))
+    ]
+
+
+def _ground_leg_resistors(opamp: Component, resistors: list[Component]) -> list[Component]:
+    input_nets = set(_opamp_input_nets(opamp))
+    result: list[Component] = []
+    for resistor in resistors:
+        nets = set(resistor.pins.values())
+        if input_nets & nets and any(is_local_terminal_net(net) for net in nets):
+            result.append(resistor)
+    return result
+
+
+def _semantic_resistor_slot(
+    component: Component,
+    placements: dict[str, tuple[float, float, str]],
+    opamps: list[Component],
+    resistors: list[Component],
+) -> tuple[float, float, str] | None:
+    for opamp in opamps:
+        if opamp.id not in placements:
+            continue
+        if component in _feedback_resistors_for_component_opamp(opamp, resistors):
+            x, y, _ = placements[opamp.id]
+            return (x + 1.05, max(1.35, y - 2.55), "left")
+        if component in _ground_leg_resistors(opamp, resistors):
+            x, y, _ = placements[opamp.id]
+            return (x + 0.85, y + 2.7, "down")
+    return None
 
 
 def _ordered_opamps(circuit: Circuit, opamps: list[Component]) -> list[Component]:
@@ -446,7 +670,14 @@ def _opamp_output_net(opamp: Component) -> str | None:
 
 
 def _opamp_input_nets(opamp: Component) -> list[str]:
-    return [net for pin_name, net in opamp.pins.items() if not _is_opamp_output_pin(pin_name)]
+    return [
+        net
+        for pin_name, net in opamp.pins.items()
+        if not _is_opamp_output_pin(pin_name)
+        and not is_positive_supply_pin(pin_name, net)
+        and not is_negative_supply_pin(pin_name, net)
+        and not is_reference_pin(pin_name, net)
+    ]
 
 
 def _is_opamp_output_pin(pin_name: str) -> bool:
@@ -603,19 +834,303 @@ def _build_layout(
         support or _support_from_warnings(warnings),
         fallback_component_ids,
     )
+    semantic = _build_semantic_plan(circuit, components, pin_map, net_to_pins)
     return LayoutPlan(
         circuit_id=circuit.id,
         width=width,
         height=height,
         grid=grid,
         components=components,
-        wires=_route_wires(pin_map, net_to_pins, motif=_route_motif(circuit, layout_support)),
+        wires=_route_wires(pin_map, net_to_pins, motif=_route_motif(circuit, layout_support), semantic=semantic),
         labels=labels,
         pin_map=pin_map,
         net_to_pins=net_to_pins,
         topology_signature=topology_signature(circuit),
         warnings=warnings,
         support=layout_support,
+        semantic=semantic,
+    )
+
+
+def _build_semantic_plan(
+    circuit: Circuit,
+    components: list[LayoutComponent],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+) -> TopologySemanticPlan:
+    component_by_id = {component.id: component for component in components}
+    net_classes = {net: classify_net(net) for net in net_to_pins}
+    local_terminals = _local_terminal_intents(component_by_id, pin_map, net_classes)
+    return TopologySemanticPlan(
+        net_classes=net_classes,
+        local_terminals=tuple(local_terminals),
+        stages=tuple(_semantic_stages(components)),
+        lanes=tuple(_semantic_lanes(components)),
+        motifs=tuple(_semantic_motifs(circuit, components, net_to_pins, net_classes)),
+        routes=tuple(_semantic_routes(pin_map, net_to_pins, net_classes, components)),
+    )
+
+
+def _local_terminal_intents(
+    component_by_id: dict[str, LayoutComponent],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    net_classes: dict[str, NetClass],
+) -> list[LocalTerminalIntent]:
+    terminals: list[LocalTerminalIntent] = []
+    for (component_id, pin_name), pin in sorted(pin_map.items()):
+        net_class = net_classes.get(pin.net, classify_net(pin.net))
+        if net_class not in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}:
+            continue
+        component = component_by_id.get(component_id)
+        if component is not None and _is_explicit_terminal_component(component):
+            continue
+        terminals.append(
+            LocalTerminalIntent(
+                component_id=component_id,
+                pin_name=pin_name,
+                net=pin.net,
+                terminal_type=terminal_type_for_net(pin.net),
+                label=terminal_label(pin.net, net_class),
+                preferred_direction=preferred_terminal_direction(pin.net),
+            )
+        )
+    return terminals
+
+
+def _semantic_stages(components: list[LayoutComponent]) -> list[Stage]:
+    buckets: dict[tuple[int, str], list[str]] = {}
+    for component in components:
+        stage_type = _semantic_stage_type(component)
+        x_key = round(component.x * 2)
+        buckets.setdefault((x_key, stage_type), []).append(component.id)
+    ordered = sorted(buckets.items(), key=lambda item: (item[0][0], item[0][1]))
+    return [
+        Stage(
+            stage_id=f"stage:{index}:{stage_type}",
+            stage_type=stage_type,
+            component_ids=tuple(sorted(component_ids)),
+            x_order=index,
+        )
+        for index, ((_, stage_type), component_ids) in enumerate(ordered)
+    ]
+
+
+def _semantic_lanes(components: list[LayoutComponent]) -> list[Lane]:
+    signal_components = [
+        component
+        for component in components
+        if not _is_explicit_terminal_component(component) and _semantic_stage_type(component) != "local_ground"
+    ]
+    y_values = sorted({round(component.y * 2) / 2.0 for component in signal_components})
+    lanes: list[Lane] = []
+    for index, y_value in enumerate(y_values):
+        members = tuple(
+            component.id
+            for component in sorted(signal_components, key=lambda item: item.x)
+            if abs(component.y - y_value) <= 0.45
+        )
+        if members:
+            lanes.append(Lane(lane_id=f"lane:{index}", source=members[0], y_order=index, component_ids=members))
+    return lanes
+
+
+def _semantic_motifs(
+    circuit: Circuit,
+    components: list[LayoutComponent],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    net_classes: dict[str, NetClass],
+) -> list[Motif]:
+    motifs: list[Motif] = []
+    component_by_id = {component.id: component for component in components}
+    opamps = [component for component in components if _is_opamp_layout(component)]
+    resistors = [component for component in components if _is_resistor_layout(component)]
+
+    for component in components:
+        stage_type = _semantic_stage_type(component)
+        if stage_type == "input_port":
+            motifs.append(
+                Motif(
+                    motif_id=f"input:{component.id}",
+                    motif_type="input_port",
+                    component_ids=(component.id,),
+                    output_nets=tuple(component.pins.values()),
+                )
+            )
+        elif stage_type == "output_port":
+            motifs.append(
+                Motif(
+                    motif_id=f"output:{component.id}",
+                    motif_type="output_port",
+                    component_ids=(component.id,),
+                    input_nets=tuple(component.pins.values()),
+                )
+            )
+        elif stage_type == "filter_block":
+            motifs.append(
+                Motif(
+                    motif_id=f"filter:{component.id}",
+                    motif_type="functional_filter_block",
+                    component_ids=(component.id,),
+                    input_nets=tuple(net for pin, net in component.pins.items() if _pin_kind(pin) in {"in", "input", "a"}),
+                    output_nets=tuple(net for pin, net in component.pins.items() if _is_opamp_output_pin(pin) or _pin_kind(pin) in {"out", "output", "b"}),
+                )
+            )
+
+    for component in components:
+        local_nets = tuple(net for net in component.pins.values() if net_classes.get(net) in {NetClass.GROUND, NetClass.REFERENCE})
+        supply_nets = tuple(
+            net
+            for net in component.pins.values()
+            if net_classes.get(net) in {NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY}
+        )
+        if local_nets and not _is_explicit_terminal_component(component):
+            motifs.append(
+                Motif(
+                    motif_id=f"local-reference:{component.id}",
+                    motif_type="local_ground",
+                    component_ids=(component.id,),
+                    local_reference_nets=local_nets,
+                )
+            )
+        if supply_nets:
+            motifs.append(
+                Motif(
+                    motif_id=f"local-supply:{component.id}",
+                    motif_type="local_supply_terminal",
+                    component_ids=(component.id,),
+                    local_reference_nets=supply_nets,
+                )
+            )
+
+    for opamp in opamps:
+        output_net = _opamp_output_net_layout(opamp)
+        input_nets = _opamp_input_nets_layout(opamp)
+        feedback = _feedback_resistors_for_opamp(opamp, resistors)
+        feedback_nets = tuple(sorted({net for resistor in feedback for net in resistor.pins.values()}))
+        motif_type = "op_amp_feedback_stage" if feedback else "generic_functional_block"
+        if output_net and output_net in input_nets:
+            motif_type = "opamp_buffer"
+        elif _is_summing_opamp(opamp, resistors):
+            motif_type = "summing_opamp"
+        motifs.append(
+            Motif(
+                motif_id=f"opamp:{opamp.id}",
+                motif_type=motif_type,
+                component_ids=tuple([opamp.id, *(resistor.id for resistor in feedback)]),
+                input_nets=tuple(input_nets),
+                output_nets=(output_net,) if output_net else (),
+                local_reference_nets=tuple(
+                    net for net in opamp.pins.values() if net_classes.get(net) in {NetClass.GROUND, NetClass.REFERENCE}
+                ),
+                feedback_nets=feedback_nets,
+            )
+        )
+
+    for resistor in resistors:
+        classes = [net_classes.get(net, classify_net(net)) for net in resistor.pins.values()]
+        if any(net_class in {NetClass.GROUND, NetClass.REFERENCE} for net_class in classes):
+            motifs.append(
+                Motif(
+                    motif_id=f"ground-leg:{resistor.id}",
+                    motif_type="resistor_to_ground_reference_leg",
+                    component_ids=(resistor.id,),
+                    input_nets=tuple(net for net in resistor.pins.values() if not is_local_terminal_net(net)),
+                    local_reference_nets=tuple(net for net in resistor.pins.values() if is_local_terminal_net(net)),
+                )
+            )
+
+    motifs.extend(_passive_section_motifs(components, net_to_pins, net_classes))
+    return motifs
+
+
+def _passive_section_motifs(
+    components: list[LayoutComponent],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    net_classes: dict[str, NetClass],
+) -> list[Motif]:
+    motifs: list[Motif] = []
+    component_by_id = {component.id: component for component in components}
+    for net, pins in net_to_pins.items():
+        if net_classes.get(net) != NetClass.SIGNAL:
+            continue
+        attached = [component_by_id[component_id] for component_id, _ in pins if component_id in component_by_id]
+        resistors = [component for component in attached if _is_resistor_layout(component)]
+        capacitors = [component for component in attached if _is_capacitor_layout(component)]
+        if resistors and capacitors:
+            motifs.append(
+                Motif(
+                    motif_id=f"rc-section:{net}",
+                    motif_type="rc_low_pass_or_high_pass_section",
+                    component_ids=tuple(sorted({component.id for component in [*resistors, *capacitors]})),
+                    input_nets=(net,),
+                )
+            )
+    return motifs
+
+
+def _semantic_routes(
+    pin_map: dict[tuple[str, str], LayoutPin],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    net_classes: dict[str, NetClass],
+    components: list[LayoutComponent],
+) -> list[RouteIntent]:
+    routes: list[RouteIntent] = []
+    component_by_id = {component.id: component for component in components}
+    for net, pins in net_to_pins.items():
+        if net_classes.get(net) != NetClass.SIGNAL or len(pins) < 2:
+            continue
+        drivers = [key for key in pins if _is_driver_pin(key, component_by_id)]
+        targets = [key for key in pins if key not in drivers]
+        if not drivers:
+            drivers = [min(pins, key=lambda key: pin_map[key].x)]
+            targets = [key for key in pins if key not in drivers]
+        for source in drivers:
+            for target in targets:
+                routes.append(
+                    RouteIntent(
+                        route_type="left_to_right_signal",
+                        source=source,
+                        target=target,
+                        net=net,
+                        preferred_side="right",
+                        avoid_component_ids=tuple(
+                            sorted(
+                                component.id
+                                for component in components
+                                if component.id not in {source[0], target[0]} and _is_opamp_layout(component)
+                            )
+                        ),
+                    )
+                )
+    return routes
+
+
+def _semantic_stage_type(component: LayoutComponent) -> str:
+    key = _key(component.type)
+    if _is_input_or_source_layout(component):
+        return "input_port"
+    if _is_output_layout(component):
+        return "output_port"
+    if _is_filter_block_layout(component):
+        return "filter_block"
+    if _is_opamp_layout(component):
+        return "op_amp_stage"
+    if _is_ground_layout(component):
+        return "local_ground"
+    if _is_resistor_layout(component) or _is_capacitor_layout(component):
+        return "passive"
+    return "generic_functional_block"
+
+
+def _is_driver_pin(key: tuple[str, str], component_by_id: dict[str, LayoutComponent]) -> bool:
+    component_id, pin_name = key
+    component = component_by_id.get(component_id)
+    if component is None:
+        return False
+    return _is_output_layout(component) is False and (
+        _is_opamp_output_pin(pin_name)
+        or (_is_input_or_source_layout(component) and _pin_kind(pin_name) in {"out", "output", "o"})
+        or (_is_filter_block_layout(component) and _pin_kind(pin_name) in {"out", "output", "b"})
     )
 
 
@@ -637,7 +1152,9 @@ def _layout_component(component: Component, x: float, y: float, orientation: str
 def _component_bbox(component_type: str, x: float, y: float, orientation: str) -> BBox:
     key = _key(component_type)
     if _is_opamp_type(key):
-        return BBox(x - 0.1, y - 1.05, 3.65, 2.1)
+        return BBox(x, y - OPAMP_HALF_HEIGHT, OPAMP_OUTPUT_LEAD_X, OPAMP_HALF_HEIGHT * 2.0)
+    if _is_filter_block_type(key):
+        return BBox(x - 1.6, y - 0.8, 3.2, 1.6)
     if key in {"input", "output", "input_terminal", "voltage_source", "source"} or "source" in key:
         return BBox(x - 0.55, y - 0.55, 1.1, 1.1)
     if key in {"ground", "gnd"}:
@@ -674,13 +1191,16 @@ def _labels_for_components(
 def _default_label_offset(component: LayoutComponent) -> tuple[float, float]:
     key = _key(component.type)
     if _is_terminal_layout(component):
+        if _is_output_layout(component):
+            return (0.95, -0.62)
+        return (-0.72, -0.62)
         return (0.0, -0.72)
     if key in {"ground", "gnd"}:
         return (0.0, 1.05)
     if _is_opamp_layout(component):
-        return (1.45, -1.45)
+        return (1.55, -1.7)
     if component.orientation in {"up", "down"}:
-        return (0.62, 0.0)
+        return (1.0, 0.0)
     return (0.0, -0.9)
 
 
@@ -698,6 +1218,7 @@ def _route_wires(
     net_to_pins: dict[str, list[tuple[str, str]]],
     *,
     motif: str | None = None,
+    semantic: TopologySemanticPlan | None = None,
 ) -> list[LayoutWire]:
     motif_routes = _route_known_motif(pin_map, net_to_pins, motif)
     if motif_routes is not None:
@@ -705,6 +1226,8 @@ def _route_wires(
 
     wires: list[LayoutWire] = []
     for net, connected in sorted(net_to_pins.items()):
+        if _net_is_terminalized(net, semantic):
+            continue
         route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
         if not route:
             continue
@@ -751,12 +1274,22 @@ def _route_known_motif(
         return None
     wires: list[LayoutWire] = []
     for net, connected in sorted(net_to_pins.items()):
+        if _net_is_terminalized(net, None):
+            continue
         route = routes.get(net)
         if route is None:
             route = _generic_route([_point(pin_map, key) for key in connected])
         if route:
             wires.append(LayoutWire(net=net, points=_dedupe(route), connected_pins=connected))
     return wires
+
+
+def _net_is_terminalized(net: str, semantic: TopologySemanticPlan | None) -> bool:
+    if semantic is not None:
+        net_class = semantic.net_classes.get(net)
+        if net_class is not None:
+            return net_class in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}
+    return is_local_terminal_net(net)
 
 
 def _voltage_divider_routes(
@@ -809,11 +1342,12 @@ def _non_inverting_op_amp_routes(
         return None
     out = _p(pin_map, "U1", "out")
     minus = _p(pin_map, "U1", "-")
-    vm_bus = Point(_p(pin_map, "Rg", "a").x, minus.y)
+    vm_left = Point(_p(pin_map, "Rf", "b").x, minus.y)
+    rg_drop = Point(vm_left.x, _p(pin_map, "Rg", "a").y)
     return {
         "vin": [_p(pin_map, "VIN", "out"), _p(pin_map, "U1", "+")],
         "vout": [out, _p(pin_map, "VOUT", "in"), out, Point(out.x, _p(pin_map, "Rf", "a").y), _p(pin_map, "Rf", "a")],
-        "vm": [_p(pin_map, "Rf", "b"), Point(_p(pin_map, "Rf", "b").x, minus.y), minus, vm_bus, _p(pin_map, "Rg", "a")],
+        "vm": [_p(pin_map, "Rf", "b"), vm_left, minus, vm_left, rg_drop, _p(pin_map, "Rg", "a")],
         "gnd": [_p(pin_map, "Rg", "b"), _p(pin_map, "GND", "gnd")],
     }
 
@@ -900,7 +1434,12 @@ def _instrumentation_amplifier_routes(
             Point(o2_bus_x, _p(pin_map, "R5", "a").y),
             _p(pin_map, "R5", "a"),
         ],
-        "n3": [_p(pin_map, "R3", "b"), _p(pin_map, "U3", "+")],
+        "n3": [
+            _p(pin_map, "R3", "b"),
+            _p(pin_map, "U3", "+"),
+            _p(pin_map, "R3", "b"),
+            _p(pin_map, "R4", "a"),
+        ],
         "gnd": [_p(pin_map, "R4", "b"), _p(pin_map, "GND", "gnd")],
         "n4": [
             _p(pin_map, "R5", "b"),
@@ -952,6 +1491,24 @@ def _op_amp_network_routes(
             for pin in pins
             if pin is not driver and _pin_kind(pin.pin_name) in {"+", "-", "plus", "minus", "non_inverting", "inverting"}
         ]
+        if len(receivers) == 1 and driver is None and len(pins) >= 3:
+            routes[net] = _opamp_passive_input_route(
+                receivers[0],
+                [pin for pin in pins if pin not in receivers],
+            )
+            continue
+        if receivers and driver is None and len(pins) >= 4:
+            routes[net] = _passive_input_bus_route(
+                receivers,
+                [pin for pin in pins if pin not in receivers],
+            )
+            continue
+        if receivers and driver is None and len(pins) == 2:
+            routes[net] = _single_input_route(
+                receivers[0],
+                next(pin for pin in pins if pin not in receivers),
+            )
+            continue
         if driver and receivers:
             routes[net] = _op_amp_output_route(
                 driver,
@@ -962,6 +1519,22 @@ def _op_amp_network_routes(
                 bottom_gutter=bottom_gutter,
             )
     return routes
+
+
+def _single_input_route(receiver: LayoutPin, source: LayoutPin) -> list[Point]:
+    source_point = Point(source.x, source.y)
+    receiver_point = Point(receiver.x, receiver.y)
+    approach = _opamp_input_approach(receiver)
+    if abs(source.y - approach.y) < 1e-6:
+        return [source_point, approach, receiver_point]
+    mid_x = (source.x + approach.x) / 2.0
+    return [
+        source_point,
+        Point(mid_x, source.y),
+        Point(mid_x, approach.y),
+        approach,
+        receiver_point,
+    ]
 
 
 def _op_amp_ground_route(pins: list[LayoutPin], *, right_gutter: float) -> list[Point]:
@@ -1002,6 +1575,45 @@ def _single_row_ground_bus_route(pins: list[LayoutPin]) -> list[Point] | None:
     return route
 
 
+def _passive_input_bus_route(receivers: list[LayoutPin], branches: list[LayoutPin]) -> list[Point]:
+    receiver = sorted(receivers, key=lambda pin: pin.x)[-1]
+    receiver_point = Point(receiver.x, receiver.y)
+    bus_x = receiver.x - 0.72
+    bus = Point(bus_x, receiver.y)
+    route = [receiver_point, bus]
+    for branch in sorted(branches, key=lambda pin: (pin.y, pin.x)):
+        branch_point = Point(branch.x, branch.y)
+        tap = Point(bus_x, branch.y)
+        route.extend([tap, branch_point, tap, bus])
+    for extra in [pin for pin in receivers if pin is not receiver]:
+        extra_point = Point(extra.x, extra.y)
+        tap = Point(bus_x, extra.y)
+        route.extend([tap, extra_point, tap, bus])
+    return route
+
+
+def _opamp_passive_input_route(receiver: LayoutPin, branches: list[LayoutPin]) -> list[Point]:
+    receiver_point = Point(receiver.x, receiver.y)
+    bus_x = _opamp_passive_input_bus_x(receiver, branches)
+    hub = Point(bus_x, receiver.y)
+    route = [hub, receiver_point, hub]
+    for branch in sorted(branches, key=lambda pin: (pin.y, pin.x)):
+        branch_point = Point(branch.x, branch.y)
+        if branch.y < receiver.y - 0.2:
+            lane_y = branch.y - 0.42
+            lane_bus = Point(bus_x, lane_y)
+            lane_branch = Point(branch.x, lane_y)
+            route.extend([lane_bus, lane_branch, branch_point, lane_branch, lane_bus, hub])
+        else:
+            tap = Point(bus_x, branch.y)
+            route.extend([tap, branch_point, tap, hub])
+    return route
+
+
+def _opamp_passive_input_bus_x(receiver: LayoutPin, branches: list[LayoutPin]) -> float:
+    return receiver.x + 0.18
+
+
 def _op_amp_output_route(
     driver: LayoutPin,
     receivers: list[LayoutPin],
@@ -1020,7 +1632,9 @@ def _op_amp_output_route(
 
     for receiver in sorted(receivers, key=lambda pin: (pin.y, pin.x)):
         receiver_point = Point(receiver.x, receiver.y)
-        if receiver.x < driver.x - 0.5 or abs(receiver.y - driver.y) > 2.0:
+        if receiver.component_id == driver.component_id:
+            route.extend(_local_feedback_detour(driver, receiver, top_gutter=top_gutter, bottom_gutter=bottom_gutter))
+        elif receiver.x < driver.x - 0.5 or abs(receiver.y - driver.y) > 2.0:
             if receiver.y > driver.y + 2.0:
                 bend_y = bottom_gutter
             elif receiver.y < driver.y - 2.0:
@@ -1029,13 +1643,16 @@ def _op_amp_output_route(
                 bend_y = (driver.y + receiver.y) / 2.0 + (0.55 if receiver.y > driver.y else -0.55)
             right_x = right_gutter
             left_x = min(driver.x, receiver.x) - 1.4
+            approach = _opamp_input_approach(receiver)
             route.extend(
                 [
                     Point(right_x, driver.y),
                     Point(right_x, bend_y),
                     Point(left_x, bend_y),
                     Point(left_x, receiver.y),
+                    approach,
                     receiver_point,
+                    approach,
                     Point(left_x, receiver.y),
                     Point(left_x, bend_y),
                     Point(right_x, bend_y),
@@ -1044,9 +1661,45 @@ def _op_amp_output_route(
                 ]
             )
         else:
-            mid_x = (driver.x + receiver.x) / 2.0
-            route.extend([Point(mid_x, driver.y), Point(mid_x, receiver.y), receiver_point, Point(mid_x, receiver.y), Point(mid_x, driver.y), driver_point])
+            approach = _opamp_input_approach(receiver)
+            route.extend(
+                [
+                    Point(driver.x, approach.y),
+                    approach,
+                    receiver_point,
+                    approach,
+                    Point(driver.x, approach.y),
+                    driver_point,
+                ]
+            )
     return route
+
+
+def _local_feedback_detour(driver: LayoutPin, receiver: LayoutPin, *, top_gutter: float, bottom_gutter: float) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    receiver_point = Point(receiver.x, receiver.y)
+    if receiver.y <= driver.y:
+        bend_y = max(0.55, driver.y - OPAMP_HALF_HEIGHT - 0.18)
+    else:
+        bend_y = driver.y + OPAMP_HALF_HEIGHT + 0.18
+    right_x = driver.x + 0.58
+    left_x = receiver.x - 0.58
+    return [
+        Point(right_x, driver.y),
+        Point(right_x, bend_y),
+        Point(left_x, bend_y),
+        Point(left_x, receiver.y),
+        receiver_point,
+        Point(left_x, receiver.y),
+        Point(left_x, bend_y),
+        Point(right_x, bend_y),
+        Point(right_x, driver.y),
+        driver_point,
+    ]
+
+
+def _opamp_input_approach(receiver: LayoutPin) -> Point:
+    return Point(receiver.x - 0.62, receiver.y)
 
 
 def _net_has_ground_pin(pins: list[LayoutPin]) -> bool:
@@ -1070,11 +1723,22 @@ def _pin_point(component: LayoutComponent, pin_name: str) -> tuple[float, float,
     kind = _pin_kind(pin_name)
     x, y = component.x, component.y
     if _is_opamp_layout(component):
+        net = component.pins.get(pin_name)
         if kind in {"-", "minus", "inverting"}:
-            return (x - 0.12, y - 0.625, "left")
+            return (x + OPAMP_INPUT_LEAD_X, y - OPAMP_INPUT_LEAD_Y, "left")
         if kind in {"+", "plus", "non_inverting"}:
-            return (x - 0.12, y + 0.625, "left")
-        return (x + 3.57, y, "right")
+            return (x + OPAMP_INPUT_LEAD_X, y + OPAMP_INPUT_LEAD_Y, "left")
+        if is_positive_supply_pin(pin_name, net):
+            return (x + OPAMP_OUTPUT_LEAD_X * 0.45, y - OPAMP_HALF_HEIGHT, "top")
+        if is_negative_supply_pin(pin_name, net) or is_reference_pin(pin_name, net):
+            return (x + OPAMP_OUTPUT_LEAD_X * 0.45, y + OPAMP_HALF_HEIGHT, "bottom")
+        return (x + OPAMP_OUTPUT_LEAD_X, y, "right")
+    if _is_filter_block_layout(component):
+        if kind in {"out", "output", "o", "b", "right"}:
+            return (component.bbox.right, y, "right")
+        if kind in {"gnd", "ground", "ref"} or is_local_terminal_net(component.pins.get(pin_name)):
+            return (x, component.bbox.bottom, "bottom")
+        return (component.bbox.x, y, "left")
     if _is_ground_layout(component):
         return (x, y, "top")
     if _is_terminal_layout(component):
@@ -1197,6 +1861,10 @@ def _is_type(component: Component, needle: str) -> bool:
     return needle in key or key.startswith(needle[0])
 
 
+def _is_filter_block_component(component: Component) -> bool:
+    return _is_filter_block_type(_key(component.type)) or _is_filter_block_type(_key(component.label)) or _is_filter_block_type(_key(component.value))
+
+
 def _has_role(component: Component, needle: str) -> bool:
     return needle in _key(component.role)
 
@@ -1232,9 +1900,25 @@ def _is_opamp_layout(component: LayoutComponent) -> bool:
     return _is_opamp_type(_key(component.type))
 
 
+def _is_resistor_layout(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "resistor" in key or key.startswith("r")
+
+
+def _is_capacitor_layout(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "capacitor" in key or key.startswith("c")
+
+
 def _is_ground_layout(component: LayoutComponent) -> bool:
     key = _key(component.type)
     return key in {"ground", "gnd"} or "ground" in _key(component.role)
+
+
+def _is_input_or_source_layout(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    role = _key(component.role)
+    return key in {"input", "input_terminal", "voltage_source", "source"} or "input" in role or "source" in key
 
 
 def _is_output_layout(component: LayoutComponent) -> bool:
@@ -1244,6 +1928,65 @@ def _is_output_layout(component: LayoutComponent) -> bool:
 def _is_terminal_layout(component: LayoutComponent) -> bool:
     key = _key(component.type)
     return key in {"input", "output", "input_terminal", "voltage_source", "source"} or "source" in key
+
+
+def _is_explicit_terminal_component(component: LayoutComponent) -> bool:
+    return _is_terminal_layout(component) or _is_ground_layout(component) or _key(component.type) in {
+        "supply",
+        "power",
+        "vcc",
+        "vdd",
+        "vee",
+        "vss",
+    }
+
+
+def _is_filter_block_layout(component: LayoutComponent) -> bool:
+    return _is_filter_block_type(_key(component.type)) or _is_filter_block_type(_key(component.label)) or _is_filter_block_type(_key(component.value))
+
+
+def _is_filter_block_type(key: str) -> bool:
+    return any(token in key for token in ["filter", "lpf", "hpf", "bpf", "bessel", "butterworth", "chebyshev"])
+
+
+def _opamp_output_net_layout(opamp: LayoutComponent) -> str | None:
+    for pin_name, net in opamp.pins.items():
+        if _is_opamp_output_pin(pin_name):
+            return net
+    return None
+
+
+def _opamp_input_nets_layout(opamp: LayoutComponent) -> list[str]:
+    nets: list[str] = []
+    for pin_name, net in opamp.pins.items():
+        kind = _pin_kind(pin_name)
+        if kind in {"+", "-", "plus", "minus", "non_inverting", "inverting"}:
+            nets.append(net)
+    return nets
+
+
+def _feedback_resistors_for_opamp(opamp: LayoutComponent, resistors: list[LayoutComponent]) -> list[LayoutComponent]:
+    output_net = _opamp_output_net_layout(opamp)
+    input_nets = set(_opamp_input_nets_layout(opamp))
+    if output_net is None:
+        return []
+    return [
+        resistor
+        for resistor in resistors
+        if output_net in set(resistor.pins.values())
+        and (input_nets & set(resistor.pins.values()) or "feedback" in _key(resistor.role))
+    ]
+
+
+def _is_summing_opamp(opamp: LayoutComponent, resistors: list[LayoutComponent]) -> bool:
+    input_nets = set(_opamp_input_nets_layout(opamp))
+    for input_net in input_nets:
+        if is_local_terminal_net(input_net):
+            continue
+        incoming = [resistor for resistor in resistors if input_net in set(resistor.pins.values())]
+        if len(incoming) >= 3:
+            return True
+    return False
 
 
 def _pin_kind(pin_name: str) -> str:
