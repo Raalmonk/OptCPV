@@ -11,6 +11,7 @@ from .patch import LayoutPatch, MoveComponent, MoveLabel, apply_patch
 from .planner import plan_layout
 from .raster import rasterize_svg
 from .renderer import render_svg_layers
+from .semantic_repair import repair_circuit
 from .verifier import verify_layout_topology
 from .vision_agent import VisionLayoutClient
 
@@ -41,6 +42,11 @@ def draw_optimized_artifact(
     current_layout = layout
     current_svg = layers.final_svg
     current_reports = reports
+    repair_result = _evaluate_repair_candidate(native, current_reports, log=log)
+    if repair_result is not None:
+        native, current_layout, current_svg, current_reports = repair_result
+        best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
+
     for iteration in range(1, max_iterations + 1):
         local_patch = propose_local_patch(current_layout, current_reports.combined_report)
         local_result = _evaluate_patch(
@@ -106,6 +112,53 @@ def draw_optimized_artifact(
     )
 
 
+def _evaluate_repair_candidate(
+    circuit: Circuit,
+    current_reports: CriticBreakdown,
+    *,
+    log: list[dict],
+) -> tuple[Circuit, LayoutPlan, str, CriticBreakdown] | None:
+    repaired = repair_circuit(circuit)
+    if repaired == circuit:
+        return None
+    try:
+        candidate_layout = plan_layout(repaired)
+        verify_layout_topology(repaired, candidate_layout)
+        candidate_layers = render_svg_layers(candidate_layout)
+        candidate_reports = critique_parts(
+            repaired,
+            candidate_layout,
+            candidate_layers.final_svg,
+            layers=candidate_layers,
+        )
+    except Exception as exc:
+        log.append(
+            {
+                "iteration": 0,
+                "source": "semantic_repair",
+                "score": current_reports.combined_report.score,
+                "accepted": False,
+                "reason": f"repair_candidate_error: {exc}",
+            }
+        )
+        return None
+
+    accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5
+    log.append(
+        {
+            "iteration": 0,
+            "source": "semantic_repair",
+            "score": candidate_reports.combined_report.score,
+            "accepted": accepted,
+            "components_before": len(circuit.components),
+            "components_after": len(repaired.components),
+        }
+    )
+    if not accepted:
+        return None
+    return repaired, candidate_layout, candidate_layers.final_svg, candidate_reports
+
+
 def _evaluate_patch(
     circuit: Circuit,
     current_layout: LayoutPlan,
@@ -167,7 +220,7 @@ def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
             y = max(y, _median_y(layout) + 2.2)
         if component.type.lower() == "output":
             x = max(x, _max_input_x(layout) + 5.0)
-        if _is_feedback(component):
+        if _is_feedback(component) and "feedback_not_above" in codes:
             y = min(y, _opamp_y(layout) - 2.8)
         moves.append(MoveComponent(component.id, x, y))
 
@@ -182,23 +235,34 @@ def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
     if "component_overlap" in codes:
         moves = _separate_overlaps(layout, moves)
 
-    label_moves = _propose_label_moves(layout)
+    label_moves = _propose_label_moves(layout, report)
 
     return LayoutPatch(move_component=moves, move_label=label_moves)
 
 
-def _propose_label_moves(layout: LayoutPlan) -> list[MoveLabel]:
+def _propose_label_moves(layout: LayoutPlan, report) -> list[MoveLabel]:
     moves: list[MoveLabel] = []
+    affected = {
+        violation.subject
+        for violation in report.violations
+        if violation.subject and violation.code.startswith("label_")
+    }
+    move_all = any(violation.code == "label_visual_collision" and not violation.subject for violation in report.violations)
+    if not affected and not move_all:
+        return moves
     for label in layout.labels:
+        if not move_all and label.id not in affected:
+            continue
         owner = next((component for component in layout.components if component.id == label.owner_id), None)
         if owner is None:
             continue
-        candidates = _label_candidates(owner)
+        candidates = [(label.x, label.y), *_label_candidates(owner)]
         best_x, best_y = min(
             candidates,
             key=lambda candidate: _label_candidate_score(layout, label, owner, candidate[0], candidate[1]),
         )
-        moves.append(MoveLabel(label.id, best_x, best_y))
+        if abs(best_x - label.x) > 1e-6 or abs(best_y - label.y) > 1e-6:
+            moves.append(MoveLabel(label.id, best_x, best_y))
     return moves
 
 
@@ -207,11 +271,17 @@ def _label_candidates(owner: LayoutComponent) -> list[tuple[float, float]]:
     below = (owner.x, owner.bbox.bottom + 0.45)
     right = (owner.bbox.right + 0.45, owner.y)
     left = (owner.bbox.x - 0.45, owner.y)
+    far_above = (owner.x, owner.bbox.y - 1.15)
+    far_below = (owner.x, owner.bbox.bottom + 1.25)
+    upper_right = (owner.bbox.right + 1.15, owner.bbox.y - 0.55)
+    lower_right = (owner.bbox.right + 1.15, owner.bbox.bottom + 0.75)
+    upper_left = (owner.bbox.x - 1.15, owner.bbox.y - 0.55)
+    lower_left = (owner.bbox.x - 1.15, owner.bbox.bottom + 0.75)
     if owner.orientation in {"up", "down"} and owner.type.lower() not in {"ground", "gnd"}:
-        return [right, left, above, below]
+        return [right, left, upper_right, lower_right, upper_left, lower_left, above, below, far_above, far_below]
     if owner.type.lower() in {"ground", "gnd"}:
-        return [below, above, right, left]
-    return [above, below, right, left]
+        return [below, far_below, right, left, above]
+    return [above, upper_right, upper_left, below, lower_right, lower_left, right, left, far_above, far_below]
 
 
 def _label_candidate_score(

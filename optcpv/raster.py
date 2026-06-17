@@ -63,122 +63,134 @@ def _fallback_raster(svg: str, width: int, height: int):
     draw = ImageDraw.Draw(image)
     clean_svg = _remove_hidden(svg)
     viewbox = _viewbox(clean_svg) or (0.0, 0.0, float(width), float(height))
-    group_scale = _first_scale(clean_svg)
 
-    def transform(x: float, y: float) -> tuple[float, float]:
+    def transform(x: float, y: float, local_scale: float, offset_x: float, offset_y: float) -> tuple[float, float]:
         vx, vy, vw, vh = viewbox
         sx = width / max(vw, 1.0)
         sy = height / max(vh, 1.0)
-        return ((x * group_scale - vx) * sx, (y * group_scale - vy) * sy)
+        return ((x * local_scale + offset_x - vx) * sx, (y * local_scale + offset_y - vy) * sy)
 
-    def stroke_width(attrs: dict[str, str]) -> int:
+    def stroke_width(attrs: dict[str, str], local_scale: float) -> int:
         vx, _vy, vw, vh = viewbox
-        scale = max(width / max(vw, 1.0), height / max(vh, 1.0)) * group_scale
+        scale = max(width / max(vw, 1.0), height / max(vh, 1.0)) * local_scale
         raw = attrs.get("stroke-width", "2")
         try:
             return max(1, int(float(raw) * scale))
         except ValueError:
             return 2
 
-    for rect in re.finditer(r"<rect\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(rect.group(1)))
-        if _is_hidden(attrs):
-            continue
-        x = float(attrs.get("x", 0))
-        y = float(attrs.get("y", 0))
-        w = float(attrs.get("width", width))
-        h = float(attrs.get("height", height))
-        p0 = transform(x, y)
-        p1 = transform(x + w, y + h)
-        box = [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])]
-        fill = _paint(attrs.get("fill", "black"))
-        stroke = _paint(attrs.get("stroke", "none"))
-        if fill is not None:
-            draw.rectangle(box, fill=fill)
-        if stroke is not None:
-            draw.rectangle(box, outline=stroke, width=stroke_width(attrs))
+    def draw_fragment(fragment: str, local_scale: float, offset_x: float, offset_y: float) -> None:
+        for rect in re.finditer(r"<rect\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(rect.group(1)))
+            if _is_hidden(attrs):
+                continue
+            x = float(attrs.get("x", 0))
+            y = float(attrs.get("y", 0))
+            w = float(attrs.get("width", width))
+            h = float(attrs.get("height", height))
+            p0 = transform(x, y, local_scale, offset_x, offset_y)
+            p1 = transform(x + w, y + h, local_scale, offset_x, offset_y)
+            box = [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])]
+            fill = _paint(attrs.get("fill", "black"))
+            stroke = _paint(attrs.get("stroke", "none"))
+            if fill is not None:
+                draw.rectangle(box, fill=fill)
+            if stroke is not None:
+                draw.rectangle(box, outline=stroke, width=stroke_width(attrs, local_scale))
 
-    for line in re.finditer(r"<line\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(line.group(1)))
-        if _is_hidden(attrs):
-            continue
-        draw.line(
-            [
-                transform(float(attrs.get("x1", 0)), float(attrs.get("y1", 0))),
-                transform(float(attrs.get("x2", 0)), float(attrs.get("y2", 0))),
-            ],
-            fill=_paint(attrs.get("stroke", "black")) or "black",
-            width=stroke_width(attrs),
-        )
+        for line in re.finditer(r"<line\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(line.group(1)))
+            if _is_hidden(attrs):
+                continue
+            draw.line(
+                [
+                    transform(float(attrs.get("x1", 0)), float(attrs.get("y1", 0)), local_scale, offset_x, offset_y),
+                    transform(float(attrs.get("x2", 0)), float(attrs.get("y2", 0)), local_scale, offset_x, offset_y),
+                ],
+                fill=_paint(attrs.get("stroke", "black")) or "black",
+                width=stroke_width(attrs, local_scale),
+            )
 
-    for poly in re.finditer(r"<polyline\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(poly.group(1)))
-        if _is_hidden(attrs):
-            continue
-        pairs = _point_pairs(attrs.get("points", ""))
-        if len(pairs) > 1:
-            draw.line([transform(x, y) for x, y in pairs], fill=_paint(attrs.get("stroke", "black")) or "black", width=stroke_width(attrs))
+        for poly in re.finditer(r"<polyline\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(poly.group(1)))
+            if _is_hidden(attrs):
+                continue
+            pairs = _point_pairs(attrs.get("points", ""))
+            if len(pairs) > 1:
+                draw.line(
+                    [transform(x, y, local_scale, offset_x, offset_y) for x, y in pairs],
+                    fill=_paint(attrs.get("stroke", "black")) or "black",
+                    width=stroke_width(attrs, local_scale),
+                )
 
-    for poly in re.finditer(r"<polygon\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(poly.group(1)))
-        if _is_hidden(attrs):
-            continue
-        pairs = [transform(x, y) for x, y in _point_pairs(attrs.get("points", ""))]
-        if len(pairs) > 1:
+        for poly in re.finditer(r"<polygon\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(poly.group(1)))
+            if _is_hidden(attrs):
+                continue
+            pairs = [transform(x, y, local_scale, offset_x, offset_y) for x, y in _point_pairs(attrs.get("points", ""))]
+            if len(pairs) > 1:
+                fill = _paint(attrs.get("fill", "black"))
+                stroke = _paint(attrs.get("stroke", "black"))
+                if fill is not None:
+                    draw.polygon(pairs, fill=fill)
+                if stroke is not None:
+                    draw.line([*pairs, pairs[0]], fill=stroke, width=stroke_width(attrs, local_scale))
+
+        for path in re.finditer(r"<path\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(path.group(1)))
+            if _is_hidden(attrs):
+                continue
+            for subpath in _path_subpaths(attrs.get("d", "")):
+                pairs = [transform(x, y, local_scale, offset_x, offset_y) for x, y in subpath]
+                if len(pairs) > 1:
+                    draw.line(pairs, fill=_paint(attrs.get("stroke", "black")) or "black", width=stroke_width(attrs, local_scale))
+
+        for circle in re.finditer(r"<circle\b([^>]*)>", fragment):
+            attrs = _effective_attrs(_attrs(circle.group(1)))
+            if _is_hidden(attrs):
+                continue
+            cx = float(attrs.get("cx", 0))
+            cy = float(attrs.get("cy", 0))
+            r = float(attrs.get("r", 3))
+            p0 = transform(cx - r, cy - r, local_scale, offset_x, offset_y)
+            p1 = transform(cx + r, cy + r, local_scale, offset_x, offset_y)
             fill = _paint(attrs.get("fill", "black"))
             stroke = _paint(attrs.get("stroke", "black"))
-            if fill is not None:
-                draw.polygon(pairs, fill=fill)
-            if stroke is not None:
-                draw.line([*pairs, pairs[0]], fill=stroke, width=stroke_width(attrs))
+            draw.ellipse(
+                [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])],
+                fill=fill,
+                outline=stroke,
+                width=stroke_width(attrs, local_scale),
+            )
 
-    for path in re.finditer(r"<path\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(path.group(1)))
-        if _is_hidden(attrs):
-            continue
-        pairs = [transform(x, y) for x, y in _path_points(attrs.get("d", ""))]
-        if len(pairs) > 1:
-            draw.line(pairs, fill=_paint(attrs.get("stroke", "black")) or "black", width=stroke_width(attrs))
+        for text in re.finditer(r"<text\b([^>]*)>(.*?)</text>", fragment, re.DOTALL):
+            attrs = _effective_attrs(_attrs(text.group(1)))
+            if _is_hidden(attrs):
+                continue
+            value = unescape(re.sub(r"<[^>]+>", "", text.group(2))).strip()
+            if not value:
+                continue
+            fill = _paint(attrs.get("fill", "black"))
+            if fill is None:
+                continue
+            raw_x = _tspan_x(text.group(2), float(attrs.get("x", 0)))
+            raw_y = float(attrs.get("y", 0)) + _tspan_dy(text.group(2))
+            x, y = transform(raw_x, raw_y, local_scale, offset_x, offset_y)
+            font_size = max(8, int(_font_size(attrs) * local_scale * (height / max(viewbox[3], 1.0))))
+            try:
+                font = ImageFont.load_default(size=font_size)
+            except TypeError:
+                font = ImageFont.load_default()
+            text_box = draw.textbbox((0, 0), value, font=font)
+            tw, th = text_box[2] - text_box[0], text_box[3] - text_box[1]
+            if attrs.get("text-anchor") == "middle":
+                x -= tw / 2
+            elif attrs.get("text-anchor") == "end":
+                x -= tw
+            draw.text((x, y - th / 2), value, fill=fill, font=font)
 
-    for circle in re.finditer(r"<circle\b([^>]*)>", clean_svg):
-        attrs = _effective_attrs(_attrs(circle.group(1)))
-        if _is_hidden(attrs):
-            continue
-        cx = float(attrs.get("cx", 0))
-        cy = float(attrs.get("cy", 0))
-        r = float(attrs.get("r", 3))
-        p0 = transform(cx - r, cy - r)
-        p1 = transform(cx + r, cy + r)
-        fill = _paint(attrs.get("fill", "black"))
-        stroke = _paint(attrs.get("stroke", "black"))
-        draw.ellipse(
-            [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])],
-            fill=fill,
-            outline=stroke,
-            width=stroke_width(attrs),
-        )
-
-    for text in re.finditer(r"<text\b([^>]*)>(.*?)</text>", clean_svg, re.DOTALL):
-        attrs = _effective_attrs(_attrs(text.group(1)))
-        if _is_hidden(attrs):
-            continue
-        value = unescape(re.sub(r"<[^>]+>", "", text.group(2))).strip()
-        if not value:
-            continue
-        fill = _paint(attrs.get("fill", "black"))
-        if fill is None:
-            continue
-        x, y = transform(float(attrs.get("x", 0)), float(attrs.get("y", 0)))
-        font_size = max(8, int(_font_size(attrs) * group_scale * (height / max(viewbox[3], 1.0))))
-        try:
-            font = ImageFont.load_default(size=font_size)
-        except TypeError:
-            font = ImageFont.load_default()
-        text_box = draw.textbbox((0, 0), value, font=font)
-        tw, th = text_box[2] - text_box[0], text_box[3] - text_box[1]
-        if attrs.get("text-anchor") == "middle":
-            x -= tw / 2
-        draw.text((x, y - th), value, fill=fill, font=font)
+    for fragment, local_scale, offset_x, offset_y in _scaled_fragments(clean_svg):
+        draw_fragment(fragment, local_scale, offset_x, offset_y)
 
     return _white_background(image)
 
@@ -213,6 +225,43 @@ def _first_scale(svg: str) -> float:
 
     values = [float(match.group(1)) for match in re.finditer(r"scale\(\s*([0-9.]+)", svg)]
     return values[0] if values else 1.0
+
+
+def _scaled_fragments(svg: str) -> list[tuple[str, float, float, float]]:
+    import re
+
+    fragments: list[tuple[str, float, float, float]] = []
+    cursor = 0
+    pattern = re.compile(r"""<g\b[^>]*transform=["']([^"']+)["'][^>]*>(.*?)</g>""", re.DOTALL)
+    for match in pattern.finditer(svg):
+        if match.start() > cursor:
+            fragments.append((svg[cursor : match.start()], 1.0, 0.0, 0.0))
+        scale, offset_x, offset_y = _simple_transform(match.group(1))
+        fragments.append((match.group(2), scale, offset_x, offset_y))
+        cursor = match.end()
+    if cursor < len(svg):
+        fragments.append((svg[cursor:], 1.0, 0.0, 0.0))
+    return fragments or [(svg, 1.0, 0.0, 0.0)]
+
+
+def _simple_transform(transform: str) -> tuple[float, float, float]:
+    import re
+
+    text = transform.replace(",", " ")
+    combo = re.fullmatch(
+        r"\s*translate\(\s*(-?[0-9.]+)\s+(-?[0-9.]+)\s*\)\s*scale\(\s*([0-9.]+)\s*\)\s*translate\(\s*(-?[0-9.]+)\s+(-?[0-9.]+)\s*\)\s*",
+        text,
+    )
+    if combo:
+        tx, ty, scale, px, py = (float(item) for item in combo.groups())
+        return scale, tx + scale * px, ty + scale * py
+    scale = re.fullmatch(r"\s*scale\(\s*([0-9.]+)\s*\)\s*", text)
+    if scale:
+        return float(scale.group(1)), 0.0, 0.0
+    translate = re.fullmatch(r"\s*translate\(\s*(-?[0-9.]+)(?:\s+(-?[0-9.]+))?\s*\)\s*", text)
+    if translate:
+        return 1.0, float(translate.group(1)), float(translate.group(2) or 0.0)
+    return 1.0, 0.0, 0.0
 
 
 def _effective_attrs(attrs: dict[str, str]) -> dict[str, str]:
@@ -298,10 +347,11 @@ def _numbers(text: str) -> list[float]:
     return [float(item) for item in re.findall(r"-?\d+(?:\.\d+)?", text)]
 
 
-def _path_points(path: str) -> list[tuple[float, float]]:
+def _path_subpaths(path: str) -> list[list[tuple[float, float]]]:
     import re
 
     tokens = re.findall(r"[MLHVZmlhvz]|-?\d+(?:\.\d+)?", path.replace(",", " "))
+    paths: list[list[tuple[float, float]]] = []
     points: list[tuple[float, float]] = []
     command = ""
     current = (0.0, 0.0)
@@ -323,6 +373,9 @@ def _path_points(path: str) -> list[tuple[float, float]]:
                     y += current[1]
                 current = (x, y)
                 if command in {"M", "m"}:
+                    if len(points) > 1:
+                        paths.append(points)
+                    points = []
                     start = current
                     command = "l" if command == "m" else "L"
                 points.append(current)
@@ -343,7 +396,13 @@ def _path_points(path: str) -> list[tuple[float, float]]:
         except ValueError:
             pass
         index += 1
-    return points
+    if len(points) > 1:
+        paths.append(points)
+    return paths
+
+
+def _path_points(path: str) -> list[tuple[float, float]]:
+    return [point for subpath in _path_subpaths(path) for point in subpath]
 
 
 def _font_size(attrs: dict[str, str]) -> float:
@@ -351,6 +410,26 @@ def _font_size(attrs: dict[str, str]) -> float:
         return float(attrs.get("font-size", "14").replace("px", ""))
     except ValueError:
         return 14.0
+
+
+def _tspan_x(inner: str, fallback: float) -> float:
+    import re
+
+    match = re.search(r"<tspan\b[^>]*\bx=(\"|')([^\"']+)\1", inner)
+    if not match:
+        return fallback
+    values = _numbers(match.group(2))
+    return values[0] if values else fallback
+
+
+def _tspan_dy(inner: str) -> float:
+    import re
+
+    match = re.search(r"<tspan\b[^>]*\bdy=(\"|')([^\"']+)\1", inner)
+    if not match:
+        return 0.0
+    values = _numbers(match.group(2))
+    return values[0] if values else 0.0
 
 
 def _white_background(image):

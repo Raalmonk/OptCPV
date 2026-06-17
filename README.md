@@ -19,7 +19,8 @@ Circuit
 ## Install
 
 ```bash
-python -m pip install -e ".[dev]"
+python -m pip install --upgrade pip
+python -m pip install ".[dev]"
 ```
 
 Core dependencies are mandatory:
@@ -42,6 +43,21 @@ vision = ["google-genai>=1.0"]
 ```
 
 `vision` is only for an optional patch-proposal client. The default optimizer works without it.
+
+## Optional Gemini Feedback
+
+The default loop uses local vector/OpenCV criticism plus `HeuristicVisionClient` for Gemini-shaped feedback without spending credits. To attach Gemini for selected cases, install the optional extra and pass an explicit client:
+
+```python
+from optcpv import GeminiVisionClient, draw_optimized_artifact
+
+artifact = draw_optimized_artifact(
+    circuit,
+    vision_client=GeminiVisionClient(model="gemini-3.5-flash"),
+)
+```
+
+The Gemini client sends the rendered schematic raster as PNG plus layout/topology metadata, and expects a topology-safe `LayoutPatch` JSON response. Patch validation still runs locally before any move is accepted.
 
 ## Public API
 
@@ -126,3 +142,32 @@ python -m compileall optcpv examples tests
 python -m pytest -q
 python examples/export_examples.py
 ```
+
+## BME Analog Benchmark
+
+The BME stress benchmark synthesizes source-inspired biomedical analog front-end cases, converts them into OptCPV `Circuit` IR, and evaluates raw, local-optimized, and Gemini-simulated visual-feedback paths.
+
+The benchmark is intentionally outside the library core: cases are generated on demand, outputs stay under `generated/`, and no large dataset or downloaded image corpus is bundled with OptCPV.
+
+```bash
+python examples/bme_analog_200.py \
+  --text-count 250 \
+  --image-count 250 \
+  --out-dir generated/bme_analog_500 \
+  --fail-on-failure
+
+python examples/bme_analog_200.py \
+  --text-count 250 \
+  --image-count 250 \
+  --adversarial \
+  --out-dir generated/bme_analog_500_adversarial \
+  --fail-on-failure
+```
+
+Each run writes `cases.json`, `results.json`, and `summary.json`. The summary includes pass rates, score histograms, failure IDs, and clustered violation codes so regressions are actionable without spending Gemini credit.
+
+Use `--start-index N` to run a shifted deterministic batch without changing the benchmark source lists. For example, `--start-index 500 --text-count 250 --image-count 250 --adversarial` creates the next 500 dirty-input variants.
+
+Add `--contact-sheet --contact-sheet-count 12` when you want a local PNG review sheet of the worst or most representative optimized cases.
+
+For quick CI or pre-commit checks, add `--local-only` to skip the second Gemini-sim optimization pass. Use the default mode for deeper local QA when you want the local critic and Gemini-sim feedback loops compared side by side.

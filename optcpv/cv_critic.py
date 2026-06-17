@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .models import CriticReport, CriticViolation, LayoutPlan
+from .models import BBox, CriticReport, CriticViolation, LayoutPlan
 from .raster import RasterImage
 
 
@@ -39,7 +39,7 @@ def critique_raster(
         violations.append(CriticViolation("tiny_or_faint", "Drawing is too tiny or visually faint in the fixed frame.", 30, True))
     if fill_ratio < 0.10:
         violations.append(CriticViolation("too_much_empty_canvas", "Drawing occupies too little of the fixed frame.", 22))
-    if fill_ratio > 0.86:
+    if fill_ratio > _max_fill_ratio(layout):
         violations.append(CriticViolation("too_full_canvas", "Drawing nearly fills the frame and loses margins.", 15))
     if abs(center_x - 0.5) > 0.22 or abs(center_y - 0.5) > 0.24:
         violations.append(CriticViolation("unbalanced_ink_mass", "Ink mass is off center.", 8))
@@ -125,6 +125,13 @@ def _grid_clutter(mask, *, rows: int, cols: int) -> float:
     return max_density
 
 
+def _max_fill_ratio(layout: LayoutPlan) -> float:
+    opamps = sum(1 for component in layout.components if "op" in component.type.lower().replace("-", "_"))
+    if any(warning.strip() == "motif: op_amp_network" for warning in layout.warnings):
+        return 0.89
+    return 0.90 if len(layout.components) >= 20 and opamps >= 6 else 0.86
+
+
 def _dark_mask(gray):
     return gray < 210
 
@@ -170,7 +177,9 @@ def _wire_component_mask_hits(layout: LayoutPlan, wire_mask, raster: RasterImage
             continue
         if not _requires_interior_wire_mask(key):
             continue
-        x0, y0, x1, y1 = _bbox_px(component.bbox, layout, raster, pad_px=-7)
+        bbox = _component_interior_bbox(component, key)
+        pad_px = -4 if _is_opamp_key(key) else -7
+        x0, y0, x1, y1 = _bbox_px(bbox, layout, raster, pad_px=pad_px)
         if x1 <= x0 or y1 <= y0:
             continue
         region = wire_mask[y0:y1, x0:x1]
@@ -183,7 +192,17 @@ def _wire_component_mask_hits(layout: LayoutPlan, wire_mask, raster: RasterImage
 
 
 def _requires_interior_wire_mask(key: str) -> bool:
-    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key or key in {"ic", "block", "subcircuit"}
+    return key in {"ic", "block", "subcircuit"}
+
+
+def _is_opamp_key(key: str) -> bool:
+    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
+
+
+def _component_interior_bbox(component, key: str) -> BBox:
+    if _is_opamp_key(key):
+        return BBox(component.x - 0.95, component.y - 0.82, 2.15, 1.64)
+    return component.bbox
 
 
 def _wire_component_mask_hits_legacy(layout: LayoutPlan, dark, raster: RasterImage) -> int:

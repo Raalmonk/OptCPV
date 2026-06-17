@@ -5,6 +5,7 @@ from __future__ import annotations
 from html import escape
 from typing import Literal
 
+from ..labels import wrap_label_lines
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, Point
 
 
@@ -113,8 +114,11 @@ def _metadata_overlay(layout: LayoutPlan) -> str:
 
 
 def _draw_wire(layout: LayoutPlan, net: str, points: list[Point]) -> str:
-    px_points = " ".join(_px(layout, point) for point in points)
-    return f'<polyline class="wire" points="{px_points}" data-net-name="{escape(net)}"/>'
+    return "\n".join(
+        f'<line class="wire" x1="{start.x * layout.grid:.1f}" y1="{start.y * layout.grid:.1f}" '
+        f'x2="{end.x * layout.grid:.1f}" y2="{end.y * layout.grid:.1f}" data-net-name="{escape(net)}"/>'
+        for start, end in _unique_segments(points)
+    )
 
 
 def _draw_component_symbol(layout: LayoutPlan, component: LayoutComponent) -> str:
@@ -150,10 +154,21 @@ def _draw_component_symbol(layout: LayoutPlan, component: LayoutComponent) -> st
 
 
 def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
+    x = label.x * layout.grid
+    y = label.y * layout.grid
+    lines = wrap_label_lines(label.text)
+    if len(lines) == 1:
+        inner = escape(lines[0])
+    else:
+        start_y = y - (len(lines) - 1) * 7.8
+        inner = "".join(
+            f'<tspan x="{x:.1f}" y="{start_y + index * 15.6:.1f}">{escape(line)}</tspan>'
+            for index, line in enumerate(lines)
+        )
     return (
-        f'<text class="label" x="{label.x * layout.grid:.1f}" y="{label.y * layout.grid:.1f}" '
+        f'<text class="label" x="{x:.1f}" y="{y:.1f}" '
         f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}">'
-        f"{escape(label.text)}</text>"
+        f"{inner}</text>"
     )
 
 
@@ -226,6 +241,22 @@ def _draw_default(x: float, y: float) -> str:
 
 def _px(layout: LayoutPlan, point: Point) -> str:
     return f"{point.x * layout.grid:.1f},{point.y * layout.grid:.1f}"
+
+
+def _unique_segments(points: list[Point]) -> list[tuple[Point, Point]]:
+    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    segments: list[tuple[Point, Point]] = []
+    for start, end in zip(points, points[1:]):
+        if start == end:
+            continue
+        a = (round(start.x, 4), round(start.y, 4))
+        b = (round(end.x, 4), round(end.y, 4))
+        key = (a, b) if a <= b else (b, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        segments.append((start, end))
+    return segments
 
 
 def _set_root_attr(svg: str, name: str, value: str) -> str:
