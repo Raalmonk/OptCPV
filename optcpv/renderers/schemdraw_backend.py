@@ -13,6 +13,24 @@ from .svg_postprocess import inject_metadata, render_debug_svg, _set_root_attr
 
 FALLBACK_RENDERER_ID = "optcpv.debug_svg_after_schemdraw_error"
 SCHEMDRAW_UNIT_PX = 36.0
+NATIVE_SCHEMDRAW_FONT_SIZE = 12
+NATIVE_SCHEMDRAW_LINE_WIDTH = 1.35
+NATIVE_TARGET_WIDTH_RATIO = 0.86
+NATIVE_TARGET_HEIGHT_RATIO = 0.78
+NATIVE_MAX_SCALE = 2.65
+_CASCADE_OPAMP_PIN_NAMES = {
+    "+",
+    "plus",
+    "in+",
+    "non_inverting",
+    "noninverting",
+    "-",
+    "minus",
+    "in-",
+    "inverting",
+    "out",
+    "output",
+}
 
 
 class SchemdrawDependencyError(RuntimeError):
@@ -166,12 +184,20 @@ def _render_native_motif_svg(schemdraw, elm, layout: LayoutPlan) -> str | None:
         "instrumentation_amplifier": _native_instrumentation_amplifier,
         "bridge_or_wheatstone": _native_bridge,
     }
+    if motif == "op_amp_network":
+        drawing = schemdraw.Drawing(show=False)
+        if hasattr(drawing, "config"):
+            drawing.config(unit=2.0, fontsize=NATIVE_SCHEMDRAW_FONT_SIZE, lw=NATIVE_SCHEMDRAW_LINE_WIDTH)
+        if not _native_op_amp_cascade(drawing, elm, labels, layout):
+            return None
+        svg = _drawing_to_svg(drawing)
+        return svg or None
     builder = builders.get(motif)
     if builder is None:
         return None
     drawing = schemdraw.Drawing(show=False)
     if hasattr(drawing, "config"):
-        drawing.config(unit=2.0, fontsize=10, lw=1.2)
+        drawing.config(unit=2.0, fontsize=NATIVE_SCHEMDRAW_FONT_SIZE, lw=NATIVE_SCHEMDRAW_LINE_WIDTH)
     builder(drawing, elm, labels)
     svg = _drawing_to_svg(drawing)
     return svg or None
@@ -237,6 +263,185 @@ def _native_non_inverting_op_amp(drawing, elm, labels: dict[str, str]) -> None:
     drawing += elm.ResistorIEC().at(feedback).down().label(labels.get("Rg", "Rg"), loc="bottom")
     drawing += elm.Line().down(0.45)
     drawing += elm.Ground()
+
+
+def _native_op_amp_cascade(drawing, elm, labels: dict[str, str], layout: LayoutPlan) -> bool:
+    cascade = _cascade_description(layout)
+    if cascade is None:
+        return False
+
+    prev_out_anchor = None
+    for stage in cascade["stages"]:
+        prev_out_anchor = _draw_perfect_cascade_stage(
+            drawing,
+            elm,
+            labels.get(stage["opamp"].id, stage["opamp"].id),
+            labels.get(stage["feedback"].id, stage["feedback"].id),
+            labels.get(stage["gain"].id, stage["gain"].id),
+            prev_out_anchor=prev_out_anchor,
+            input_label=labels.get(cascade["input"].id, cascade["input"].id),
+        )
+
+    drawing.add(elm.Line().right().length(0.95).at(prev_out_anchor))
+    drawing.add(elm.Dot(open=True).label(labels.get(cascade["output"].id, cascade["output"].id), loc="right"))
+    return True
+
+
+def _draw_perfect_cascade_stage(
+    drawing,
+    elm,
+    u_name: str,
+    rf_name: str,
+    rg_name: str,
+    *,
+    prev_out_anchor=None,
+    input_label: str,
+):
+    input_y = 0.0
+    if prev_out_anchor is not None:
+        drawing.add(elm.Line().right().length(0.58).at(prev_out_anchor))
+        drawing.add(elm.Line().toy(input_y))
+        drawing.add(elm.Line().right().length(0.58))
+    else:
+        input_start = (0.0, input_y)
+        drawing.add(elm.Dot(open=True).at(input_start).label(input_label, loc="left"))
+        drawing.add(elm.Line().right().length(1.5).at(input_start))
+
+    opamp = drawing.add(elm.Opamp(leads=True).flip().anchor("in2").label(u_name, loc="top"))
+    out_wire = drawing.add(elm.Line().right().length(1.2).at(opamp.out))
+    drawing.add(elm.Dot().at(out_wire.end))
+
+    drawing.push()
+    drawing.add(elm.Line().down().length(1.2).at(opamp.in1))
+    drawing.add(elm.Dot())
+
+    drawing.push()
+    drawing.add(elm.ResistorIEC().down().label(rg_name, loc="right"))
+    drawing.add(elm.Ground())
+    drawing.pop()
+
+    drawing.add(elm.ResistorIEC().right().tox(out_wire.end).label(rf_name, loc="bottom"))
+    drawing.add(elm.Line().toy(out_wire.end))
+    drawing.pop()
+
+    return out_wire.end
+
+
+def _cascade_description(layout: LayoutPlan) -> dict | None:
+    components = {component.id: component for component in layout.components}
+    opamps = [component for component in layout.components if _is_opamp_component(component)]
+    if len(opamps) < 2:
+        return None
+
+    inputs = [component for component in layout.components if _is_input_or_source_component(component)]
+    outputs = [component for component in layout.components if _is_output_component(component)]
+    resistors = [component for component in layout.components if _is_resistor(component)]
+    if len(inputs) != 1 or len(outputs) != 1:
+        return None
+
+    allowed_ids = {component.id for component in [*opamps, *inputs, *outputs, *resistors]}
+    allowed_ids.update(component.id for component in layout.components if _is_standalone_terminal_component(component))
+    if set(components) - allowed_ids:
+        return None
+
+    opamp_by_input_net: dict[str, LayoutComponent] = {}
+    opamp_output_nets: set[str] = set()
+    for opamp in opamps:
+        if any(not _is_cascade_opamp_pin(pin_name) for pin_name in opamp.pins):
+            return None
+        plus_net = _component_pin_net(opamp, ["+", "plus", "in+", "non_inverting", "noninverting"])
+        minus_net = _component_pin_net(opamp, ["-", "minus", "in-", "inverting"])
+        output_net = _component_pin_net(opamp, ["out", "output"])
+        if plus_net is None or minus_net is None or output_net is None:
+            return None
+        if plus_net in opamp_by_input_net:
+            return None
+        opamp_by_input_net[plus_net] = opamp
+        opamp_output_nets.add(output_net)
+
+    current_net = next(iter(inputs[0].pins.values()), None)
+    if current_net is None or current_net in opamp_output_nets:
+        return None
+
+    ground_nets = _cascade_ground_nets(layout)
+    used_resistors: set[str] = set()
+    stages: list[dict[str, LayoutComponent]] = []
+    while current_net in opamp_by_input_net:
+        opamp = opamp_by_input_net.pop(current_net)
+        minus_net = _component_pin_net(opamp, ["-", "minus", "in-", "inverting"])
+        output_net = _component_pin_net(opamp, ["out", "output"])
+        if minus_net is None or output_net is None:
+            return None
+        feedback = _resistor_between(resistors, output_net, minus_net, used_resistors)
+        gain = _resistor_between_any(resistors, minus_net, ground_nets, used_resistors)
+        if feedback is None or gain is None:
+            return None
+        used_resistors.update({feedback.id, gain.id})
+        stages.append({"opamp": opamp, "feedback": feedback, "gain": gain})
+        current_net = output_net
+
+    if opamp_by_input_net or len(stages) != len(opamps):
+        return None
+    if current_net not in set(outputs[0].pins.values()):
+        return None
+    if any(resistor.id not in used_resistors for resistor in resistors):
+        return None
+    gain_ids = {stage["gain"].id for stage in stages}
+    if any(terminal.component_id not in gain_ids or terminal.terminal_type != "ground" for terminal in layout.semantic.local_terminals):
+        return None
+    return {"input": inputs[0], "output": outputs[0], "stages": stages}
+
+
+def _cascade_ground_nets(layout: LayoutPlan) -> set[str]:
+    ground_nets = {terminal.net for terminal in layout.semantic.local_terminals if terminal.terminal_type == "ground"}
+    for component in layout.components:
+        if _is_standalone_terminal_component(component):
+            ground_nets.update(component.pins.values())
+    ground_nets.update(net for net in layout.net_to_pins if _key(net) in {"gnd", "ground", "agnd", "dgnd"})
+    return ground_nets
+
+
+def _resistor_between(
+    resistors: list[LayoutComponent],
+    net_a: str,
+    net_b: str,
+    used_resistors: set[str],
+) -> LayoutComponent | None:
+    targets = {net_a, net_b}
+    matches = [
+        resistor
+        for resistor in resistors
+        if resistor.id not in used_resistors and set(resistor.pins.values()) == targets
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resistor_between_any(
+    resistors: list[LayoutComponent],
+    net_a: str,
+    net_b_options: set[str],
+    used_resistors: set[str],
+) -> LayoutComponent | None:
+    matches = []
+    for resistor in resistors:
+        if resistor.id in used_resistors:
+            continue
+        nets = set(resistor.pins.values())
+        if net_a in nets and nets - {net_a} and nets - {net_a} <= net_b_options:
+            matches.append(resistor)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _component_pin_net(component: LayoutComponent, names: list[str]) -> str | None:
+    normalized = {_key(name) for name in names}
+    for pin_name, net in component.pins.items():
+        if _key(pin_name) in normalized:
+            return net
+    return None
+
+
+def _is_cascade_opamp_pin(pin_name: str) -> bool:
+    return any(_key(pin_name) == _key(allowed) for allowed in _CASCADE_OPAMP_PIN_NAMES)
 
 
 def _native_instrumentation_amplifier(drawing, elm, labels: dict[str, str]) -> None:
@@ -367,9 +572,9 @@ def _normalize_native_svg_canvas(svg: str, layout: LayoutPlan) -> str:
     if viewbox is None:
         viewbox = (0.0, 0.0, float(layout.width), float(layout.height))
     vx, vy, vw, vh = viewbox
-    target_width = layout.width * 0.78
-    target_height = layout.height * 0.72
-    scale = min(target_width / max(vw, 1.0), target_height / max(vh, 1.0), 2.3)
+    target_width = layout.width * NATIVE_TARGET_WIDTH_RATIO
+    target_height = layout.height * NATIVE_TARGET_HEIGHT_RATIO
+    scale = min(target_width / max(vw, 1.0), target_height / max(vh, 1.0), NATIVE_MAX_SCALE)
     tx = (layout.width - vw * scale) / 2.0
     ty = (layout.height - vh * scale) / 2.0
     return (
@@ -624,18 +829,27 @@ def _terminal_owner_is_resistor(layout: LayoutPlan, terminal: LocalTerminalInten
     return component is not None and _is_resistor(component)
 
 
+def _is_opamp_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
+
+
+def _is_input_or_source_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return key in {"input", "input_terminal", "source", "voltage_source"} or "source" in key
+
+
+def _is_output_component(component: LayoutComponent) -> bool:
+    return _key(component.type) in {"output", "output_terminal"}
+
+
 def _is_resistor(component: LayoutComponent) -> bool:
     key = _key(component.type)
     return "resistor" in key or key.startswith("r")
 
 
 def _is_flipped_opamp(component: LayoutComponent) -> bool:
-    key = _key(component.type)
-    return (
-        "op_amp" in key
-        or "opamp" in key
-        or "operational_amplifier" in key
-    ) and "flip" in _key(component.orientation)
+    return _is_opamp_component(component) and "flip" in _key(component.orientation)
 
 
 def _is_filter_block(component: LayoutComponent) -> bool:

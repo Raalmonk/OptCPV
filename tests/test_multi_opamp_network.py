@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from optcpv import Component, Circuit, draw_optimized_artifact, repair_circuit
+from optcpv import Component, Circuit, draw_optimized_artifact, draw_svg, repair_circuit
 from optcpv.planner import plan_layout
 
 
@@ -66,6 +66,17 @@ def test_multi_opamp_network_optimizes_without_hard_failure() -> None:
     assert len([component for component in artifact.components.values() if component["type"] == "op_amp"]) == 8
     assert artifact.viewbox["width"] <= 1400
     assert artifact.viewbox["height"] <= 850
+
+
+def test_pure_cascade_uses_native_no_cross_stage_macro() -> None:
+    svg = draw_svg(opamp_chain(3, "three_stage_native_cascade", "op_amp_network"))
+
+    assert 'data-renderer="optcpv.schemdraw"' in svg
+    assert "data-schemdraw-error" not in svg
+    assert 'id="schemdraw-canvas"' in svg
+    assert 'id="optcpv-visible-wires"' not in svg
+    assert "Rf1" in svg
+    assert "Rg1" in svg
 
 
 def test_mislabeled_multi_opamp_network_keeps_topology() -> None:
