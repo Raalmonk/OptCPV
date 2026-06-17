@@ -221,10 +221,16 @@ def _wire_component_mask_hits_legacy(layout: LayoutPlan, dark, raster: RasterIma
 
 
 def _bbox_px(bbox, layout: LayoutPlan, raster: RasterImage, *, pad_px: int) -> tuple[int, int, int, int]:
-    sx = raster.width / layout.width
-    sy = raster.height / layout.height
-    x0 = int(max(0, bbox.x * layout.grid * sx - pad_px))
-    y0 = int(max(0, bbox.y * layout.grid * sy - pad_px))
-    x1 = int(min(raster.width, bbox.right * layout.grid * sx + pad_px))
-    y1 = int(min(raster.height, bbox.bottom * layout.grid * sy + pad_px))
+    scale, offset_x, offset_y = _viewbox_to_raster(layout, raster)
+    x0 = int(max(0, offset_x + bbox.x * layout.grid * scale - pad_px))
+    y0 = int(max(0, offset_y + bbox.y * layout.grid * scale - pad_px))
+    x1 = int(min(raster.width, offset_x + bbox.right * layout.grid * scale + pad_px))
+    y1 = int(min(raster.height, offset_y + bbox.bottom * layout.grid * scale + pad_px))
     return x0, y0, x1, y1
+
+
+def _viewbox_to_raster(layout: LayoutPlan, raster: RasterImage) -> tuple[float, float, float]:
+    scale = min(raster.width / max(layout.width, 1), raster.height / max(layout.height, 1))
+    offset_x = (raster.width - layout.width * scale) / 2.0
+    offset_y = (raster.height - layout.height * scale) / 2.0
+    return scale, offset_x, offset_y

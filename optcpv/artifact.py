@@ -52,6 +52,7 @@ def artifact_from_layout(
         nets=_net_metadata(layout),
         labels=_label_metadata(layout),
         viewbox={"x": 0, "y": 0, "width": layout.width, "height": layout.height},
+        layout_support=layout.support.to_dict(),
         critic_report=combined_dict,
         vector_report=vector_report.to_dict() if vector_report else None,
         cv_report=cv_report.to_dict() if cv_report else None,

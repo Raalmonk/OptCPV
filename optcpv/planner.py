@@ -16,6 +16,7 @@ from .models import (
     LayoutLabel,
     LayoutPin,
     LayoutPlan,
+    LayoutSupport,
     LayoutWire,
     Point,
     circuit_from_any,
@@ -26,6 +27,13 @@ from .verifier import topology_signature
 GRID = 48
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 800
+NATIVE_MOTIFS = {
+    "voltage_divider",
+    "rc_low_pass",
+    "non_inverting_op_amp",
+    "instrumentation_amplifier",
+    "bridge_or_wheatstone",
+}
 
 
 def plan_layout(circuit: Circuit | dict) -> LayoutPlan:
@@ -74,6 +82,7 @@ def rebuild_layout_geometry(layout: LayoutPlan) -> LayoutPlan:
         height=layout.height,
         grid=layout.grid,
         label_offsets=label_offsets,
+        support=layout.support,
     )
 
 
@@ -94,7 +103,7 @@ def _plan_voltage_divider(circuit: Circuit) -> LayoutPlan:
         placements[output.id] = (15.0, 6.6, "right")
     if ground:
         placements[ground.id] = (10.0, 10.9, "right")
-    return _build_layout(circuit, placements, ["motif: voltage_divider"])
+    return _build_layout(circuit, placements, ["motif: voltage_divider"], support=_native_motif_support("voltage_divider"))
 
 
 def _plan_rc_low_pass(circuit: Circuit) -> LayoutPlan:
@@ -114,7 +123,7 @@ def _plan_rc_low_pass(circuit: Circuit) -> LayoutPlan:
         placements[output.id] = (15.8, 5.0, "right")
     if ground:
         placements[ground.id] = (12.2, 10.3, "right")
-    return _build_layout(circuit, placements, ["motif: rc_low_pass"])
+    return _build_layout(circuit, placements, ["motif: rc_low_pass"], support=_native_motif_support("rc_low_pass"))
 
 
 def _plan_non_inverting_op_amp(circuit: Circuit) -> LayoutPlan:
@@ -140,7 +149,12 @@ def _plan_non_inverting_op_amp(circuit: Circuit) -> LayoutPlan:
         placements[output.id] = (15.2, 6.5, "right")
     if ground:
         placements[ground.id] = (11.05, 11.1, "right")
-    return _build_layout(circuit, placements, ["motif: non_inverting_op_amp"])
+    return _build_layout(
+        circuit,
+        placements,
+        ["motif: non_inverting_op_amp"],
+        support=_native_motif_support("non_inverting_op_amp"),
+    )
 
 
 def _plan_instrumentation_amplifier(circuit: Circuit) -> LayoutPlan:
@@ -182,7 +196,12 @@ def _plan_instrumentation_amplifier(circuit: Circuit) -> LayoutPlan:
     ]
     for component, slot in zip(resistors, resistor_slots):
         placements[component.id] = slot
-    return _build_layout(circuit, placements, ["motif: instrumentation_amplifier"])
+    return _build_layout(
+        circuit,
+        placements,
+        ["motif: instrumentation_amplifier"],
+        support=_native_motif_support("instrumentation_amplifier"),
+    )
 
 
 def _plan_bridge(circuit: Circuit) -> LayoutPlan:
@@ -195,22 +214,27 @@ def _plan_bridge(circuit: Circuit) -> LayoutPlan:
         [(5, 3.35, "right"), (12.4, 6.15, "right"), (11, 10.8, "right")],
     ):
         placements[component.id] = slot
-    return _build_layout(circuit, placements, ["motif: bridge_or_wheatstone"])
+    return _build_layout(circuit, placements, ["motif: bridge_or_wheatstone"], support=_native_motif_support("bridge_or_wheatstone"))
 
 
 def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
     placements: dict[str, tuple[float, float, str]] = {}
     opamps = _ordered_opamps(circuit, [component for component in circuit.components if _is_opamp(component)])
-    width = 1400 if len(opamps) >= 3 else DEFAULT_WIDTH
-    height = 850 if len(opamps) >= 3 else DEFAULT_HEIGHT
+    single_row_network = 5 <= len(opamps) <= 7
+    if single_row_network:
+        width = 1680
+        height = 700
+    else:
+        width = 1400 if len(opamps) >= 3 else DEFAULT_WIDTH
+        height = 850 if len(opamps) >= 3 else DEFAULT_HEIGHT
     span_x = width / GRID
     span_y = height / GRID
-    columns = min(4, max(1, len(opamps)))
+    columns = len(opamps) if single_row_network else min(4, max(1, len(opamps)))
     rows = max(1, ceil(len(opamps) / columns))
-    x0 = 3.2 if width > DEFAULT_WIDTH else 3.0
-    dx = 6.0 if width > DEFAULT_WIDTH else 5.3
+    x0 = 2.4 if single_row_network else (3.2 if width > DEFAULT_WIDTH else 3.0)
+    dx = (span_x - 8.2) / max(1, columns - 1) if single_row_network else (6.0 if width > DEFAULT_WIDTH else 5.3)
     long_label_mode = any(_long_label(component) for component in circuit.components)
-    y0 = 4.15 if long_label_mode else 3.3
+    y0 = 4.0 if single_row_network else (4.15 if long_label_mode else 3.3)
     dy = min(6.4, max(4.8, (span_y - 5.4) / max(1, rows - 1))) if rows > 1 else 0.0
 
     for index, opamp in enumerate(opamps):
@@ -238,11 +262,18 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
             dx0, dy0, _ = placements[driver.id]
             output_index = output_counts.get(driver.id, 0)
             output_counts[driver.id] = output_index + 1
-            placements[terminal.id] = (
-                min(span_x - 1.3, dx0 + 4.9),
-                min(span_y - 2.1, max(1.2, dy0 + _spread_offset(output_index, 1.05))),
-                "right",
-            )
+            if single_row_network and _is_monitor_output(terminal):
+                placements[terminal.id] = (
+                    min(span_x - 1.3, dx0 + 3.57),
+                    max(1.2, dy0 - 1.8 - output_index * 0.75),
+                    "right",
+                )
+            else:
+                placements[terminal.id] = (
+                    min(span_x - 1.3, dx0 + 4.9),
+                    min(span_y - 2.1, max(1.2, dy0 + _spread_offset(output_index, 1.05))),
+                    "right",
+                )
         else:
             placements[terminal.id] = (span_x - 1.5, 3.0 + fallback_outputs * 1.5, "right")
             fallback_outputs += 1
@@ -272,6 +303,12 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
     label_offsets: dict[str, tuple[float, float]] = {}
     for opamp in opamps:
         label_offsets[opamp.id] = (4.25, -0.85) if long_label_mode else (1.9, -1.25)
+    if single_row_network:
+        for component in circuit.components:
+            if _is_input_or_source(component):
+                label_offsets[component.id] = (0.0, -1.65)
+            elif _is_output(component):
+                label_offsets[component.id] = (0.0, -1.2)
     row_split_y = y0 + max(1.0, dy * 0.5)
     for component in circuit.components:
         if "feedback" in _key(component.role) and component.id in placements:
@@ -290,6 +327,7 @@ def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
         width=width,
         height=height,
         label_offsets=label_offsets,
+        support=_op_amp_network_support(),
     )
 
 
@@ -342,7 +380,7 @@ def _op_amp_passive_slot(
         output_net = _opamp_output_net(opamp)
         if output_net and output_net in nets and any(net in nets for net in _opamp_input_nets(opamp)):
             x, y, _ = placements[opamp.id]
-            return (x + 1.75, max(1.2, y - 1.95), "right")
+            return (x + 1.75, max(1.2, y - 1.95), "left")
 
     active_nets = [net for net in nets if net not in ground_nets]
     if any(net in ground_nets for net in nets):
@@ -454,7 +492,82 @@ def _plan_diagnostic(circuit: Circuit) -> LayoutPlan:
         component.id: (2.0 + index * 2.6, 5.0, "right")
         for index, component in enumerate(circuit.components)
     }
-    return _build_layout(circuit, placements, ["diagnostic: generic layout"])
+    return _build_layout(circuit, placements, ["diagnostic: generic layout"], support=_diagnostic_support())
+
+
+def _native_motif_support(motif: str) -> LayoutSupport:
+    return LayoutSupport(
+        layout_mode="native_motif",
+        layout_confidence=0.95,
+        matched_motifs=(motif,),
+        fallback_used=False,
+        notes=("schemdraw native motif renderer available",),
+    )
+
+
+def _op_amp_network_support() -> LayoutSupport:
+    return LayoutSupport(
+        layout_mode="motif_network",
+        layout_confidence=0.72,
+        matched_motifs=("op_amp_network",),
+        fallback_used=False,
+        notes=("heuristic multi-op-amp placement; not a textbook guarantee",),
+    )
+
+
+def _diagnostic_support() -> LayoutSupport:
+    return LayoutSupport(
+        layout_mode="diagnostic_fallback",
+        layout_confidence=0.25,
+        matched_motifs=(),
+        fallback_used=True,
+        unsupported_regions=("circuit:unknown_topology",),
+        notes=("generic diagnostic layout; no known motif matched",),
+    )
+
+
+def _support_from_warnings(warnings: list[str]) -> LayoutSupport:
+    motif = _warning_motif(warnings)
+    if motif in NATIVE_MOTIFS:
+        return _native_motif_support(motif)
+    if motif == "op_amp_network":
+        return _op_amp_network_support()
+    if any(warning.startswith("diagnostic:") for warning in warnings):
+        return _diagnostic_support()
+    return LayoutSupport(notes=("layout support metadata was not supplied by planner",))
+
+
+def _support_with_fallback_components(support: LayoutSupport, component_ids: list[str]) -> LayoutSupport:
+    if not component_ids:
+        return support
+    unsupported = _unique((*support.unsupported_regions, *(f"component:{component_id}" for component_id in component_ids)))
+    notes = _unique((*support.notes, "one or more components used generic fallback placement"))
+    mode = "partial_motif" if support.matched_motifs else support.layout_mode
+    return replace(
+        support,
+        layout_mode=mode,
+        layout_confidence=min(support.layout_confidence, 0.55),
+        fallback_used=True,
+        unsupported_regions=unsupported,
+        notes=notes,
+    )
+
+
+def _warning_motif(warnings: list[str]) -> str | None:
+    for warning in warnings:
+        if warning.startswith("motif:"):
+            return _key(warning.split(":", 1)[1].strip())
+    return None
+
+
+def _unique(values) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def _route_motif(circuit: Circuit, support: LayoutSupport) -> str:
+    if support.matched_motifs:
+        return support.matched_motifs[0]
+    return _canonical_motif(circuit.motif) or _key(circuit.id)
 
 
 def _build_layout(
@@ -466,12 +579,15 @@ def _build_layout(
     height: int = DEFAULT_HEIGHT,
     grid: int = GRID,
     label_offsets: dict[str, tuple[float, float]] | None = None,
+    support: LayoutSupport | None = None,
 ) -> LayoutPlan:
     fallback_index = 0
+    fallback_component_ids: list[str] = []
     components: list[LayoutComponent] = []
     for component in circuit.components:
         if component.id not in placements:
             placements[component.id] = (2.0 + fallback_index * 2.8, 15.0, "right")
+            fallback_component_ids.append(component.id)
             fallback_index += 1
         x, y, orientation = placements[component.id]
         components.append(_layout_component(component, x, y, orientation))
@@ -483,18 +599,23 @@ def _build_layout(
     net_to_pins = {net: sorted(pins) for net, pins in sorted(net_to_pins.items())}
 
     labels = _labels_for_components(components, label_offsets or {})
+    layout_support = _support_with_fallback_components(
+        support or _support_from_warnings(warnings),
+        fallback_component_ids,
+    )
     return LayoutPlan(
         circuit_id=circuit.id,
         width=width,
         height=height,
         grid=grid,
         components=components,
-        wires=_route_wires(pin_map, net_to_pins, motif=_canonical_motif(circuit.motif) or _key(circuit.id)),
+        wires=_route_wires(pin_map, net_to_pins, motif=_route_motif(circuit, layout_support)),
         labels=labels,
         pin_map=pin_map,
         net_to_pins=net_to_pins,
         topology_signature=topology_signature(circuit),
         warnings=warnings,
+        support=layout_support,
     )
 
 
@@ -813,11 +934,17 @@ def _op_amp_network_routes(
     net_to_pins: dict[str, list[tuple[str, str]]],
 ) -> dict[str, list[Point]] | None:
     routes: dict[str, list[Point]] = {}
-    right_gutter = max(pin.x for pin in pin_map.values()) + 1.25
+    max_pin_x = max(pin.x for pin in pin_map.values())
+    min_pin_y = min(pin.y for pin in pin_map.values())
+    max_pin_y = max(pin.y for pin in pin_map.values())
+    ground_gutter = max_pin_x + 1.05
+    signal_gutter = max_pin_x + 1.85
+    top_gutter = max(0.75, min_pin_y - 0.6)
+    bottom_gutter = max_pin_y + 0.6
     for net, connected in net_to_pins.items():
         pins = [pin_map[key] for key in connected]
         if _net_has_ground_pin(pins):
-            routes[net] = _op_amp_ground_route(pins, right_gutter=right_gutter)
+            routes[net] = _op_amp_ground_route(pins, right_gutter=ground_gutter)
             continue
         driver = next((pin for pin in pins if _is_opamp_output_pin(pin.pin_name) and pin.side == "right"), None)
         receivers = [
@@ -830,12 +957,18 @@ def _op_amp_network_routes(
                 driver,
                 receivers,
                 [pin for pin in pins if pin is not driver and pin not in receivers],
-                right_gutter=right_gutter,
+                right_gutter=signal_gutter,
+                top_gutter=top_gutter,
+                bottom_gutter=bottom_gutter,
             )
     return routes
 
 
 def _op_amp_ground_route(pins: list[LayoutPin], *, right_gutter: float) -> list[Point]:
+    simple_bus = _single_row_ground_bus_route(pins)
+    if simple_bus is not None:
+        return simple_bus
+
     points = [Point(pin.x, pin.y) for pin in pins]
     bus_y = max(point.y for point in points) - 0.55
     gutter_x = right_gutter
@@ -851,12 +984,32 @@ def _op_amp_ground_route(pins: list[LayoutPin], *, right_gutter: float) -> list[
     return route
 
 
+def _single_row_ground_bus_route(pins: list[LayoutPin]) -> list[Point] | None:
+    ground_symbols = [pin for pin in pins if _key(pin.pin_name) == "gnd"]
+    taps = [pin for pin in pins if pin not in ground_symbols]
+    if not ground_symbols or len(taps) < 2:
+        return None
+    tap_y_values = [pin.y for pin in taps]
+    if max(tap_y_values) - min(tap_y_values) > 0.35:
+        return None
+
+    bus_y = sum(tap_y_values) / len(tap_y_values)
+    ordered_taps = sorted(taps, key=lambda pin: pin.x)
+    ground = sorted(ground_symbols, key=lambda pin: abs(pin.x - ordered_taps[len(ordered_taps) // 2].x))[0]
+    route = [Point(ordered_taps[0].x, bus_y)]
+    route.extend(Point(pin.x, bus_y) for pin in ordered_taps[1:])
+    route.extend([Point(ground.x, bus_y), Point(ground.x, ground.y)])
+    return route
+
+
 def _op_amp_output_route(
     driver: LayoutPin,
     receivers: list[LayoutPin],
     branches: list[LayoutPin],
     *,
     right_gutter: float,
+    top_gutter: float,
+    bottom_gutter: float,
 ) -> list[Point]:
     driver_point = Point(driver.x, driver.y)
     route = [driver_point]
@@ -868,7 +1021,12 @@ def _op_amp_output_route(
     for receiver in sorted(receivers, key=lambda pin: (pin.y, pin.x)):
         receiver_point = Point(receiver.x, receiver.y)
         if receiver.x < driver.x - 0.5 or abs(receiver.y - driver.y) > 2.0:
-            bend_y = (driver.y + receiver.y) / 2.0 + (0.55 if receiver.y > driver.y else -0.55)
+            if receiver.y > driver.y + 2.0:
+                bend_y = bottom_gutter
+            elif receiver.y < driver.y - 2.0:
+                bend_y = top_gutter
+            else:
+                bend_y = (driver.y + receiver.y) / 2.0 + (0.55 if receiver.y > driver.y else -0.55)
             right_x = right_gutter
             left_x = min(driver.x, receiver.x) - 1.4
             route.extend(

@@ -87,6 +87,36 @@ Also available:
 - `draw_optimized_artifact(circuit)` for optimized SVG plus QA metadata and optimization log
 - `plan_layout(circuit)` for the LayoutPlan DSL
 
+Artifacts include explicit layout capability metadata:
+
+```python
+artifact = draw_optimized_artifact(circuit)
+artifact.layout_support
+# {
+#   "layout_mode": "native_motif",
+#   "layout_confidence": 0.95,
+#   "matched_motifs": ["instrumentation_amplifier"],
+#   "fallback_used": False,
+#   "unsupported_regions": [],
+#   "notes": [...]
+# }
+```
+
+The same information is also written on the SVG root as `data-optcpv-layout-mode`,
+`data-optcpv-layout-confidence`, `data-optcpv-matched-motifs`,
+`data-optcpv-fallback-used`, and `data-optcpv-unsupported-regions`.
+
+## Layout Support Contract
+
+OptCPV is currently a known-motif canonicalizer plus a Schemdraw/native motif renderer, vector/CV critic, and topology-safe patch loop. It does not promise arbitrary circuit topology to textbook schematic conversion.
+
+Layout modes are explicit:
+
+- `native_motif`: a recognized motif with a native Schemdraw rendering path, currently voltage divider, RC low-pass, non-inverting op amp, instrumentation amplifier, and bridge/Wheatstone.
+- `motif_network`: heuristic multi-op-amp network placement and routing. This is motif-aware and useful for composed analog front ends, but it is not a textbook-layout guarantee.
+- `partial_motif`: a known motif was matched, but one or more components required generic fallback placement. Read `unsupported_regions` before treating the drawing as complete.
+- `diagnostic_fallback`: no known motif matched. OptCPV still returns a topology-preserving diagnostic schematic, but `layout_confidence` is low and `fallback_used` is true.
+
 ## What CV Means Here
 
 CV means OptCPV inspects its own rendered output:
@@ -134,6 +164,8 @@ The command prints raw score to optimized score for each circuit.
 ## Boundaries
 
 OptCPV core does not ship a FastAPI product surface, arbitrary text parsing, arbitrary image parsing, or CiTT tutor logic. Simple input adapters may live under `optcpv.adapters`.
+
+CiTT-style adapters are boundary converters, not proof that arbitrary CiTT circuits will render like textbook figures. Unknown or weakly supported topologies are surfaced through `layout_support` instead of being silently presented as fully supported motif output.
 
 ## Validation
 

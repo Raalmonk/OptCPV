@@ -7,6 +7,7 @@ from typing import Literal
 
 from ..labels import wrap_label_lines
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, Point
+from ..segments import merged_axis_aligned_segments
 
 
 LayerName = Literal["wires", "components", "labels"]
@@ -15,6 +16,11 @@ LayerName = Literal["wires", "components", "labels"]
 def inject_metadata(svg: str, layout: LayoutPlan, *, renderer: str) -> str:
     patched = _set_root_attr(svg, "data-renderer", renderer)
     patched = _set_root_attr(patched, "data-optcpv-circuit-id", layout.circuit_id)
+    patched = _set_root_attr(patched, "data-optcpv-layout-mode", layout.support.layout_mode)
+    patched = _set_root_attr(patched, "data-optcpv-layout-confidence", f"{layout.support.layout_confidence:.2f}")
+    patched = _set_root_attr(patched, "data-optcpv-fallback-used", _bool_attr(layout.support.fallback_used))
+    patched = _set_root_attr(patched, "data-optcpv-matched-motifs", ",".join(layout.support.matched_motifs))
+    patched = _set_root_attr(patched, "data-optcpv-unsupported-regions", ",".join(layout.support.unsupported_regions))
     overlay = _metadata_overlay(layout)
     if "</svg>" in patched:
         return patched.replace("</svg>", overlay + "\n</svg>")
@@ -166,7 +172,7 @@ def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
             for index, line in enumerate(lines)
         )
     return (
-        f'<text class="label" x="{x:.1f}" y="{y:.1f}" '
+        f'<text class="label" x="{x:.1f}" y="{y:.1f}" text-anchor="{escape(label.anchor)}" '
         f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}">'
         f"{inner}</text>"
     )
@@ -244,19 +250,7 @@ def _px(layout: LayoutPlan, point: Point) -> str:
 
 
 def _unique_segments(points: list[Point]) -> list[tuple[Point, Point]]:
-    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
-    segments: list[tuple[Point, Point]] = []
-    for start, end in zip(points, points[1:]):
-        if start == end:
-            continue
-        a = (round(start.x, 4), round(start.y, 4))
-        b = (round(end.x, 4), round(end.y, 4))
-        key = (a, b) if a <= b else (b, a)
-        if key in seen:
-            continue
-        seen.add(key)
-        segments.append((start, end))
-    return segments
+    return merged_axis_aligned_segments(points)
 
 
 def _set_root_attr(svg: str, name: str, value: str) -> str:
@@ -281,6 +275,10 @@ def _set_root_attr(svg: str, name: str, value: str) -> str:
     else:
         head = f'{head} {name}="{escaped}"'
     return before + head + tail
+
+
+def _bool_attr(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _key(value: str | None) -> str:

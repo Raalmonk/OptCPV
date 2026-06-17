@@ -6,6 +6,7 @@ from itertools import combinations
 from math import hypot
 
 from .models import BBox, CriticReport, CriticViolation, LayoutPlan, Point
+from .segments import layout_wire_segments
 
 
 MAX_VIEWBOX_AREA = 1_200_000
@@ -96,6 +97,16 @@ def _wire_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> N
     crossings = _wire_crossings(layout)
     if crossings:
         violations.append(CriticViolation("wire_crossings", f"{crossings} wire crossings detected.", crossings * 3))
+    overlaps = _wire_net_overlaps(layout)
+    if overlaps:
+        violations.append(
+            CriticViolation(
+                "wire_net_overlap",
+                f"{overlaps} different-net wire overlaps detected.",
+                min(80, overlaps * 20),
+                True,
+            )
+        )
 
 
 def _convention_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
@@ -118,20 +129,7 @@ def _convention_violations(layout: LayoutPlan, violations: list[CriticViolation]
 
 
 def _wire_crossings(layout: LayoutPlan) -> int:
-    segments: list[tuple[str, Point, Point]] = []
-    seen: set[tuple[str, tuple[float, float], tuple[float, float]]] = set()
-    for wire in layout.wires:
-        for a, b in zip(wire.points, wire.points[1:]):
-            if a == b:
-                continue
-            left = (round(a.x, 4), round(a.y, 4))
-            right = (round(b.x, 4), round(b.y, 4))
-            start, end = (left, right) if left <= right else (right, left)
-            key = (wire.net, start, end)
-            if key in seen:
-                continue
-            seen.add(key)
-            segments.append((wire.net, a, b))
+    segments = _wire_segments(layout)
     count = 0
     for left, right in combinations(segments, 2):
         if left[0] == right[0]:
@@ -139,6 +137,21 @@ def _wire_crossings(layout: LayoutPlan) -> int:
         if _segments_intersect(left[1], left[2], right[1], right[2]):
             count += 1
     return count
+
+
+def _wire_net_overlaps(layout: LayoutPlan) -> int:
+    segments = _wire_segments(layout)
+    count = 0
+    for left, right in combinations(segments, 2):
+        if left[0] == right[0]:
+            continue
+        if _collinear_overlap_length(left[1], left[2], right[1], right[2]) > 0.08:
+            count += 1
+    return count
+
+
+def _wire_segments(layout: LayoutPlan) -> list[tuple[str, Point, Point]]:
+    return layout_wire_segments(layout)
 
 
 def _polyline_intersects_bbox(points: list[Point], bbox: BBox) -> bool:
@@ -163,21 +176,36 @@ def _segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool:
     return orient(a, b, c) * orient(a, b, d) < 0 and orient(c, d, a) * orient(c, d, b) < 0
 
 
+def _collinear_overlap_length(a: Point, b: Point, c: Point, d: Point) -> float:
+    if _same(a.y, b.y) and _same(c.y, d.y) and _same(a.y, c.y):
+        return _interval_overlap(a.x, b.x, c.x, d.x)
+    if _same(a.x, b.x) and _same(c.x, d.x) and _same(a.x, c.x):
+        return _interval_overlap(a.y, b.y, c.y, d.y)
+    return 0.0
+
+
+def _interval_overlap(a1: float, a2: float, b1: float, b2: float) -> float:
+    left = max(min(a1, a2), min(b1, b2))
+    right = min(max(a1, a2), max(b1, b2))
+    return max(0.0, right - left)
+
+
+def _same(left: float, right: float) -> bool:
+    return abs(left - right) < 1e-6
+
+
 def _total_wire_length(layout: LayoutPlan) -> float:
     seen: set[tuple[str, tuple[float, float], tuple[float, float]]] = set()
     total = 0.0
-    for wire in layout.wires:
-        for a, b in zip(wire.points, wire.points[1:]):
-            if a == b:
-                continue
-            left = (round(a.x, 4), round(a.y, 4))
-            right = (round(b.x, 4), round(b.y, 4))
-            start, end = (left, right) if left <= right else (right, left)
-            key = (wire.net, start, end)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += hypot(b.x - a.x, b.y - a.y)
+    for net, a, b in _wire_segments(layout):
+        left = (round(a.x, 4), round(a.y, 4))
+        right = (round(b.x, 4), round(b.y, 4))
+        start, end = (left, right) if left <= right else (right, left)
+        key = (net, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += hypot(b.x - a.x, b.y - a.y)
     return total
 
 
@@ -198,6 +226,8 @@ def _average_component_distance(layout: LayoutPlan) -> float:
 
 def _average_distance_limit(layout: LayoutPlan) -> float:
     if _opamp_network_layout(layout):
+        if layout.width > 1400 and layout.height <= 720:
+            return 14.0
         return 11.2
     return 8.2 if _complex_opamp_layout(layout) else 7.5
 

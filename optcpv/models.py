@@ -114,6 +114,26 @@ class LayoutWire:
 
 
 @dataclass(frozen=True)
+class LayoutSupport:
+    layout_mode: str = "unknown"
+    layout_confidence: float = 0.0
+    matched_motifs: tuple[str, ...] = field(default_factory=tuple)
+    fallback_used: bool = True
+    unsupported_regions: tuple[str, ...] = field(default_factory=tuple)
+    notes: tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "layout_mode": self.layout_mode,
+            "layout_confidence": self.layout_confidence,
+            "matched_motifs": list(self.matched_motifs),
+            "fallback_used": self.fallback_used,
+            "unsupported_regions": list(self.unsupported_regions),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
 class LayoutPlan:
     circuit_id: str
     width: int
@@ -126,6 +146,7 @@ class LayoutPlan:
     net_to_pins: dict[str, list[tuple[str, str]]]
     topology_signature: str
     warnings: list[str] = field(default_factory=list)
+    support: LayoutSupport = field(default_factory=LayoutSupport)
 
 
 Layout = LayoutPlan
@@ -186,6 +207,7 @@ class SchematicArtifact:
     combined_report: dict[str, Any] | None = None
     optimization_log: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    layout_support: dict[str, Any] = field(default_factory=dict)
 
 
 def circuit_from_any(circuit: Circuit | dict[str, Any]) -> Circuit:

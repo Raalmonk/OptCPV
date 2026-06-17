@@ -1,11 +1,12 @@
 from optcpv.critic import critique
-from optcpv.cv_critic import critique_raster
+from optcpv.cv_critic import _bbox_px, critique_raster
 from optcpv.examples import voltage_divider
+from optcpv.models import BBox
 from optcpv.patch import LayoutPatch, MoveLabel, apply_patch
 from optcpv.planner import plan_layout
 from optcpv.renderer import render_svg
 from optcpv.renderers.svg_postprocess import render_layer_svg
-from optcpv.raster import rasterize_svg
+from optcpv.raster import RasterImage, rasterize_svg
 
 
 def test_cv_critic_detects_dense_black_blob() -> None:
@@ -63,6 +64,13 @@ def test_layered_cv_detects_label_on_wire_fixture() -> None:
 
     assert report.metrics["label_layer_collision_count"] > 0
     assert any(violation.code == "label_visual_collision" for violation in report.violations)
+
+
+def test_bbox_mapping_matches_svg_preserve_aspect_ratio() -> None:
+    layout = plan_layout(voltage_divider())
+    raster = RasterImage(width=1200, height=800, rgba=None, bgr=None, gray=None)
+
+    assert _bbox_px(BBox(0, 0, 1, 1), layout, raster, pad_px=0) == (50, 0, 98, 48)
 
 
 def _empty_svg(layout) -> str:

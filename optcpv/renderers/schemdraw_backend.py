@@ -7,6 +7,7 @@ from io import StringIO
 
 from ..labels import component_display_label, display_label_text, wrap_label_lines
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LayoutWire, Point
+from ..segments import merged_axis_aligned_segments
 from .svg_postprocess import inject_metadata, render_debug_svg, _set_root_attr
 
 
@@ -394,8 +395,7 @@ def _visible_wires_svg(layout: LayoutPlan) -> str:
     parts.append('<g id="optcpv-visible-junctions" fill="#111827" stroke="none">')
     for wire in layout.wires:
         if len(wire.connected_pins) >= 3:
-            junction = _junction_point(wire)
-            if junction is not None:
+            for junction in _junction_points(wire):
                 parts.append(
                     f'<circle cx="{junction.x * layout.grid:.1f}" cy="{junction.y * layout.grid:.1f}" r="3.6" '
                     f'data-net-name="{escape(wire.net)}"/>'
@@ -416,29 +416,44 @@ def _wire_svg(layout: LayoutPlan, wire: LayoutWire) -> str:
 
 
 def _unique_segments(points: list[Point]) -> list[tuple[Point, Point]]:
-    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
-    segments: list[tuple[Point, Point]] = []
-    for start, end in zip(points, points[1:]):
-        if start == end:
-            continue
-        a = (round(start.x, 4), round(start.y, 4))
-        b = (round(end.x, 4), round(end.y, 4))
-        key = (a, b) if a <= b else (b, a)
-        if key in seen:
-            continue
-        seen.add(key)
-        segments.append((start, end))
-    return segments
+    return merged_axis_aligned_segments(points)
 
 
-def _junction_point(wire: LayoutWire) -> Point | None:
-    counts: dict[Point, int] = {}
+def _junction_points(wire: LayoutWire) -> list[Point]:
+    segments = _unique_segments(wire.points)
+    endpoint_counts: dict[tuple[float, float], int] = {}
+    point_by_key: dict[tuple[float, float], Point] = {}
     for point in wire.points:
-        counts[point] = counts.get(point, 0) + 1
-    if not counts:
-        return None
-    point = max(counts, key=counts.get)
-    return point if counts[point] > 1 else None
+        point_by_key[_point_key(point)] = point
+    for start, end in segments:
+        for point in (start, end):
+            key = _point_key(point)
+            endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
+            point_by_key[key] = point
+
+    junctions: dict[tuple[float, float], Point] = {
+        key: point_by_key[key]
+        for key, count in endpoint_counts.items()
+        if count >= 3
+    }
+    for point in point_by_key.values():
+        if any(_point_on_segment_interior(point, start, end) for start, end in segments):
+            junctions[_point_key(point)] = point
+    return sorted(junctions.values(), key=lambda point: (point.y, point.x))
+
+
+def _point_key(point: Point) -> tuple[float, float]:
+    return (round(point.x, 4), round(point.y, 4))
+
+
+def _point_on_segment_interior(point: Point, start: Point, end: Point) -> bool:
+    if point == start or point == end:
+        return False
+    if abs(start.x - end.x) < 1e-6 and abs(point.x - start.x) < 1e-6:
+        return min(start.y, end.y) + 1e-6 < point.y < max(start.y, end.y) - 1e-6
+    if abs(start.y - end.y) < 1e-6 and abs(point.y - start.y) < 1e-6:
+        return min(start.x, end.x) + 1e-6 < point.x < max(start.x, end.x) - 1e-6
+    return False
 
 
 def _element_anchor(component: LayoutComponent) -> Point:

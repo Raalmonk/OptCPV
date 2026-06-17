@@ -66,13 +66,17 @@ def _fallback_raster(svg: str, width: int, height: int):
 
     def transform(x: float, y: float, local_scale: float, offset_x: float, offset_y: float) -> tuple[float, float]:
         vx, vy, vw, vh = viewbox
-        sx = width / max(vw, 1.0)
-        sy = height / max(vh, 1.0)
-        return ((x * local_scale + offset_x - vx) * sx, (y * local_scale + offset_y - vy) * sy)
+        scale = min(width / max(vw, 1.0), height / max(vh, 1.0))
+        pad_x = (width - vw * scale) / 2.0
+        pad_y = (height - vh * scale) / 2.0
+        return (
+            (x * local_scale + offset_x - vx) * scale + pad_x,
+            (y * local_scale + offset_y - vy) * scale + pad_y,
+        )
 
     def stroke_width(attrs: dict[str, str], local_scale: float) -> int:
-        vx, _vy, vw, vh = viewbox
-        scale = max(width / max(vw, 1.0), height / max(vh, 1.0)) * local_scale
+        _vx, _vy, vw, vh = viewbox
+        scale = min(width / max(vw, 1.0), height / max(vh, 1.0)) * local_scale
         raw = attrs.get("stroke-width", "2")
         try:
             return max(1, int(float(raw) * scale))

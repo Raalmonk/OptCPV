@@ -1,6 +1,7 @@
 /generated/
 .env
 .env.local
+.venv/
 __pycache__/
 *.pyc
 *.egg-info/
