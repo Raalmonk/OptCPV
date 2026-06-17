@@ -917,12 +917,20 @@ def _label_svg(layout: LayoutPlan, label: LayoutLabel) -> str:
             f'<tspan x="{label.x * layout.grid:.1f}" y="{start_y + index * 16.6:.1f}">{escape(line)}</tspan>'
             for index, line in enumerate(lines)
         )
-    return (
-        f'<text class="optcpv-visible-label" x="{label.x * layout.grid:.1f}" y="{label.y * layout.grid:.1f}" '
-        f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}" '
+    common = (
+        f'x="{label.x * layout.grid:.1f}" y="{label.y * layout.grid:.1f}" '
         f'text-anchor="{anchor}" dominant-baseline="middle" dy="{dy}" '
-        f'font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#111827">{inner}</text>'
+        'font-family="Arial, Helvetica, sans-serif" font-size="14"'
     )
+    halo = (
+        f'<text class="optcpv-visible-label-halo" {common} fill="none" stroke="#ffffff" '
+        f'stroke-width="4" stroke-linejoin="round">{inner}</text>'
+    )
+    foreground = (
+        f'<text class="optcpv-visible-label" {common} fill="#111827" '
+        f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}">{inner}</text>'
+    )
+    return halo + foreground
 
 
 def _sd(point: Point) -> tuple[float, float]:

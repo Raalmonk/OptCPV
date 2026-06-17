@@ -8,6 +8,30 @@ from .models import LayoutPlan, Point
 EPSILON = 1e-6
 
 
+def orthogonalized_points(points: list[Point], *, prefer: str = "-|") -> list[Point]:
+    """Return a Manhattan version of a route by inserting simple elbows."""
+
+    if len(points) < 2:
+        return list(points)
+    result = [points[0]]
+    for end in points[1:]:
+        start = result[-1]
+        if start == end:
+            continue
+        if is_axis_aligned(start, end):
+            result.append(end)
+            continue
+        elbow = Point(end.x, start.y) if prefer == "-|" else Point(start.x, end.y)
+        if elbow != start:
+            result.append(elbow)
+        result.append(end)
+    return result
+
+
+def is_axis_aligned(start: Point, end: Point) -> bool:
+    return _same(start.x, end.x) or _same(start.y, end.y)
+
+
 def merged_axis_aligned_segments(points: list[Point]) -> list[tuple[Point, Point]]:
     """Return drawable segments with same-line overlaps collapsed.
 
@@ -19,10 +43,10 @@ def merged_axis_aligned_segments(points: list[Point]) -> list[tuple[Point, Point
 
     horizontal: dict[float, list[tuple[float, float]]] = {}
     vertical: dict[float, list[tuple[float, float]]] = {}
-    other: list[tuple[Point, Point]] = []
     seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
 
-    for start, end in zip(points, points[1:]):
+    route = orthogonalized_points(points)
+    for start, end in zip(route, route[1:]):
         if start == end:
             continue
         start_key = _point_key(start)
@@ -38,8 +62,6 @@ def merged_axis_aligned_segments(points: list[Point]) -> list[tuple[Point, Point
         elif _same(start.x, end.x):
             x = round(start.x, 4)
             vertical.setdefault(x, []).append((start.y, end.y))
-        else:
-            other.append((start, end))
 
     merged: list[tuple[Point, Point]] = []
     for y, intervals in sorted(horizontal.items()):
@@ -48,7 +70,6 @@ def merged_axis_aligned_segments(points: list[Point]) -> list[tuple[Point, Point
     for x, intervals in sorted(vertical.items()):
         for start, end in _merge_intervals(intervals):
             merged.append((Point(x, start), Point(x, end)))
-    merged.extend(other)
     return merged
 
 

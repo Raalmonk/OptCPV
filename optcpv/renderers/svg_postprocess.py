@@ -92,6 +92,7 @@ def _style_rules(mask_layer: LayerName | None) -> list[str]:
             ".symbol{fill:none;stroke:#111827;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
             ".pin{fill:#111827}",
             ".label{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
+            ".label-halo{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:none;stroke:#ffffff;stroke-width:4px;stroke-linejoin:round}",
             ".terminal-label{font:12px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
         ]
     return [
@@ -100,6 +101,7 @@ def _style_rules(mask_layer: LayerName | None) -> list[str]:
         ".symbol{fill:none;stroke:#111827;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
         ".pin{fill:#111827}",
         ".label{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#111827}",
+        ".label-halo{font:14px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:none;stroke:#ffffff;stroke-width:4px;stroke-linejoin:round}",
         ".terminal-label{font:12px ui-sans-serif,system-ui,sans-serif;text-anchor:middle;fill:#374151}",
     ]
 
@@ -239,11 +241,13 @@ def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
             f'<tspan x="{x:.1f}" y="{start_y + index * 15.6:.1f}">{escape(line)}</tspan>'
             for index, line in enumerate(lines)
         )
-    return (
+    halo = f'<text class="label-halo" x="{x:.1f}" y="{y:.1f}" text-anchor="{escape(label.anchor)}">{inner}</text>'
+    foreground = (
         f'<text class="label" x="{x:.1f}" y="{y:.1f}" text-anchor="{escape(label.anchor)}" '
         f'data-label-id="{escape(label.id)}" data-label-owner-id="{escape(label.owner_id)}">'
         f"{inner}</text>"
     )
+    return halo + foreground
 
 
 def _draw_opamp(x: float, y: float, *, flipped: bool = False) -> str:

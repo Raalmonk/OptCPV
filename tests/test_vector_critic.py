@@ -35,6 +35,21 @@ def test_vector_critic_catches_different_net_wire_overlap() -> None:
     assert report.hard_fail
 
 
+def test_vector_critic_rejects_diagonal_wire() -> None:
+    layout = plan_layout(voltage_divider())
+    diagonal = replace(
+        layout,
+        wires=[
+            LayoutWire(net="diag", points=[Point(1.0, 1.0), Point(3.0, 2.0)], connected_pins=[]),
+            *layout.wires,
+        ],
+    )
+    report = critique_layout(diagonal)
+
+    assert any(violation.code == "diagonal_wire" and violation.hard for violation in report.violations)
+    assert report.hard_fail
+
+
 def test_same_net_nested_bus_segments_are_merged_for_display() -> None:
     segments = merged_axis_aligned_segments(
         [

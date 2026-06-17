@@ -8,6 +8,7 @@ from .artifact import artifact_from_layout
 from .critic import CriticBreakdown, critique_parts
 from .models import BBox, Circuit, LayoutComponent, LayoutLabel, LayoutPlan, Point, SchematicArtifact, circuit_from_any
 from .patch import LayoutPatch, MoveComponent, MoveLabel, apply_patch
+from .planning_agent import SemanticPlanningClient
 from .planner import plan_layout
 from .raster import rasterize_svg
 from .renderer import render_svg_layers
@@ -21,8 +22,14 @@ def draw_optimized_svg(
     *,
     max_iterations: int = 5,
     vision_client: VisionLayoutClient | None = None,
+    planning_client: SemanticPlanningClient | None = None,
 ) -> str:
-    return draw_optimized_artifact(circuit, max_iterations=max_iterations, vision_client=vision_client).svg
+    return draw_optimized_artifact(
+        circuit,
+        max_iterations=max_iterations,
+        vision_client=vision_client,
+        planning_client=planning_client,
+    ).svg
 
 
 def draw_optimized_artifact(
@@ -30,9 +37,10 @@ def draw_optimized_artifact(
     *,
     max_iterations: int = 5,
     vision_client: VisionLayoutClient | None = None,
+    planning_client: SemanticPlanningClient | None = None,
 ) -> SchematicArtifact:
     native = circuit_from_any(circuit)
-    layout = plan_layout(native)
+    layout = plan_layout(native, planning_client=planning_client)
     verify_layout_topology(native, layout)
     layers = render_svg_layers(layout)
     reports = critique_parts(native, layout, layers.final_svg, layers=layers)
@@ -42,7 +50,7 @@ def draw_optimized_artifact(
     current_layout = layout
     current_svg = layers.final_svg
     current_reports = reports
-    repair_result = _evaluate_repair_candidate(native, current_reports, log=log)
+    repair_result = _evaluate_repair_candidate(native, current_reports, log=log, planning_client=planning_client)
     if repair_result is not None:
         native, current_layout, current_svg, current_reports = repair_result
         best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
@@ -117,12 +125,13 @@ def _evaluate_repair_candidate(
     current_reports: CriticBreakdown,
     *,
     log: list[dict],
+    planning_client: SemanticPlanningClient | None,
 ) -> tuple[Circuit, LayoutPlan, str, CriticBreakdown] | None:
     repaired = repair_circuit(circuit)
     if repaired == circuit:
         return None
     try:
-        candidate_layout = plan_layout(repaired)
+        candidate_layout = plan_layout(repaired, planning_client=planning_client)
         verify_layout_topology(repaired, candidate_layout)
         candidate_layers = render_svg_layers(candidate_layout)
         candidate_reports = critique_parts(

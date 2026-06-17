@@ -4,6 +4,7 @@ from optcpv import draw_svg
 from optcpv.examples import EXAMPLES, instrumentation_amplifier
 from optcpv.planner import plan_layout
 from optcpv.renderers.schemdraw_backend import FALLBACK_RENDERER_ID, SchemdrawRenderer
+from optcpv.renderers.svg_postprocess import render_layer_svg
 
 
 def test_default_renderer_is_schemdraw_and_preserves_metadata() -> None:
@@ -43,3 +44,11 @@ def test_schemdraw_fallback_metadata_does_not_lie(monkeypatch) -> None:
     assert f'data-renderer="{FALLBACK_RENDERER_ID}"' in svg
     assert 'data-renderer="optcpv.schemdraw"' not in svg
     assert 'data-schemdraw-error="ValueError: boom"' in svg
+
+
+def test_label_halo_preserves_label_metadata() -> None:
+    layout = plan_layout(instrumentation_amplifier())
+    labels_svg = render_layer_svg(layout, "labels")
+
+    assert 'data-label-id="label:U1"' in labels_svg
+    assert 'class="label-halo"' in labels_svg

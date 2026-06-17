@@ -6,7 +6,7 @@ from itertools import combinations
 from math import hypot
 
 from .models import BBox, CriticReport, CriticViolation, LayoutComponent, LayoutPlan, NetClass, Point
-from .segments import layout_wire_segments, merged_axis_aligned_segments
+from .segments import is_axis_aligned, layout_wire_segments, merged_axis_aligned_segments
 from .semantics import classify_net, is_local_terminal_net
 from .symbols import OPAMP_INPUT_LEAD_X, OPAMP_INPUT_LEAD_Y, OPAMP_OUTPUT_LEAD_X
 
@@ -85,6 +85,17 @@ def _label_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> 
 
 def _wire_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
     for wire in layout.wires:
+        for start, end in zip(wire.points, wire.points[1:]):
+            if not is_axis_aligned(start, end):
+                violations.append(
+                    CriticViolation(
+                        "diagonal_wire",
+                        f"Net {wire.net} has a non-Manhattan segment.",
+                        80,
+                        True,
+                        subject=wire.net,
+                    )
+                )
         for component in layout.components:
             connected = {component_id for component_id, _ in wire.connected_pins}
             if component.id in connected:

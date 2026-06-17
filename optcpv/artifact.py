@@ -4,25 +4,36 @@ from __future__ import annotations
 
 from .critic import critique_parts
 from .models import Circuit, CriticReport, LayoutPlan, SchematicArtifact, circuit_from_any
+from .planning_agent import SemanticPlanningClient
 from .planner import plan_layout
 from .renderer import render_svg
 from .verifier import verify_layout_topology
 
 
-def draw_svg(circuit: Circuit | dict, *, style: str = "textbook") -> str:
+def draw_svg(
+    circuit: Circuit | dict,
+    *,
+    style: str = "textbook",
+    planning_client: SemanticPlanningClient | None = None,
+) -> str:
     """Return a one-pass Schemdraw SVG for a native OptCPV circuit description."""
 
     native = circuit_from_any(circuit)
-    layout = plan_layout(native)
+    layout = plan_layout(native, planning_client=planning_client)
     verify_layout_topology(native, layout)
     return render_svg(layout, style=style)
 
 
-def draw_artifact(circuit: Circuit | dict, *, style: str = "textbook") -> SchematicArtifact:
+def draw_artifact(
+    circuit: Circuit | dict,
+    *,
+    style: str = "textbook",
+    planning_client: SemanticPlanningClient | None = None,
+) -> SchematicArtifact:
     """Return a deterministic artifact with topology, vector, and CV criticism."""
 
     native = circuit_from_any(circuit)
-    layout = plan_layout(native)
+    layout = plan_layout(native, planning_client=planning_client)
     verify_layout_topology(native, layout)
     svg = render_svg(layout, style=style)
     reports = critique_parts(native, layout, svg)

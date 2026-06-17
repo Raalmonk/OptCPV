@@ -4,6 +4,7 @@ from optcpv import Circuit, Component, draw_artifact
 from optcpv.models import LayoutWire, NetClass, Point
 from optcpv.planner import plan_layout
 from optcpv.renderers.schemdraw_backend import _junction_points
+from optcpv.renderers.svg_postprocess import render_layer_svg
 from optcpv.segments import merged_axis_aligned_segments
 from optcpv.symbols import OPAMP_LEAD_LENGTH
 from optcpv.vector_critic import critique_layout
@@ -72,6 +73,28 @@ def test_feedback_and_local_terminal_semantics_have_no_hard_vector_failure() -> 
     assert "long_global_terminal_wire" not in codes
     assert "missing_local_terminal" not in codes
     assert report.hard_fail is False
+
+
+def test_analog_signal_chain_has_no_diagonal_layout_wires() -> None:
+    _assert_no_diagonal_segments(plan_layout(analog_signal_chain()))
+
+
+def test_two_stage_local_ground_chain_has_no_diagonal_layout_wires() -> None:
+    _assert_no_diagonal_segments(plan_layout(two_stage_local_ground_chain()))
+
+
+def test_renderer_visible_wires_are_axis_aligned() -> None:
+    import re
+
+    layout = plan_layout(analog_signal_chain())
+    wires_svg = render_layer_svg(layout, "wires")
+    lines = re.findall(
+        r"<line\b[^>]*\bx1=\"([0-9.-]+)\"[^>]*\by1=\"([0-9.-]+)\"[^>]*\bx2=\"([0-9.-]+)\"[^>]*\by2=\"([0-9.-]+)\"",
+        wires_svg,
+    )
+
+    assert lines
+    assert all(abs(float(x1) - float(x2)) < 1e-6 or abs(float(y1) - float(y2)) < 1e-6 for x1, y1, x2, y2 in lines)
 
 
 def test_renderer_and_artifact_expose_semantic_metadata() -> None:
@@ -217,4 +240,12 @@ def two_stage_local_ground_chain() -> Circuit:
             Component(id="Rf2", type="resistor", pins={"a": "o2", "b": "fb2"}, role="feedback"),
             Component(id="Rg2", type="resistor", pins={"a": "fb2", "b": "gnd"}, role="gain"),
         ],
+    )
+
+
+def _assert_no_diagonal_segments(layout) -> None:
+    assert all(
+        start.x == end.x or start.y == end.y
+        for wire in layout.wires
+        for start, end in zip(wire.points, wire.points[1:])
     )

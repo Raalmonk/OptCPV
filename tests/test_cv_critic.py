@@ -1,7 +1,9 @@
 from optcpv.critic import critique
 from optcpv.cv_critic import _bbox_px, critique_raster
 from optcpv.examples import voltage_divider
-from optcpv.models import BBox
+from dataclasses import replace
+
+from optcpv.models import BBox, LayoutWire, Point
 from optcpv.patch import LayoutPatch, MoveLabel, apply_patch
 from optcpv.planner import plan_layout
 from optcpv.renderer import render_svg
@@ -66,6 +68,43 @@ def test_layered_cv_detects_label_on_wire_fixture() -> None:
     assert any(violation.code == "label_visual_collision" for violation in report.violations)
 
 
+def test_layered_cv_detects_wire_through_opamp_body() -> None:
+    layout = plan_layout(_opamp_fixture())
+    opamp = next(component for component in layout.components if component.id == "U1")
+    bad = replace(
+        layout,
+        wires=[
+            LayoutWire(
+                net="probe",
+                points=[Point(opamp.bbox.x + 0.25, opamp.y), Point(opamp.bbox.right - 0.25, opamp.y)],
+                connected_pins=[],
+            )
+        ],
+    )
+    report = _layered_report(bad)
+
+    assert any(violation.code == "wire_component_visual_collision" for violation in report.violations)
+    assert report.hard_fail
+
+
+def test_layered_cv_allows_wire_routed_around_opamp_body() -> None:
+    layout = plan_layout(_opamp_fixture())
+    opamp = next(component for component in layout.components if component.id == "U1")
+    good = replace(
+        layout,
+        wires=[
+            LayoutWire(
+                net="probe",
+                points=[Point(opamp.bbox.x - 0.5, opamp.bbox.y - 0.25), Point(opamp.bbox.right + 0.5, opamp.bbox.y - 0.25)],
+                connected_pins=[],
+            )
+        ],
+    )
+    report = _layered_report(good)
+
+    assert not any(violation.code == "wire_component_visual_collision" for violation in report.violations)
+
+
 def test_bbox_mapping_matches_svg_preserve_aspect_ratio() -> None:
     layout = plan_layout(voltage_divider())
     raster = RasterImage(width=1200, height=800, rgba=None, bgr=None, gray=None)
@@ -77,4 +116,34 @@ def _empty_svg(layout) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {layout.width} {layout.height}" '
         f'width="{layout.width}" height="{layout.height}"></svg>'
+    )
+
+
+def _layered_report(layout):
+    wires = rasterize_svg(render_layer_svg(layout, "wires"))
+    components = rasterize_svg(render_layer_svg(layout, "components"))
+    labels = rasterize_svg(render_layer_svg(layout, "labels"))
+    return critique_raster(
+        layout,
+        rasterize_svg(render_svg(layout)),
+        wire_raster=wires,
+        component_raster=components,
+        label_raster=labels,
+    )
+
+
+def _opamp_fixture():
+    from optcpv import Circuit, Component
+
+    return Circuit(
+        id="opamp_body_hit",
+        motif="non_inverting_op_amp",
+        components=[
+            Component(id="VIN", type="input", pins={"out": "vin"}),
+            Component(id="VOUT", type="output", pins={"in": "vout"}),
+            Component(id="GND", type="ground", pins={"gnd": "gnd"}),
+            Component(id="U1", type="op_amp", pins={"+": "vin", "-": "vm", "out": "vout"}),
+            Component(id="Rf", type="resistor", pins={"a": "vout", "b": "vm"}, role="feedback"),
+            Component(id="Rg", type="resistor", pins={"a": "vm", "b": "gnd"}, role="gain"),
+        ],
     )

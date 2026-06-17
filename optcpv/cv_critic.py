@@ -192,7 +192,11 @@ def _wire_component_mask_hits(layout: LayoutPlan, wire_mask, raster: RasterImage
 
 
 def _requires_interior_wire_mask(key: str) -> bool:
-    return key in {"ic", "block", "subcircuit"}
+    return (
+        key in {"ic", "block", "subcircuit"}
+        or _is_opamp_key(key)
+        or any(token in key for token in ["filter", "lpf", "hpf", "bpf", "bessel", "butterworth", "chebyshev"])
+    )
 
 
 def _is_opamp_key(key: str) -> bool:
@@ -201,7 +205,12 @@ def _is_opamp_key(key: str) -> bool:
 
 def _component_interior_bbox(component, key: str) -> BBox:
     if _is_opamp_key(key):
-        return BBox(component.x - 0.95, component.y - 0.82, 2.15, 1.64)
+        return BBox(
+            component.bbox.x + 0.36,
+            component.bbox.y + 0.28,
+            max(0.1, component.bbox.width - 1.05),
+            max(0.1, component.bbox.height - 0.56),
+        )
     return component.bbox
 
 

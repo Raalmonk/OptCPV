@@ -28,6 +28,7 @@ from .models import (
     TopologySemanticPlan,
     circuit_from_any,
 )
+from .planning_agent import PlanningHints, SemanticPlanningClient
 from .semantics import (
     classify_net,
     is_local_terminal_net,
@@ -38,6 +39,7 @@ from .semantics import (
     terminal_label,
     terminal_type_for_net,
 )
+from .segments import is_axis_aligned
 from .symbols import OPAMP_HALF_HEIGHT, OPAMP_INPUT_LEAD_X, OPAMP_INPUT_LEAD_Y, OPAMP_OUTPUT_LEAD_X
 from .verifier import topology_signature
 
@@ -54,8 +56,24 @@ NATIVE_MOTIFS = {
 }
 
 
-def plan_layout(circuit: Circuit | dict) -> LayoutPlan:
+def plan_layout(
+    circuit: Circuit | dict,
+    *,
+    planning_hints: PlanningHints | dict | None = None,
+    planning_client: SemanticPlanningClient | None = None,
+) -> LayoutPlan:
     native = circuit_from_any(circuit)
+    base_layout = _plan_layout_deterministic(native)
+    hints = _resolve_planning_hints(native, planning_hints=planning_hints, planning_client=planning_client)
+    if hints is None:
+        return base_layout
+    candidate = _layout_from_planning_hints(native, base_layout, hints)
+    if candidate is None:
+        return base_layout
+    return candidate
+
+
+def _plan_layout_deterministic(native: Circuit) -> LayoutPlan:
     motif = _validated_motif(native) or _infer_motif(native.components)
     planners: dict[str, Callable[[Circuit], LayoutPlan]] = {
         "voltage_divider": _plan_voltage_divider,
@@ -848,6 +866,172 @@ def _route_motif(circuit: Circuit, support: LayoutSupport) -> str:
     return _canonical_motif(circuit.motif) or _key(circuit.id)
 
 
+def _resolve_planning_hints(
+    circuit: Circuit,
+    *,
+    planning_hints: PlanningHints | dict | None,
+    planning_client: SemanticPlanningClient | None,
+) -> PlanningHints | None:
+    if planning_hints is not None and planning_client is not None:
+        raise ValueError("Pass either planning_hints or planning_client, not both.")
+    if isinstance(planning_hints, dict):
+        return PlanningHints.from_dict(planning_hints)
+    if planning_hints is not None:
+        return planning_hints
+    if planning_client is None:
+        return None
+    return planning_client.propose_hints(circuit)
+
+
+def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints: PlanningHints) -> LayoutPlan | None:
+    try:
+        placements = _legalize_hint_placements(circuit, base_layout, hints)
+    except ValueError:
+        return None
+    if placements is None:
+        return None
+
+    support = replace(
+        base_layout.support,
+        notes=_unique((*base_layout.support.notes, "pre-layout semantic planning hints accepted")),
+    )
+    candidate = _build_layout(
+        circuit,
+        placements,
+        [*base_layout.warnings, "planning_hints: accepted"],
+        width=base_layout.width,
+        height=base_layout.height,
+        grid=base_layout.grid,
+        support=support,
+    )
+    try:
+        from .vector_critic import critique_layout
+        from .verifier import verify_layout_topology
+
+        verify_layout_topology(circuit, candidate)
+        base_report = critique_layout(base_layout)
+        candidate_report = critique_layout(candidate)
+    except Exception:
+        return None
+    if candidate_report.score > base_report.score:
+        return None
+    return candidate
+
+
+def _legalize_hint_placements(
+    circuit: Circuit,
+    base_layout: LayoutPlan,
+    hints: PlanningHints,
+) -> dict[str, tuple[float, float, str]] | None:
+    component_ids = {component.id for component in circuit.components}
+    net_names = {net for component in circuit.components for net in component.pins.values()}
+    if not hints.placement_hints:
+        return None
+    if unknown := (set(hints.placement_hints) - component_ids):
+        raise ValueError(f"Planning hints reference unknown components: {sorted(unknown)}")
+
+    for stage in hints.stage_order:
+        _reject_unknown_members(stage.members, component_ids, "stage")
+    for lane in hints.lanes:
+        if lane.source and lane.source not in component_ids:
+            raise ValueError(f"Planning lane source {lane.source} is not a known component.")
+        _reject_unknown_members(lane.members, component_ids, "lane")
+    for motif in hints.motifs:
+        _reject_unknown_members(motif.members, component_ids, "motif")
+
+    terminal_nets = {
+        net
+        for net in net_names
+        if classify_net(net) in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}
+    }
+    unknown_policy_nets = set(hints.local_terminal_policy) - net_names
+    if unknown_policy_nets:
+        raise ValueError(f"Planning hints reference unknown terminal nets: {sorted(unknown_policy_nets)}")
+    for net in terminal_nets:
+        policy = hints.local_terminal_policy.get(net)
+        if policy is not None and policy != "local_symbol_only":
+            raise ValueError(f"Planning hints may not route terminal net {net}.")
+    for rule in hints.routing_rules:
+        lowered = _key(rule)
+        if any(_key(net) in lowered for net in terminal_nets) and any(token in lowered for token in ["route", "global", "rail", "bus"]):
+            raise ValueError("Planning routing rules may not ask for routed terminal rails.")
+
+    grid_cells = _resolve_duplicate_hint_cells(hints)
+    _reject_backward_signal_flow(base_layout, grid_cells)
+
+    base_components = {component.id: component for component in base_layout.components}
+    placements = {component.id: (component.x, component.y, component.orientation) for component in base_layout.components}
+    span_x = base_layout.width / base_layout.grid
+    span_y = base_layout.height / base_layout.grid
+    max_col = max((col for col, _ in grid_cells.values()), default=0)
+    col_spacing = max(2.8, min(4.6, (span_x - 3.0) / max(1, max_col)))
+    x_origin = 1.4
+    center_y = _median_component_y(base_layout.components)
+    row_spacing = 2.35
+
+    for component_id, (col, row) in grid_cells.items():
+        component = base_components[component_id]
+        hint = hints.placement_hints[component_id]
+        orientation = _legalized_hint_orientation(component, hint.orientation)
+        x = _clamp(x_origin + col * col_spacing, 1.1, span_x - 1.2)
+        y = _clamp(center_y + row * row_spacing, 1.05, span_y - 1.05)
+        placements[component_id] = (x, y, orientation)
+    return placements
+
+
+def _reject_unknown_members(members: tuple[str, ...], component_ids: set[str], owner: str) -> None:
+    if unknown := (set(members) - component_ids):
+        raise ValueError(f"Planning {owner} references unknown components: {sorted(unknown)}")
+
+
+def _resolve_duplicate_hint_cells(hints: PlanningHints) -> dict[str, tuple[int, int]]:
+    occupied: set[tuple[int, int]] = set()
+    result: dict[str, tuple[int, int]] = {}
+    ordered = sorted(hints.placement_hints.values(), key=lambda hint: (hint.col, hint.row, hint.component_id))
+    for hint in ordered:
+        row = hint.row
+        cell = (hint.col, row)
+        while cell in occupied:
+            row += 1
+            cell = (hint.col, row)
+        occupied.add(cell)
+        result[hint.component_id] = cell
+    return result
+
+
+def _reject_backward_signal_flow(base_layout: LayoutPlan, grid_cells: dict[str, tuple[int, int]]) -> None:
+    feedback_nets = {net for motif in base_layout.semantic.motifs for net in motif.feedback_nets}
+    for route in base_layout.semantic.routes:
+        if route.net in feedback_nets:
+            continue
+        source_cell = grid_cells.get(route.source[0])
+        target_cell = grid_cells.get(route.target[0])
+        if source_cell is None or target_cell is None:
+            continue
+        if target_cell[0] < source_cell[0]:
+            raise ValueError(f"Planning hints route {route.net} backward from {route.source[0]} to {route.target[0]}.")
+
+
+def _legalized_hint_orientation(component: LayoutComponent, orientation: str | None) -> str:
+    value = _key(orientation)
+    current = component.orientation
+    if _is_opamp_layout(component):
+        return orientation if value in {"right", "right_flip"} and orientation is not None else current if current in {"right", "right_flip"} else "right"
+    if _is_input_or_source_layout(component) or _is_output_layout(component) or _is_filter_block_layout(component):
+        return "right"
+    allowed = {"right", "left", "up", "down", "east", "west", "north", "south"}
+    return orientation if value in allowed and orientation is not None else current
+
+
+def _median_component_y(components: list[LayoutComponent]) -> float:
+    values = sorted(component.y for component in components)
+    return values[len(values) // 2] if values else 5.0
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 def _build_layout(
     circuit: Circuit,
     placements: dict[str, tuple[float, float, str]],
@@ -888,7 +1072,14 @@ def _build_layout(
         height=height,
         grid=grid,
         components=components,
-        wires=_route_wires(pin_map, net_to_pins, motif=_route_motif(circuit, layout_support), semantic=semantic),
+        wires=_route_wires(
+            pin_map,
+            net_to_pins,
+            motif=_route_motif(circuit, layout_support),
+            semantic=semantic,
+            components=components,
+            labels=labels,
+        ),
         labels=labels,
         pin_map=pin_map,
         net_to_pins=net_to_pins,
@@ -1266,8 +1457,10 @@ def _route_wires(
     *,
     motif: str | None = None,
     semantic: TopologySemanticPlan | None = None,
+    components: list[LayoutComponent] | None = None,
+    labels: list[LayoutLabel] | None = None,
 ) -> list[LayoutWire]:
-    motif_routes = _route_known_motif(pin_map, net_to_pins, motif)
+    motif_routes = _route_known_motif(pin_map, net_to_pins, motif, semantic=semantic, components=components, labels=labels)
     if motif_routes is not None:
         return motif_routes
 
@@ -1278,7 +1471,13 @@ def _route_wires(
         route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
         if not route:
             continue
-        wires.append(LayoutWire(net=net, points=_dedupe(route), connected_pins=connected))
+        wires.append(
+            LayoutWire(
+                net=net,
+                points=_finalize_route(net, connected, route, pin_map, semantic=semantic, components=components, labels=labels),
+                connected_pins=connected,
+            )
+        )
     return wires
 
 
@@ -1299,10 +1498,164 @@ def _generic_route(points: list[Point]) -> list[Point]:
     return route
 
 
+def _finalize_route(
+    net: str,
+    connected: list[tuple[str, str]],
+    route: list[Point],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    *,
+    semantic: TopologySemanticPlan | None,
+    components: list[LayoutComponent] | None,
+    labels: list[LayoutLabel] | None,
+) -> list[Point]:
+    route = _dedupe(route)
+    return _dedupe(
+        _orthogonalize_route(
+            route,
+            net=net,
+            connected=connected,
+            pin_map=pin_map,
+            semantic=semantic,
+            components=components or [],
+            labels=labels or [],
+        )
+    )
+
+
+def _orthogonalize_route(
+    points: list[Point],
+    *,
+    net: str,
+    connected: list[tuple[str, str]],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    semantic: TopologySemanticPlan | None,
+    components: list[LayoutComponent],
+    labels: list[LayoutLabel],
+) -> list[Point]:
+    if len(points) < 2:
+        return points
+    component_keepouts = [component.bbox.expanded(-0.08) for component in components]
+    label_keepouts = [label.bbox.expanded(0.03) for label in labels]
+    feedback_keepouts = [
+        _opamp_route_body_bbox(component)
+        for component in components
+        if _is_feedback_related_net(net, semantic) and _is_opamp_layout(component)
+    ]
+    endpoint_kinds = _route_endpoint_kinds(pin_map, components)
+
+    fixed = [points[0]]
+    for end in points[1:]:
+        start = fixed[-1]
+        if start == end:
+            continue
+        if is_axis_aligned(start, end):
+            fixed.append(end)
+            continue
+
+        elbow_a = Point(end.x, start.y)
+        elbow_b = Point(start.x, end.y)
+        elbow = min(
+            [elbow_a, elbow_b],
+            key=lambda candidate: _elbow_score(
+                start,
+                end,
+                candidate,
+                component_keepouts=component_keepouts,
+                label_keepouts=label_keepouts,
+                feedback_keepouts=feedback_keepouts,
+                endpoint_kinds=endpoint_kinds,
+            ),
+        )
+        fixed.extend([elbow, end])
+    return fixed
+
+
+def _elbow_score(
+    start: Point,
+    end: Point,
+    elbow: Point,
+    *,
+    component_keepouts: list[BBox],
+    label_keepouts: list[BBox],
+    feedback_keepouts: list[BBox],
+    endpoint_kinds: dict[tuple[float, float], str],
+) -> float:
+    segments = [(start, elbow), (elbow, end)]
+    score = sum(abs(a.x - b.x) + abs(a.y - b.y) for a, b in segments) * 0.01
+    for bbox in component_keepouts:
+        if bbox.width > 0 and bbox.height > 0 and any(_axis_segment_intersects_bbox(a, b, bbox) for a, b in segments):
+            score += 100.0
+    for bbox in label_keepouts:
+        if any(_axis_segment_intersects_bbox(a, b, bbox) for a, b in segments):
+            score += 70.0
+    for bbox in feedback_keepouts:
+        if any(_axis_segment_intersects_bbox(a, b, bbox) for a, b in segments):
+            score += 140.0
+
+    if endpoint_kinds.get(_point_key(end)) == "opamp_input" and not _same(elbow.y, end.y):
+        score += 25.0
+    if endpoint_kinds.get(_point_key(start)) == "opamp_input" and not _same(start.y, elbow.y):
+        score += 25.0
+    if _same(elbow.x, end.x) and _same(elbow.y, start.y):
+        score -= 0.02
+    return score
+
+
+def _route_endpoint_kinds(
+    pin_map: dict[tuple[str, str], LayoutPin],
+    components: list[LayoutComponent],
+) -> dict[tuple[float, float], str]:
+    component_by_id = {component.id: component for component in components}
+    endpoints: dict[tuple[float, float], str] = {}
+    for (component_id, pin_name), pin in pin_map.items():
+        component = component_by_id.get(component_id)
+        if component is None:
+            continue
+        if _is_opamp_layout(component) and _pin_kind(pin_name) in {"+", "-"}:
+            endpoints[_point_key(Point(pin.x, pin.y))] = "opamp_input"
+    return endpoints
+
+
+def _is_feedback_related_net(net: str, semantic: TopologySemanticPlan | None) -> bool:
+    if semantic is None:
+        return False
+    return any(net in motif.feedback_nets for motif in semantic.motifs)
+
+
+def _opamp_route_body_bbox(component: LayoutComponent) -> BBox:
+    return BBox(
+        component.bbox.x + 0.16,
+        component.bbox.y + 0.14,
+        max(0.1, component.bbox.width - 0.36),
+        max(0.1, component.bbox.height - 0.28),
+    )
+
+
+def _axis_segment_intersects_bbox(start: Point, end: Point, bbox: BBox) -> bool:
+    if _same(start.x, end.x):
+        return bbox.x <= start.x <= bbox.right and _intervals_overlap(start.y, end.y, bbox.y, bbox.bottom)
+    if _same(start.y, end.y):
+        return bbox.y <= start.y <= bbox.bottom and _intervals_overlap(start.x, end.x, bbox.x, bbox.right)
+    elbow = Point(end.x, start.y)
+    return _axis_segment_intersects_bbox(start, elbow, bbox) or _axis_segment_intersects_bbox(elbow, end, bbox)
+
+
+def _intervals_overlap(a: float, b: float, c: float, d: float) -> bool:
+    return min(max(a, b), max(c, d)) >= max(min(a, b), min(c, d))
+
+
+def _point_key(point: Point) -> tuple[float, float]:
+    return (round(point.x, 4), round(point.y, 4))
+
+
 def _route_known_motif(
     pin_map: dict[tuple[str, str], LayoutPin],
     net_to_pins: dict[str, list[tuple[str, str]]],
     motif: str | None,
+    *,
+    semantic: TopologySemanticPlan | None = None,
+    components: list[LayoutComponent] | None = None,
+    labels: list[LayoutLabel] | None = None,
 ) -> list[LayoutWire] | None:
     motif_key = _key(motif)
     builders: dict[str, Callable[[dict[tuple[str, str], LayoutPin], dict[str, list[tuple[str, str]]]], dict[str, list[Point]] | None]] = {
@@ -1321,13 +1674,19 @@ def _route_known_motif(
         return None
     wires: list[LayoutWire] = []
     for net, connected in sorted(net_to_pins.items()):
-        if _net_is_terminalized(net, None):
+        if _net_is_terminalized(net, semantic):
             continue
         route = routes.get(net)
         if route is None:
             route = _generic_route([_point(pin_map, key) for key in connected])
         if route:
-            wires.append(LayoutWire(net=net, points=_dedupe(route), connected_pins=connected))
+            wires.append(
+                LayoutWire(
+                    net=net,
+                    points=_finalize_route(net, connected, route, pin_map, semantic=semantic, components=components, labels=labels),
+                    connected_pins=connected,
+                )
+            )
     return wires
 
 
@@ -2058,3 +2417,7 @@ def _has_component(layout: LayoutPlan, component_id: str) -> bool:
 
 def _key(value: str | None) -> str:
     return (value or "").lower().replace("-", "_").replace(" ", "_")
+
+
+def _same(left: float, right: float) -> bool:
+    return abs(left - right) < 1e-6
