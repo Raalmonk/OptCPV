@@ -50,7 +50,7 @@ def test_rld_feedback_stays_local_while_drive_uses_bottom_corridor() -> None:
 
     assert max(point.y for point in rld_fb.points) < components["Aau"].bbox.bottom + 0.2
     assert max(point.y for point in rld.points) > components["Aau"].bbox.bottom
-    assert max(point.y for point in rld_drive.points) > components["Ro"].bbox.bottom
+    assert max(point.y for point in rld_drive.points) <= layout.pin_map[("Ro", "b")].y + 1e-6
 
 
 def test_single_feedback_input_branch_does_not_backtrack_to_fake_corridor() -> None:
@@ -108,6 +108,17 @@ def test_bottom_auxiliary_output_keeps_feedback_resistor_as_local_branch() -> No
 
     assert rld.points[0] == Point(driver.x, driver.y)
     assert feedback_index < bottom_entry
+
+
+def test_two_pin_auxiliary_leaf_stops_at_passive_pin_without_overshoot() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    components = {component.id: component for component in layout.components}
+    rld_drive = next(wire for wire in layout.wires if wire.net == "rld_drive")
+    ro_pin = layout.pin_map[("Ro", "b")]
+
+    assert rld_drive.points[-1] == Point(ro_pin.x, ro_pin.y)
+    assert max(point.y for point in rld_drive.points) <= ro_pin.y + 1e-6
+    assert not route_crosses_keepout(rld_drive.points, components["Ro"].bbox.expanded(-0.06))
 
 
 def test_opamp_supply_symbols_are_not_visible_in_main_svg() -> None:

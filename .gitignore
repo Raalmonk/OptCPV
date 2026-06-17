@@ -1,8 +1,42 @@
-/generated/
-.env
-.env.local
+# Generated artifacts
+generated/
+output/
+outputs/
+artifacts/
+*.artifact.json
+*.critic.json
+*.report.json
+*.raw.svg
+*.optimized.svg
+*.debug.svg
+*.raw.png
+*.optimized.png
+*.start.svg
+*.start.png
+*.local_cv.svg
+*.local_cv.png
+*.gemini_sim.svg
+*.gemini_sim.png
+contact_sheet*.json
+contact_sheet*.png
+
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Local environment
+.env
+.env.*
+!.env.example
 .DS_Store

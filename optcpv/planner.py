@@ -1937,6 +1937,8 @@ def _bottom_auxiliary_corridor_route(
     if len(pins) < 2:
         return []
     component_by_id = {component.id: component for component in components}
+    if len(pins) == 2:
+        return _two_pin_auxiliary_route(pins[0], pins[1], component_by_id)
     driver = _bottom_auxiliary_opamp_driver(pins, component_by_id)
     if driver is not None:
         local_branches = _local_feedback_branches_for_output_net(driver, pins, component_by_id)
@@ -1978,6 +1980,51 @@ def _bottom_auxiliary_corridor_route(
     for pin in ordered[1:]:
         route.extend(_bottom_corridor_branch_route(pin, corridor_y, components))
     return route
+
+
+def _two_pin_auxiliary_route(
+    first: LayoutPin,
+    second: LayoutPin,
+    component_by_id: dict[str, LayoutComponent],
+) -> list[Point]:
+    first_component = component_by_id.get(first.component_id)
+    second_component = component_by_id.get(second.component_id)
+    if first_component is not None and _is_passive_layout(first_component):
+        leaf, source = first, second
+    elif second_component is not None and _is_passive_layout(second_component):
+        leaf, source = second, first
+    else:
+        return _generic_route([Point(first.x, first.y), Point(second.x, second.y)])
+
+    source_point = Point(source.x, source.y)
+    leaf_point = Point(leaf.x, leaf.y)
+    approach = _passive_leaf_approach(leaf, component_by_id.get(leaf.component_id))
+    if abs(source.y - approach.y) < 0.15:
+        return [source_point, approach, leaf_point]
+    return [
+        source_point,
+        Point(approach.x, source.y),
+        approach,
+        leaf_point,
+    ]
+
+
+def _is_passive_layout(component: LayoutComponent) -> bool:
+    return _is_resistor_layout(component) or _is_capacitor_layout(component)
+
+
+def _passive_leaf_approach(pin: LayoutPin, component: LayoutComponent | None) -> Point:
+    if component is None:
+        return Point(pin.x, pin.y)
+    if pin.side == "right":
+        return Point(component.bbox.right + 0.42, pin.y)
+    if pin.side == "left":
+        return Point(component.bbox.x - 0.42, pin.y)
+    if pin.side == "bottom":
+        return Point(pin.x, component.bbox.bottom + 0.42)
+    if pin.side == "top":
+        return Point(pin.x, component.bbox.y - 0.42)
+    return Point(pin.x, pin.y)
 
 
 def _bottom_auxiliary_opamp_driver(
