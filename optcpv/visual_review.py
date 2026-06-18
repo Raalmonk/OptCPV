@@ -9,8 +9,8 @@ import os
 import re
 from typing import Any
 
-from .models import Circuit, CriticReport, LayoutPlan
-from .patch import LayoutPatch, MoveComponent, MoveLabel
+from .models import Circuit, CriticReport, LayoutComponent, LayoutPin, LayoutPlan, NetClass
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetRoutePolicy
 from .raster import RasterImage
 
 
@@ -211,15 +211,92 @@ def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) ->
     label_ids = {label.id for label in layout.labels}
     move_components: list[MoveComponent] = []
     move_labels: list[MoveLabel] = []
+    route_policies: list[SetRoutePolicy] = []
 
     for patch in review.patches:
         if patch.action == "move_component" and patch.component_id in component_ids and patch.x is not None and patch.y is not None:
             move_components.append(MoveComponent(patch.component_id, patch.x, patch.y))
         elif patch.action == "move_label" and patch.label_id in label_ids and patch.x is not None and patch.y is not None:
             move_labels.append(MoveLabel(patch.label_id, patch.x, patch.y))
-        elif patch.action in {"assign_route_corridor", "request_reroute", "no_op"}:
+        elif patch.action in {"assign_route_corridor", "request_reroute"} and patch.net:
+            route_policy = _route_policy_from_visual_patch(patch, layout)
+            if route_policy is not None:
+                route_policies.append(route_policy)
+        elif patch.action == "no_op":
             continue
-    return LayoutPatch(move_component=move_components, move_label=move_labels)
+    return LayoutPatch(move_component=move_components, move_label=move_labels, set_route_policy=route_policies)
+
+
+def _route_policy_from_visual_patch(patch: VisualPatch, layout: LayoutPlan) -> SetRoutePolicy | None:
+    if patch.net is None or patch.net not in layout.net_to_pins:
+        return None
+    net_class = layout.semantic.net_classes.get(patch.net, NetClass.SIGNAL)
+    if net_class in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}:
+        return None
+    policy = _normalize_corridor_policy(patch.corridor, patch.net, layout)
+    if policy is None:
+        return None
+    role = "right_leg_drive" if policy == "bottom_auxiliary_corridor" else "feedback"
+    return SetRoutePolicy(net=patch.net, policy=policy, net_role=role)
+
+
+def _normalize_corridor_policy(corridor: str | None, net: str, layout: LayoutPlan) -> str | None:
+    key = _key(corridor or "")
+    if any(token in key for token in ("bottom_auxiliary", "auxiliary", "right_leg", "rld")):
+        return "bottom_auxiliary_corridor"
+    if "top" in key and ("bottom" in key or "or" in key):
+        return _feedback_corridor_for_net(net, layout)
+    if "top" in key:
+        return "top_feedback_corridor"
+    if "bottom" in key:
+        return "bottom_feedback_corridor"
+    if not key or "reroute" in key or "feedback" in key:
+        return _feedback_corridor_for_net(net, layout)
+    return None
+
+
+def _feedback_corridor_for_net(net: str, layout: LayoutPlan) -> str:
+    component_by_id = {component.id: component for component in layout.components}
+    pins = [layout.pin_map[key] for key in layout.net_to_pins.get(net, []) if key in layout.pin_map]
+    driver = next((pin for pin in pins if _is_opamp_output_pin(pin, component_by_id)), None)
+    receivers = [pin for pin in pins if _is_opamp_input_pin(pin, component_by_id)]
+    if driver is not None and receivers:
+        receiver = min(receivers, key=lambda pin: abs(pin.y - driver.y))
+        return "bottom_feedback_corridor" if receiver.y > driver.y else "top_feedback_corridor"
+    if pins:
+        median_y = sorted(pin.y for pin in pins)[len(pins) // 2]
+        return "bottom_feedback_corridor" if median_y > _layout_midline_y(layout) else "top_feedback_corridor"
+    return "top_feedback_corridor"
+
+
+def _is_opamp_output_pin(pin: LayoutPin, component_by_id: dict[str, LayoutComponent]) -> bool:
+    component = component_by_id.get(pin.component_id)
+    return component is not None and _is_opamp(component) and _pin_kind(pin.pin_name) in {"out", "output", "o"}
+
+
+def _is_opamp_input_pin(pin: LayoutPin, component_by_id: dict[str, LayoutComponent]) -> bool:
+    component = component_by_id.get(pin.component_id)
+    return component is not None and _is_opamp(component) and _pin_kind(pin.pin_name) in {"+", "-", "plus", "minus", "noninverting", "inverting"}
+
+
+def _is_opamp(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return "op_amp" in key or "opamp" in key or "operational_amplifier" in key
+
+
+def _pin_kind(pin_name: str) -> str:
+    compact = _key(pin_name).replace("_", "")
+    if pin_name in {"+", "-"}:
+        return pin_name
+    if compact in {"plus", "noninverting", "noninv", "inp", "vp"}:
+        return "+"
+    if compact in {"minus", "inverting", "inv", "inn", "vn"}:
+        return "-"
+    return compact
+
+
+def _layout_midline_y(layout: LayoutPlan) -> float:
+    return (layout.height / layout.grid) / 2.0
 
 
 def _heuristic_patches(layout: LayoutPlan, critic_report: CriticReport) -> list[VisualPatch]:
@@ -348,6 +425,10 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _key(value: str | None) -> str:
+    return (value or "").lower().replace("-", "_").replace(" ", "_")
 
 
 __all__ = [

@@ -3,11 +3,15 @@
 from .artifact import draw_artifact, draw_svg
 from .models import Circuit, Component, LayoutSupport, SchematicArtifact
 from .optimizer import draw_optimized_artifact, draw_optimized_svg
-from .planning_agent import FakePlanningClient, GeminiPlanningClient, SemanticPlanningClient
+from .planning_agent import FakePlanningClient, GeminiPlanningClient, SemanticPlanningClient, planning_client_from_env
 from .planning_hints import (
+    AuxiliaryLoopHint,
+    BlockHint,
     GridPlacementHint,
+    InterBlockRouteHint,
     LaneHint,
     PlanningHints,
+    OrientationOverrideHint,
     RoutePolicyHint,
     SchematicLayoutHints,
     SchematicPlanningRequest,
@@ -29,17 +33,21 @@ from .vision_agent import GeminiVisionClient, HeuristicVisionClient, VisualFeedb
 __all__ = [
     "Circuit",
     "Component",
+    "AuxiliaryLoopHint",
+    "BlockHint",
     "FakePlanningClient",
     "FakeVisualReviewClient",
     "GeminiVisualReviewClient",
     "GeminiVisionClient",
     "GeminiPlanningClient",
     "GridPlacementHint",
+    "InterBlockRouteHint",
     "HeuristicVisionClient",
     "HeuristicVisualReviewClient",
     "LaneHint",
     "LayoutSupport",
     "PlanningHints",
+    "OrientationOverrideHint",
     "RoutePolicyHint",
     "SchematicArtifact",
     "SchematicLayoutHints",
@@ -57,5 +65,6 @@ __all__ = [
     "draw_svg",
     "heuristic_feedback",
     "plan_layout",
+    "planning_client_from_env",
     "repair_circuit",
 ]

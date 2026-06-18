@@ -6,14 +6,15 @@ from dataclasses import replace
 
 from .artifact import artifact_from_layout
 from .critic import CriticBreakdown, critique_parts
-from .models import BBox, Circuit, LayoutComponent, LayoutLabel, LayoutPlan, Point, SchematicArtifact, circuit_from_any
-from .patch import LayoutPatch, MoveComponent, MoveLabel, apply_patch
-from .planning_agent import SemanticPlanningClient
+from .models import BBox, Circuit, Component, LayoutComponent, LayoutLabel, LayoutPlan, Point, SchematicArtifact, circuit_from_any
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, apply_patch
+from .planning_agent import SemanticPlanningClient, planning_client_from_env
 from .planner import plan_layout
 from .raster import rasterize_svg
 from .renderer import render_svg_layers
 from .semantic_repair import repair_circuit
 from .verifier import verify_layout_topology
+from .vector_critic import critique_layout
 from .visual_review import VisualReview, VisualReviewClient, layout_patch_from_visual_review
 from .vision_agent import VisionLayoutClient
 
@@ -47,6 +48,7 @@ def draw_optimized_artifact(
     reference_image: bytes | None = None,
 ) -> SchematicArtifact:
     native = circuit_from_any(circuit)
+    planning_client = planning_client or planning_client_from_env()
     layout = plan_layout(native, planning_client=planning_client, reference_image=reference_image)
     verify_layout_topology(native, layout)
     layers = render_svg_layers(layout)
@@ -334,15 +336,78 @@ def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
     should_compact = "fill_ratio_low" in codes or "too_much_empty_canvas" in codes or (
         "spread_excessive" in codes and raster_fill < 0.28 and component_fill < 0.45
     )
-    if should_compact:
+    if should_compact and not _has_external_planning_hints(layout):
         moves = _compact_moves(layout, moves)
 
     if "component_overlap" in codes:
         moves = _separate_overlaps(layout, moves)
 
     label_moves = _propose_label_moves(layout, report)
+    orientation_updates = _propose_orientation_updates(layout)
 
-    return LayoutPatch(move_component=moves, move_label=label_moves)
+    return LayoutPatch(move_component=moves, move_label=label_moves, set_orientation=orientation_updates)
+
+
+def _propose_orientation_updates(layout: LayoutPlan) -> list[SetOrientation]:
+    opamps = [component for component in layout.components if _is_opamp_layout(component)]
+    if not opamps:
+        return []
+    circuit = _circuit_from_layout(layout)
+    best = layout
+    best_report = critique_layout(layout)
+    for component in sorted(opamps, key=lambda item: item.id):
+        current = next((item for item in best.components if item.id == component.id), component)
+        for orientation in ("right", "right_flip"):
+            if current.orientation == orientation:
+                continue
+            try:
+                candidate = apply_patch(circuit, best, LayoutPatch(set_orientation=[SetOrientation(component.id, orientation)]))
+                candidate_report = critique_layout(candidate)
+            except Exception:
+                continue
+            if _orientation_candidate_better(candidate_report, best_report):
+                best = candidate
+                best_report = candidate_report
+                current = next((item for item in best.components if item.id == component.id), current)
+    updates: list[SetOrientation] = []
+    original = {component.id: component.orientation for component in layout.components}
+    for component in best.components:
+        if component.id in original and original[component.id] != component.orientation:
+            updates.append(SetOrientation(component.id, component.orientation))
+    return updates
+
+
+def _orientation_candidate_better(candidate_report, best_report) -> bool:
+    candidate_hard = sum(1 for violation in candidate_report.violations if violation.hard)
+    best_hard = sum(1 for violation in best_report.violations if violation.hard)
+    if _violation_count(candidate_report, "component_overlap") > _violation_count(best_report, "component_overlap"):
+        return False
+    if candidate_hard > best_hard:
+        return False
+    if candidate_hard < best_hard:
+        return True
+    return candidate_report.score < best_report.score - 0.1
+
+
+def _violation_count(report, code: str) -> int:
+    return sum(1 for violation in report.violations if violation.code == code)
+
+
+def _circuit_from_layout(layout: LayoutPlan) -> Circuit:
+    return Circuit(
+        id=layout.circuit_id,
+        components=[
+            Component(
+                id=component.id,
+                type=component.type,
+                pins=dict(component.pins),
+                label=component.label,
+                role=component.role,
+                value=component.value,
+            )
+            for component in layout.components
+        ],
+    )
 
 
 def _propose_label_moves(layout: LayoutPlan, report) -> list[MoveLabel]:
@@ -520,11 +585,62 @@ def _separate_overlaps(layout: LayoutPlan, moves: list[MoveComponent]) -> list[M
     for index, component in enumerate(ordered):
         move = adjusted[component.id]
         adjusted[component.id] = replace(move, y=move.y + index * 0.12)
+    component_by_id = {component.id: component for component in layout.components}
+    for _ in range(16):
+        overlap = _first_adjusted_overlap(layout.components, adjusted)
+        if overlap is None:
+            break
+        left_id, right_id = overlap
+        moving_id = _overlap_move_id(component_by_id[left_id], component_by_id[right_id])
+        fixed_id = right_id if moving_id == left_id else left_id
+        moving = adjusted[moving_id]
+        moving_box = _adjusted_bbox(component_by_id[moving_id], moving)
+        fixed_box = _adjusted_bbox(component_by_id[fixed_id], adjusted[fixed_id])
+        overlap_x = min(moving_box.right, fixed_box.right) - max(moving_box.x, fixed_box.x)
+        direction = 1.0 if moving_box.center.x >= fixed_box.center.x else -1.0
+        adjusted[moving_id] = replace(moving, x=moving.x + direction * (overlap_x + 0.32))
     return list(adjusted.values())
 
 
+def _first_adjusted_overlap(components: list[LayoutComponent], moves: dict[str, MoveComponent]) -> tuple[str, str] | None:
+    boxes = {component.id: _adjusted_bbox(component, moves[component.id]) for component in components if component.id in moves}
+    ids = sorted(boxes)
+    for index, left_id in enumerate(ids):
+        for right_id in ids[index + 1 :]:
+            if boxes[left_id].intersects(boxes[right_id], padding=0.05):
+                return (left_id, right_id)
+    return None
+
+
+def _adjusted_bbox(component: LayoutComponent, move: MoveComponent) -> BBox:
+    return BBox(
+        component.bbox.x + move.x - component.x,
+        component.bbox.y + move.y - component.y,
+        component.bbox.width,
+        component.bbox.height,
+    )
+
+
+def _overlap_move_id(left: LayoutComponent, right: LayoutComponent) -> str:
+    if _is_opamp_layout(left) and not _is_opamp_layout(right):
+        return right.id
+    if _is_opamp_layout(right) and not _is_opamp_layout(left):
+        return left.id
+    return right.id if (right.x, right.y) >= (left.x, left.y) else left.id
+
+
+def _has_external_planning_hints(layout: LayoutPlan) -> bool:
+    return bool(layout.support.planning_hints)
+
+
 def _empty_patch(patch: LayoutPatch) -> bool:
-    return not (patch.move_component or patch.move_label or patch.set_orientation or patch.set_wire_points)
+    return not (
+        patch.move_component
+        or patch.move_label
+        or patch.set_orientation
+        or patch.set_wire_points
+        or patch.set_route_policy
+    )
 
 
 def _median_y(layout: LayoutPlan) -> float:

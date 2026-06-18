@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from math import ceil
 from statistics import median
-from typing import Callable
+from typing import Callable, Iterable
 
 from .labels import component_display_label, label_bbox_size
 from .models import (
@@ -30,7 +30,7 @@ from .models import (
 )
 from .hint_legalizer import legalize_planning_hints
 from .planning_agent import SemanticPlanningClient
-from .planning_hints import RoutePolicyHint, SchematicLayoutHints
+from .planning_hints import BlockHint, GridPlacementHint, RoutePolicyHint, SchematicLayoutHints
 from .route_contract import assert_no_diagonal_wires, orthogonalize_route
 from .semantics import (
     classify_net,
@@ -76,9 +76,19 @@ def plan_layout(
         reference_image=reference_image,
     )
     if hints is None:
+        auto_hints = _auto_ecg_frontend_hints(native)
+        if auto_hints is not None:
+            candidate = _layout_from_planning_hints(native, base_layout, auto_hints)
+            if candidate is not None:
+                return candidate
         return base_layout
     candidate = _layout_from_planning_hints(native, base_layout, hints)
     if candidate is None:
+        auto_hints = _auto_ecg_frontend_hints(native)
+        if auto_hints is not None:
+            candidate = _layout_from_planning_hints(native, base_layout, auto_hints)
+            if candidate is not None:
+                return candidate
         return base_layout
     return candidate
 
@@ -903,6 +913,130 @@ def _resolve_planning_hints(
         return planning_client.propose_hints(circuit)
 
 
+def _auto_ecg_frontend_hints(circuit: Circuit) -> SchematicLayoutHints | None:
+    component_ids = {component.id for component in circuit.components}
+    required = {
+        "A1",
+        "A2",
+        "A3",
+        "A4",
+        "A_AUX",
+        "C1",
+        "R6",
+        "C2",
+        "R_RL",
+        "RA_TOP",
+        "RA_BOT",
+        "R7_BIAS_A4",
+    }
+    if not required <= component_ids:
+        return None
+
+    def members(*ids: str) -> tuple[str, ...]:
+        return tuple(component_id for component_id in ids if component_id in component_ids)
+
+    blocks = (
+        BlockHint(
+            block_id="auto_differential_input",
+            block_type="differential_input",
+            members=members("E_PLUS", "E_MINUS", "A1", "A2", "R1_GAIN", "R2_TOP", "R2_BOT"),
+            stage_x=0,
+            lane_y=1,
+        ),
+        BlockHint(
+            block_id="auto_common_mode",
+            block_type="common_mode_sense",
+            members=members("RA_TOP", "RA_BOT", "V3_MON"),
+            stage_x=1,
+            lane_y=1,
+        ),
+        BlockHint(
+            block_id="auto_difference_amplifier",
+            block_type="difference_amplifier",
+            members=members("A3", "R3_MINUS", "R3_PLUS", "R4_FEEDBACK_A3", "R4_PLUS_GND"),
+            stage_x=2,
+            lane_y=1,
+        ),
+        BlockHint(
+            block_id="auto_ac_coupling",
+            block_type="ac_coupling_bias",
+            members=members("C1", "S1", "R7_BIAS_A4"),
+            stage_x=3,
+            lane_y=1,
+        ),
+        BlockHint(
+            block_id="auto_active_filter_a4",
+            block_type="active_filter_a4",
+            members=members("A4", "R5", "R6", "C2", "R7_A4_MINUS", "V5_OUT"),
+            stage_x=4,
+            lane_y=1,
+        ),
+        BlockHint(
+            block_id="auto_auxiliary_right_leg_drive",
+            block_type="auxiliary_right_leg_drive",
+            members=members("A_AUX", "RF_AUX", "RO_AUX", "R_RL", "RL_ELECTRODE", "AUX_OUT_MON", "VO_MON"),
+            stage_x=2,
+            lane_y=3,
+        ),
+    )
+    placement_specs = {
+        "E_PLUS": (0, 0, "RIGHT"),
+        "E_MINUS": (0, 4, "RIGHT"),
+        "A1": (1, 0, "RIGHT_FLIP"),
+        "A2": (1, 4, "RIGHT"),
+        "R1_GAIN": (1, 2, "DOWN"),
+        "R2_TOP": (2, 0, "LEFT"),
+        "R2_BOT": (2, 4, "RIGHT"),
+        "RA_TOP": (2, 1, "DOWN"),
+        "RA_BOT": (2, 3, "DOWN"),
+        "A3": (3, 2, "RIGHT"),
+        "R3_MINUS": (3, 1, "RIGHT"),
+        "R3_PLUS": (3, 3, "RIGHT"),
+        "R4_FEEDBACK_A3": (3, 0, "LEFT"),
+        "R4_PLUS_GND": (3, 4, "DOWN"),
+        "C1": (4, 2, "RIGHT"),
+        "S1": (4, 3, "DOWN"),
+        "R7_BIAS_A4": (4, 4, "DOWN"),
+        "A4": (5, 2, "RIGHT"),
+        "R6": (5, 0, "RIGHT"),
+        "C2": (6, 0, "RIGHT"),
+        "R7_A4_MINUS": (5, 1, "RIGHT"),
+        "R5": (5, 4, "DOWN"),
+        "V5_OUT": (6, 2, "RIGHT"),
+        "A_AUX": (3, 6, "RIGHT"),
+        "RF_AUX": (4, 5, "RIGHT"),
+        "RO_AUX": (4, 6, "RIGHT"),
+        "R_RL": (5, 6, "RIGHT"),
+        "RL_ELECTRODE": (6, 6, "RIGHT"),
+        "V2_MON": (2, 0, "RIGHT"),
+        "V3_MON": (2, 2, "LEFT"),
+        "V4_MON": (4, 2, "RIGHT"),
+        "AUX_OUT_MON": (4, 6, "LEFT"),
+        "VO_MON": (5, 6, "RIGHT"),
+        "GND": (6, 7, "RIGHT"),
+    }
+    placements = tuple(
+        GridPlacementHint(
+            component_id=component_id,
+            stage_x=stage_x,
+            lane_y=lane_y,
+            orientation=orientation,
+            role="auto_ecg_frontend",
+            confidence=0.84,
+        )
+        for component_id, (stage_x, lane_y, orientation) in placement_specs.items()
+        if component_id in component_ids
+    )
+    return SchematicLayoutHints(
+        recognized_topology="ecg_frontend_right_leg_drive",
+        confidence=0.84,
+        tutor_explanation="Detected a complete ECG frontend with right-leg-drive components from circuit structure.",
+        source="deterministic",
+        placements=placements,
+        blocks=blocks,
+    )
+
+
 def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints: SchematicLayoutHints) -> LayoutPlan | None:
     legal_hints = legalize_planning_hints(circuit, hints)
     if legal_hints is None:
@@ -929,6 +1063,7 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         width=base_layout.width,
         height=base_layout.height,
         grid=base_layout.grid,
+        label_offsets=_hint_label_offsets(circuit, legal_hints),
         support=support,
     )
     candidate = _improve_hint_opamp_orientations(circuit, candidate)
@@ -944,7 +1079,9 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         return None
     base_hard = sum(1 for violation in base_report.violations if violation.hard)
     candidate_hard = sum(1 for violation in candidate_report.violations if violation.hard)
-    if any(violation.code == "component_overlap" for violation in candidate_report.violations):
+    base_overlaps = _violation_count(base_report, "component_overlap")
+    candidate_overlaps = _violation_count(candidate_report, "component_overlap")
+    if candidate_overlaps > base_overlaps:
         return None
     if candidate_hard > base_hard or candidate_report.score > base_report.score:
         return None
@@ -997,13 +1134,17 @@ def _improve_hint_opamp_orientations(circuit: Circuit, layout: LayoutPlan) -> La
 def _orientation_candidate_better(candidate_report, best_report) -> bool:
     candidate_hard = sum(1 for violation in candidate_report.violations if violation.hard)
     best_hard = sum(1 for violation in best_report.violations if violation.hard)
-    if any(violation.code == "component_overlap" for violation in candidate_report.violations):
+    if _violation_count(candidate_report, "component_overlap") > _violation_count(best_report, "component_overlap"):
         return False
     if candidate_hard > best_hard:
         return False
     if candidate_hard < best_hard:
         return True
     return candidate_report.score < best_report.score - 0.1
+
+
+def _violation_count(report, code: str) -> int:
+    return sum(1 for violation in report.violations if violation.code == code)
 
 
 def _hint_placements(
@@ -1019,6 +1160,13 @@ def _hint_placements(
         hint.component_id: _legalized_hint_orientation(base_components[hint.component_id], hint.orientation)
         for hint in hints.placements
     }
+    orientations.update(
+        {
+            override.component_id: _legalized_hint_orientation(base_components[override.component_id], override.orientation)
+            for override in hints.orientation_overrides
+            if override.component_id in base_components
+        }
+    )
     stage_positions = _hint_stage_positions(hints, base_components, orientations, span_x)
     lane_positions = _hint_lane_positions(hints, base_components, orientations, span_y)
 
@@ -1030,9 +1178,50 @@ def _hint_placements(
         y = _clamp(lane_positions[hint.lane_y], 0.6, span_y - 0.6)
         x, y = _clamp_anchor_to_canvas(component, x, y, orientation, span_x, span_y)
         placements[component_id] = (x, y, orientation)
+    for override in hints.orientation_overrides:
+        component_id = override.component_id
+        if component_id not in base_components or component_id not in placements:
+            continue
+        component = base_components[component_id]
+        x, y, _ = placements[component_id]
+        orientation = orientations[component_id]
+        x, y = _clamp_anchor_to_canvas(component, x, y, orientation, span_x, span_y)
+        placements[component_id] = (x, y, orientation)
+    placements = _apply_block_internal_placements(circuit, hints, base_components, placements, span_x, span_y)
     placements = _anchor_hint_ground_legs(circuit, base_components, placements, span_x, span_y)
     placements = _orient_hint_feedback_resistors(circuit, base_components, placements, span_x, span_y)
+    placements = _apply_block_internal_placements(circuit, hints, base_components, placements, span_x, span_y)
+    placements = _anchor_hint_ground_symbols(circuit, base_components, placements, span_x, span_y)
+    placements = _align_hint_passive_output_terminals(circuit, base_components, placements, span_x, span_y)
+    if _ecg_frontend_blocks_present(hints):
+        placements = _apply_block_internal_placements(circuit, hints, base_components, placements, span_x, span_y)
+        return placements
     return _relax_hint_component_overlaps(base_components, placements, span_x, span_y)
+
+
+def _hint_label_offsets(circuit: Circuit, hints: SchematicLayoutHints) -> dict[str, tuple[float, float]]:
+    if not _ecg_frontend_blocks_present(hints):
+        return {}
+    component_ids = {component.id for component in circuit.components}
+    offsets = {
+        "A1": (1.35, -1.05),
+        "A2": (1.35, -1.05),
+        "A3": (1.35, -1.05),
+        "A4": (1.35, -1.05),
+        "A_AUX": (1.35, -1.05),
+        "RA_TOP": (-0.9, -0.1),
+        "RA_BOT": (-0.9, 0.1),
+        "R7_A4_MINUS": (0.0, -0.95),
+        "S1": (-0.95, 0.18),
+        "R7_BIAS_A4": (1.05, -0.18),
+        "C2": (0.0, 0.72),
+        "V2_MON": (1.75, -0.3),
+        "V3_MON": (-1.45, 0.0),
+        "V4_MON": (0.72, -0.22),
+        "AUX_OUT_MON": (0.82, -0.55),
+        "VO_MON": (0.72, 0.42),
+    }
+    return {component_id: offset for component_id, offset in offsets.items() if component_id in component_ids}
 
 
 def _anchor_hint_ground_legs(
@@ -1062,6 +1251,68 @@ def _anchor_hint_ground_legs(
         x, y = _clamp_anchor_to_canvas(components[component.id], x, y, "right", span_x, span_y)
         result[component.id] = (x, y, "right")
     return result
+
+
+def _anchor_hint_ground_symbols(
+    circuit: Circuit,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    net_to_pins = _net_to_component_pins(circuit.components)
+    component_by_id = {component.id: component for component in circuit.components}
+    for ground in circuit.components:
+        if ground.id not in result or ground.id not in components or not _is_ground(ground):
+            continue
+        ground_nets = set(ground.pins.values())
+        passive_pin: tuple[str, str] | None = None
+        for net in sorted(ground_nets):
+            passive_pin = next(
+                (
+                    (component_id, pin_name)
+                    for component_id, pin_name in net_to_pins.get(net, [])
+                    if component_id != ground.id
+                    and component_id in result
+                    and component_id in components
+                    and _is_passive_layout(components[component_id])
+                ),
+                None,
+            )
+            if passive_pin is not None:
+                break
+        if passive_pin is None:
+            continue
+        passive_id, pin_name = passive_pin
+        passive_component = _component_at_hint_placement(components[passive_id], result[passive_id])
+        pin_x, pin_y, _ = _pin_point(passive_component, pin_name)
+        target_y = pin_y + 1.2 if pin_y + 2.1 <= span_y - CANVAS_EDGE_PADDING else pin_y - 1.2
+        if _has_auxiliary_output_near_y(component_by_id.values(), placements, pin_y, target_y):
+            target_y = pin_y - 1.2
+        x, y = _clamp_anchor_to_canvas(components[ground.id], pin_x, target_y, "right", span_x, span_y)
+        result[ground.id] = (x, y, "right")
+    return result
+
+
+def _has_auxiliary_output_near_y(
+    components: Iterable[Component],
+    placements: dict[str, tuple[float, float, str]],
+    pin_y: float,
+    target_y: float,
+) -> bool:
+    top = min(pin_y, target_y)
+    bottom = max(pin_y, target_y)
+    for component in components:
+        if component.id not in placements:
+            continue
+        identity = _key(" ".join(filter(None, [component.id, component.type, component.label, component.value, component.role])))
+        if not _is_auxiliary_identity(identity):
+            continue
+        _, y, _ = placements[component.id]
+        if top - 0.35 <= y <= bottom + 0.35:
+            return True
+    return False
 
 
 def _orient_hint_feedback_resistors(
@@ -1103,6 +1354,490 @@ def _feedback_resistor_orientation(resistor: Component, opamps: list[Component])
         if _pin_kind(output_pin) == "b" and _pin_kind(input_pin) == "a":
             return "right"
     return None
+
+
+def _apply_block_internal_placements(
+    circuit: Circuit,
+    hints: SchematicLayoutHints,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    if not hints.blocks:
+        return placements
+    result = dict(placements)
+    component_by_id = {component.id: component for component in circuit.components}
+    result = _place_ecg_frontend_blocks(circuit, hints, components, result, span_x, span_y)
+    for block in sorted(hints.blocks, key=lambda item: (item.stage_x, item.lane_y, item.block_id)):
+        members = [component_by_id[component_id] for component_id in block.members if component_id in component_by_id]
+        if not members:
+            continue
+        if _ecg_frontend_blocks_present(hints) and _block_is_ecg_handled(block):
+            continue
+        block_type = _key(block.block_type)
+        if "parallel" in block_type and "buffer" in block_type:
+            result = _place_parallel_buffer_block(members, components, result, span_x, span_y)
+        elif "auxiliary" in block_type or "right_leg" in block_type or "rld" in block_type:
+            result = _place_auxiliary_feedback_block(members, components, result, span_x, span_y)
+        elif "feedback" in block_type and "opamp" in block_type:
+            result = _place_opamp_feedback_block(members, components, result, span_x, span_y)
+        elif "differential_input" in block_type or "input_pair" in block_type:
+            result = _place_differential_input_block(members, components, result, span_x, span_y)
+    return result
+
+
+def _place_parallel_buffer_block(
+    members: list[Component],
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    opamps = _placed_members(members, components, result, _is_opamp)
+    if len(opamps) < 2:
+        return result
+    ordered = sorted(opamps, key=lambda component: result[component.id][1])
+    x = min(result[component.id][0] for component in ordered)
+    center_y = sum(result[component.id][1] for component in ordered) / len(ordered)
+    spacing = max(2.25, min(3.05, _member_y_span(ordered, result) / max(1, len(ordered) - 1)))
+    start_y = center_y - spacing * (len(ordered) - 1) / 2.0
+    output_net_to_resistor = _member_resistors_by_source_net(members, ordered)
+    input_net_to_terminal = _member_terminals_by_net(members, want_input=True)
+    for index, opamp in enumerate(ordered):
+        y = start_y + index * spacing
+        result[opamp.id] = _clamped_placement(components[opamp.id], x, y, "right", span_x, span_y)
+        output_net = _opamp_output_net(opamp)
+        if output_net in output_net_to_resistor:
+            resistor = output_net_to_resistor[output_net]
+            result[resistor.id] = _clamped_placement(components[resistor.id], x + 3.85, y, "right", span_x, span_y)
+        for net in _opamp_input_nets(opamp):
+            terminal = input_net_to_terminal.get(net)
+            if terminal is not None:
+                result[terminal.id] = _clamped_placement(components[terminal.id], x - 2.45, y, "right", span_x, span_y)
+    return result
+
+
+def _place_ecg_frontend_blocks(
+    circuit: Circuit,
+    hints: SchematicLayoutHints,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    if not _ecg_frontend_blocks_present(hints):
+        return placements
+    ids = {component.id: component for component in circuit.components}
+    result = dict(placements)
+    top_y = 2.35
+    mid_y = 5.55
+    bot_y = 8.75
+    aux_y = min(span_y - 3.0, 12.0)
+    x0 = 1.2
+    x1 = 4.2
+    xbuf = 8.6
+    x2 = 12.0
+    x3 = 16.9
+    x4 = min(span_x - 5.4, 20.5)
+    x5 = min(span_x - 1.4, 26.0)
+
+    def put(component_id: str, x: float, y: float, orientation: str = "right") -> None:
+        if component_id in components:
+            result[component_id] = _clamped_placement(components[component_id], x, y, orientation, span_x, span_y)
+
+    input_blocks = [block for block in hints.blocks if _block_key(block, ("differential", "input"))]
+    input_members = _block_member_ids(input_blocks)
+    if {"A1", "A2"} & input_members or any(component_id in input_members for component_id in ("E_PLUS", "E_MINUS")):
+        put("E_PLUS", x0, top_y + 0.35)
+        put("E_MINUS", x0, bot_y - 0.35)
+        put("A1", x1, top_y, "right_flip")
+        put("A2", x1, bot_y, "right")
+        put("R2_TOP", xbuf + 0.4, top_y - 1.0, "left")
+        put("R2_BOT", xbuf + 0.4, bot_y + 1.7, "right")
+        put("R1_GAIN", x1 - 0.85, mid_y, "down")
+
+    common_mode_blocks = [
+        block
+        for block in hints.blocks
+        if "common_mode" in _key(block.block_id) or any("common_mode" in _key(member) for member in block.members)
+    ]
+    common_members = _block_member_ids(common_mode_blocks) or {component.id for component in circuit.components if "common_mode" in _key(component.role)}
+    if common_members:
+        put("RA_TOP", xbuf - 0.2, mid_y - 1.3, "down")
+        put("RA_BOT", xbuf - 0.2, mid_y + 1.3, "down")
+
+    diff_blocks = [block for block in hints.blocks if _block_key(block, ("difference",)) or _block_has_member(block, "A3")]
+    if diff_blocks:
+        put("A3", x2, mid_y)
+        put("R3_MINUS", x2 - 1.8, mid_y - 0.62)
+        put("R3_PLUS", x2 - 1.8, mid_y + 0.62)
+        put("R4_FEEDBACK_A3", x2 + 1.3, mid_y - 2.85, "left")
+        put("R4_PLUS_GND", x2 - 1.8, mid_y + 3.05, "down")
+
+    filter_blocks = [block for block in hints.blocks if _block_key(block, ("ac",)) or _block_has_any(block, {"C1", "S1", "R7_BIAS_A4"})]
+    if filter_blocks:
+        put("C1", x3, mid_y + 0.62)
+        put("S1", x3 + 1.45, mid_y + 1.57, "down")
+        put("R7_BIAS_A4", x3 + 2.45, mid_y + 1.57, "down")
+
+    active_blocks = [block for block in hints.blocks if _block_key(block, ("active", "filter")) or _block_has_member(block, "A4")]
+    if active_blocks:
+        put("A4", x4, mid_y)
+        put("R6", x4 + 0.9, mid_y - 3.0, "right")
+        put("C2", x4 + 3.0, mid_y - 2.25, "right")
+        put("R7_A4_MINUS", x4 - 1.7, mid_y - 0.62, "right")
+        put("R5", x4 - 0.9, mid_y + 4.05, "down")
+        put("V5_OUT", x5, mid_y)
+
+    aux_blocks = [block for block in hints.blocks if _block_key(block, ("auxiliary",)) or _block_key(block, ("right_leg",)) or _block_has_member(block, "A_AUX")]
+    if aux_blocks:
+        put("A_AUX", x2 - 1.2, aux_y)
+        put("RF_AUX", x2 + 2.7, aux_y - 2.8, "right")
+        put("RO_AUX", x3 - 0.2, aux_y, "right")
+        put("R_RL", x3 + 2.2, aux_y, "right")
+        put("RL_ELECTRODE", x4 + 0.35, aux_y)
+        put("AUX_OUT_MON", x3 - 1.65, aux_y, "left")
+        put("VO_MON", x3 + 0.9, aux_y + 0.85, "right")
+        put("V3_MON", xbuf - 0.2, mid_y, "left")
+
+    put("V2_MON", xbuf - 0.35, top_y, "right")
+    put("V4_MON", x3 - 1.25, mid_y, "right")
+    put("GND", x5 - 0.7, min(span_y - 1.15, aux_y + 1.85))
+    return result
+
+
+def _ecg_frontend_blocks_present(hints: SchematicLayoutHints) -> bool:
+    block_text = " ".join(_key(" ".join([block.block_id, block.block_type, *block.members])) for block in hints.blocks)
+    return (
+        ("right_leg" in block_text or "rld" in block_text)
+        and ("a4" in block_text or "active_filter" in block_text)
+        and ("difference" in block_text or "a3" in block_text)
+        and ("differential" in block_text or "instrumentation" in block_text)
+    )
+
+
+def _block_is_ecg_handled(block) -> bool:
+    key = _key(" ".join([block.block_id, block.block_type, *block.members]))
+    return any(
+        token in key
+        for token in (
+            "instrumentation",
+            "differential",
+            "difference",
+            "diff",
+            "a3",
+            "a4",
+            "active",
+            "filter",
+            "frontend",
+            "right_leg",
+            "rld",
+            "auxiliary",
+            "common_mode",
+        )
+    )
+
+
+def _block_key(block, tokens: tuple[str, ...]) -> bool:
+    key = _key(f"{block.block_id} {block.block_type}")
+    return all(token in key for token in tokens)
+
+
+def _block_has_member(block, component_id: str) -> bool:
+    return component_id in set(block.members)
+
+
+def _block_has_any(block, component_ids: set[str]) -> bool:
+    return bool(set(block.members) & component_ids)
+
+
+def _block_member_ids(blocks) -> set[str]:
+    result: set[str] = set()
+    for block in blocks:
+        result.update(block.members)
+    return result
+
+
+def _place_opamp_feedback_block(
+    members: list[Component],
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    opamps = _placed_members(members, components, result, _is_opamp)
+    resistors = _placed_members(members, components, result, lambda component: _is_type(component, "resistor"))
+    for opamp in opamps:
+        if opamp.id not in result:
+            continue
+        opamp_x, opamp_y, opamp_orientation = result[opamp.id]
+        output_net = _opamp_output_net(opamp)
+        input_nets = set(_opamp_input_nets(opamp))
+        if output_net is None:
+            continue
+        feedback = [
+            resistor
+            for resistor in resistors
+            if output_net in set(resistor.pins.values())
+            and (input_nets & set(resistor.pins.values()) or "feedback" in _key(resistor.role))
+        ]
+        ground_legs = [
+            resistor
+            for resistor in resistors
+            if input_nets & set(resistor.pins.values()) and any(is_local_terminal_net(net) for net in resistor.pins.values())
+        ]
+        feedback_y = opamp_y + (2.65 if _is_flipped_opamp_orientation(opamp_orientation) else -2.65)
+        for index, resistor in enumerate(sorted(feedback, key=lambda item: item.id)):
+            orientation = _feedback_resistor_orientation(resistor, [opamp]) or result.get(resistor.id, (0.0, 0.0, "right"))[2]
+            result[resistor.id] = _clamped_placement(
+                components[resistor.id],
+                opamp_x + 1.2 + index * 0.55,
+                feedback_y,
+                orientation,
+                span_x,
+                span_y,
+            )
+        for index, resistor in enumerate(sorted(ground_legs, key=lambda item: item.id)):
+            result[resistor.id] = _clamped_placement(
+                components[resistor.id],
+                max(1.2, opamp_x - 4.4 - index * 0.55),
+                opamp_y + (2.0 if not _is_flipped_opamp_orientation(opamp_orientation) else -2.0),
+                "right",
+                span_x,
+                span_y,
+            )
+    return result
+
+
+def _place_auxiliary_feedback_block(
+    members: list[Component],
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    opamps = _placed_members(members, components, result, _is_opamp)
+    if not opamps:
+        return result
+    opamp = sorted(opamps, key=lambda component: ("right" not in _key(component.role), component.id))[0]
+    current_x, current_y, orientation = result[opamp.id]
+    main_opamp_ys = [
+        y
+        for component_id, (_, y, _) in result.items()
+        if component_id in components and _is_opamp_layout(components[component_id]) and component_id != opamp.id
+    ]
+    target_y = max(current_y, (sum(main_opamp_ys) / len(main_opamp_ys) if main_opamp_ys else current_y) + 2.45)
+    target_x = max(2.2, min(current_x, span_x - 8.2))
+    result[opamp.id] = _clamped_placement(components[opamp.id], target_x, target_y, "right", span_x, span_y)
+    opamp_x, opamp_y, _ = result[opamp.id]
+    output_net = _opamp_output_net(opamp)
+    input_nets = set(_opamp_input_nets(opamp))
+    resistors = _placed_members(members, components, result, lambda component: _is_type(component, "resistor"))
+    output_terminals = _placed_members(members, components, result, _is_output)
+    feedback = [
+        resistor
+        for resistor in resistors
+        if output_net is not None
+        and output_net in set(resistor.pins.values())
+        and (input_nets & set(resistor.pins.values()) or "feedback" in _key(resistor.role))
+    ]
+    output_resistors = [
+        resistor
+        for resistor in resistors
+        if resistor not in feedback and output_net is not None and output_net in set(resistor.pins.values())
+    ]
+    for index, resistor in enumerate(sorted(feedback, key=lambda item: item.id)):
+        orientation = _feedback_resistor_orientation(resistor, [opamp]) or "left"
+        result[resistor.id] = _clamped_placement(
+            components[resistor.id],
+            opamp_x + 3.65 + index * 0.5,
+            opamp_y - 1.45,
+            orientation,
+            span_x,
+            span_y,
+        )
+    output_y = min(span_y - 1.8, opamp_y + 3.45)
+    for index, resistor in enumerate(sorted(output_resistors, key=lambda item: item.id)):
+        result[resistor.id] = _clamped_placement(
+            components[resistor.id],
+            opamp_x + 7.25 + index * 2.3,
+            output_y,
+            "right",
+            span_x,
+            span_y,
+        )
+        downstream_net = next((net for net in resistor.pins.values() if net != output_net), None)
+        terminal = next((item for item in output_terminals if downstream_net in item.pins.values()), None)
+        if terminal is not None:
+            result[terminal.id] = _clamped_placement(
+                components[terminal.id],
+                result[resistor.id][0] + 2.35,
+                output_y,
+                "right",
+                span_x,
+                span_y,
+            )
+    return result
+
+
+def _place_differential_input_block(
+    members: list[Component],
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    terminals = _placed_members(members, components, result, _is_input_or_source)
+    if len(terminals) < 2:
+        return result
+    ordered = sorted(terminals, key=lambda component: result[component.id][1])
+    x = min(result[component.id][0] for component in ordered)
+    center_y = sum(result[component.id][1] for component in ordered) / len(ordered)
+    spacing = max(2.25, min(3.05, _member_y_span(ordered, result) / max(1, len(ordered) - 1)))
+    start_y = center_y - spacing * (len(ordered) - 1) / 2.0
+    for index, terminal in enumerate(ordered):
+        result[terminal.id] = _clamped_placement(components[terminal.id], x, start_y + index * spacing, "right", span_x, span_y)
+    return result
+
+
+def _placed_members(
+    members: list[Component],
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    predicate: Callable[[Component], bool],
+) -> list[Component]:
+    return [component for component in members if component.id in components and component.id in placements and predicate(component)]
+
+
+def _member_y_span(members: list[Component], placements: dict[str, tuple[float, float, str]]) -> float:
+    ys = [placements[component.id][1] for component in members if component.id in placements]
+    return max(ys) - min(ys) if ys else 0.0
+
+
+def _member_resistors_by_source_net(members: list[Component], sources: list[Component]) -> dict[str, Component]:
+    source_nets = {_opamp_output_net(source) for source in sources}
+    source_nets.discard(None)
+    result: dict[str, Component] = {}
+    for component in members:
+        if not _is_type(component, "resistor"):
+            continue
+        for net in component.pins.values():
+            if net in source_nets and net not in result:
+                result[net] = component
+    return result
+
+
+def _member_terminals_by_net(members: list[Component], *, want_input: bool) -> dict[str, Component]:
+    predicate = _is_input_or_source if want_input else _is_output
+    result: dict[str, Component] = {}
+    for component in members:
+        if not predicate(component):
+            continue
+        for net in component.pins.values():
+            result.setdefault(net, component)
+    return result
+
+
+def _clamped_placement(
+    component: LayoutComponent,
+    x: float,
+    y: float,
+    orientation: str,
+    span_x: float,
+    span_y: float,
+) -> tuple[float, float, str]:
+    x, y = _clamp_anchor_to_canvas(component, x, y, orientation, span_x, span_y)
+    return (x, y, orientation)
+
+
+def _align_hint_passive_output_terminals(
+    circuit: Circuit,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    net_to_pins = _net_to_component_pins(circuit.components)
+    for terminal in circuit.components:
+        if terminal.id not in result or terminal.id not in components or not _is_output(terminal):
+            continue
+        nets = list(terminal.pins.values())
+        if len(nets) != 1:
+            continue
+        connected = net_to_pins.get(nets[0], [])
+        if len(connected) != 2:
+            continue
+        passive_pin = next(
+            (
+                (component_id, pin_name)
+                for component_id, pin_name in connected
+                if component_id != terminal.id
+                and component_id in components
+                and _is_passive_layout(components[component_id])
+                and component_id in result
+            ),
+            None,
+        )
+        if passive_pin is None:
+            continue
+        passive_id, pin_name = passive_pin
+        passive_component = _component_at_hint_placement(components[passive_id], result[passive_id])
+        pin_x, pin_y, side = _pin_point(passive_component, pin_name)
+        if side == "left":
+            target = (pin_x - 1.35, pin_y, "right")
+        elif side == "right":
+            target = (pin_x + 1.35, pin_y, "right")
+        elif side == "top":
+            target = (pin_x, pin_y - 1.35, "right")
+        elif side == "bottom":
+            target = (pin_x, pin_y + 1.35, "right")
+        else:
+            continue
+        x, y = _clamp_anchor_to_canvas(components[terminal.id], target[0], target[1], target[2], span_x, span_y)
+        if side in {"left", "right"} and (abs(x - target[0]) > 0.05 or abs(y - target[1]) > 0.05):
+            passive_x, passive_y, passive_orientation = result[passive_id]
+            passive_x += x - target[0]
+            passive_y += y - target[1]
+            passive_x, passive_y = _clamp_anchor_to_canvas(
+                components[passive_id],
+                passive_x,
+                passive_y,
+                passive_orientation,
+                span_x,
+                span_y,
+            )
+            result[passive_id] = (passive_x, passive_y, passive_orientation)
+            passive_component = _component_at_hint_placement(components[passive_id], result[passive_id])
+            pin_x, pin_y, side = _pin_point(passive_component, pin_name)
+            target_x = pin_x - 1.35 if side == "left" else pin_x + 1.35
+            x, y = _clamp_anchor_to_canvas(components[terminal.id], target_x, pin_y, target[2], span_x, span_y)
+        result[terminal.id] = (x, y, target[2])
+    return result
+
+
+def _component_at_hint_placement(component: LayoutComponent, placement: tuple[float, float, str]) -> LayoutComponent:
+    x, y, orientation = placement
+    return replace(
+        component,
+        x=x,
+        y=y,
+        orientation=orientation,
+        bbox=_component_bbox(component.type, x, y, orientation),
+    )
+
+
+def _net_to_component_pins(components: list[Component]) -> dict[str, list[tuple[str, str]]]:
+    result: dict[str, list[tuple[str, str]]] = {}
+    for component in components:
+        for pin_name, net in component.pins.items():
+            result.setdefault(net, []).append((component.id, pin_name))
+    return result
 
 
 def _hint_stage_positions(
@@ -1348,7 +2083,8 @@ def _build_layout(
         support or _support_from_warnings(warnings),
         fallback_component_ids,
     )
-    semantic = _build_semantic_plan(circuit, components, pin_map, net_to_pins)
+    route_policies = _route_policy_hints(layout_support)
+    semantic = _build_semantic_plan(circuit, components, pin_map, net_to_pins, route_policies=route_policies)
     wires = _route_wires(
         pin_map,
         net_to_pins,
@@ -1356,7 +2092,7 @@ def _build_layout(
         semantic=semantic,
         components=components,
         labels=labels,
-        route_policies=_route_policy_hints(layout_support),
+        route_policies=route_policies,
         canvas_bottom=height / grid,
     )
     layout = LayoutPlan(
@@ -1383,10 +2119,12 @@ def _build_semantic_plan(
     components: list[LayoutComponent],
     pin_map: dict[tuple[str, str], LayoutPin],
     net_to_pins: dict[str, list[tuple[str, str]]],
+    *,
+    route_policies: tuple[RoutePolicyHint, ...] = (),
 ) -> TopologySemanticPlan:
     component_by_id = {component.id: component for component in components}
     net_classes = {net: classify_net(net) for net in net_to_pins}
-    local_terminals = _local_terminal_intents(component_by_id, pin_map, net_classes)
+    local_terminals = _local_terminal_intents(component_by_id, pin_map, net_classes, net_to_pins, route_policies)
     return TopologySemanticPlan(
         net_classes=net_classes,
         local_terminals=tuple(local_terminals),
@@ -1401,6 +2139,8 @@ def _local_terminal_intents(
     component_by_id: dict[str, LayoutComponent],
     pin_map: dict[tuple[str, str], LayoutPin],
     net_classes: dict[str, NetClass],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    route_policies: tuple[RoutePolicyHint, ...],
 ) -> list[LocalTerminalIntent]:
     terminals: list[LocalTerminalIntent] = []
     for (component_id, pin_name), pin in sorted(pin_map.items()):
@@ -1420,7 +2160,139 @@ def _local_terminal_intents(
                 preferred_direction=preferred_terminal_direction(pin.net),
             )
         )
+    terminal_keys = {(terminal.component_id, terminal.pin_name) for terminal in terminals}
+    for key in _monitor_signal_terminal_keys(component_by_id, pin_map):
+        if key in terminal_keys:
+            continue
+        pin = pin_map.get(key)
+        component = component_by_id.get(key[0])
+        if pin is None or component is None:
+            continue
+        terminals.append(
+            LocalTerminalIntent(
+                component_id=key[0],
+                pin_name=key[1],
+                net=pin.net,
+                terminal_type="signal_label",
+                label=component.label or pin.net,
+                preferred_direction="left" if component.orientation in {"left", "west"} else "right",
+            )
+        )
+        terminal_keys.add(key)
+    for key in _ecg_auxiliary_signal_terminal_keys(component_by_id, pin_map):
+        if key in terminal_keys:
+            continue
+        pin = pin_map.get(key)
+        if pin is None:
+            continue
+        terminals.append(
+            LocalTerminalIntent(
+                component_id=key[0],
+                pin_name=key[1],
+                net=pin.net,
+                terminal_type="signal_label",
+                label=_ecg_signal_terminal_label(pin.net),
+                preferred_direction="left" if pin.side == "left" else "right",
+            )
+        )
+        terminal_keys.add(key)
+    for key in _auxiliary_signal_terminal_keys(net_to_pins, pin_map, component_by_id, route_policies):
+        if key in terminal_keys:
+            continue
+        pin = pin_map.get(key)
+        if pin is None:
+            continue
+        terminals.append(
+            LocalTerminalIntent(
+                component_id=key[0],
+                pin_name=key[1],
+                net=pin.net,
+                terminal_type="signal_label",
+                label=pin.net,
+                preferred_direction="left" if pin.side == "left" else "right",
+            )
+        )
     return terminals
+
+
+def _monitor_signal_terminal_keys(
+    component_by_id: dict[str, LayoutComponent],
+    pin_map: dict[tuple[str, str], LayoutPin],
+) -> set[tuple[str, str]]:
+    result: set[tuple[str, str]] = set()
+    for component in component_by_id.values():
+        if not _is_output_layout(component) or not _is_monitor_output(component):
+            continue
+        for pin_name in component.pins:
+            if (component.id, pin_name) in pin_map:
+                result.add((component.id, pin_name))
+    return result
+
+
+def _ecg_auxiliary_signal_terminal_keys(
+    component_by_id: dict[str, LayoutComponent],
+    pin_map: dict[tuple[str, str], LayoutPin],
+) -> set[tuple[str, str]]:
+    ids = set(component_by_id)
+    if not {"A1", "A2", "A3", "A4", "A_AUX"} <= ids:
+        return set()
+    result: set[tuple[str, str]] = set()
+    for key, pin in pin_map.items():
+        component = component_by_id.get(key[0])
+        if component is None:
+            continue
+        if pin.net in {"right_leg_drive", "aux_out", "v3_cm"} and _is_output_layout(component):
+            result.add(key)
+            continue
+        if pin.net == "v3_cm" and component.id in {"A_AUX", "RF_AUX"}:
+            result.add(key)
+    return result
+
+
+def _ecg_signal_terminal_label(net: str) -> str:
+    return {"v3_cm": "V3", "right_leg_drive": "Vo", "aux_out": "v_out"}.get(net, net)
+
+
+def _auxiliary_signal_terminal_keys(
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    component_by_id: dict[str, LayoutComponent],
+    route_policies: tuple[RoutePolicyHint, ...],
+) -> set[tuple[str, str]]:
+    result: set[tuple[str, str]] = set()
+    components = list(component_by_id.values())
+    for net, connected in net_to_pins.items():
+        pins = [pin_map[key] for key in connected]
+        policy = _policy_for_net_with_context(
+            net,
+            route_policies,
+            semantic=None,
+            pins=pins,
+            components=components,
+        )
+        if policy != "bottom_auxiliary_corridor":
+            continue
+        result.update(_local_auxiliary_signal_terminal_keys(connected, pin_map, component_by_id))
+    return result
+
+
+def _local_auxiliary_signal_terminal_keys(
+    connected: list[tuple[str, str]],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    component_by_id: dict[str, LayoutComponent],
+) -> set[tuple[str, str]]:
+    pins = [pin_map[key] for key in connected]
+    driver = _bottom_auxiliary_opamp_driver(pins, component_by_id)
+    if driver is None:
+        return set()
+    local_branches = _local_feedback_branches_for_output_net(driver, pins, component_by_id)
+    if not local_branches:
+        return set()
+    corridor_branches = [pin for pin in pins if pin is not driver and pin not in local_branches]
+    auxiliary_receivers = _auxiliary_opamp_input_branches(corridor_branches, component_by_id)
+    if not auxiliary_receivers or len(auxiliary_receivers) != len(corridor_branches):
+        return set()
+    return {(pin.component_id, pin.pin_name) for pin in auxiliary_receivers}
 
 
 def _semantic_stages(components: list[LayoutComponent]) -> list[Stage]:
@@ -1711,7 +2583,55 @@ def _labels_for_components(
                 bbox=BBox(x - width / 2.0, y - height / 2.0, width, height),
             )
         )
-    return labels
+    return _nudge_labels_from_component_bodies(labels, components)
+
+
+def _nudge_labels_from_component_bodies(
+    labels: list[LayoutLabel],
+    components: list[LayoutComponent],
+) -> list[LayoutLabel]:
+    result: list[LayoutLabel] = []
+    for label in labels:
+        adjusted = label
+        for blocker in components:
+            if blocker.id == adjusted.owner_id or not adjusted.bbox.intersects(blocker.bbox, padding=0.02):
+                continue
+            adjusted = min(
+                _label_body_avoidance_candidates(adjusted, blocker),
+                key=lambda candidate: _label_body_overlap_score(candidate, adjusted, components),
+            )
+        result.append(adjusted)
+    return result
+
+
+def _label_body_avoidance_candidates(label: LayoutLabel, blocker: LayoutComponent) -> list[LayoutLabel]:
+    gap = 0.12
+    half_w = label.bbox.width / 2.0
+    half_h = label.bbox.height / 2.0
+    return [
+        _moved_label(label, label.x, blocker.bbox.y - half_h - gap),
+        _moved_label(label, label.x, blocker.bbox.bottom + half_h + gap),
+        _moved_label(label, blocker.bbox.x - half_w - gap, label.y),
+        _moved_label(label, blocker.bbox.right + half_w + gap, label.y),
+    ]
+
+
+def _label_body_overlap_score(label: LayoutLabel, original: LayoutLabel, components: list[LayoutComponent]) -> float:
+    overlap_count = sum(
+        1
+        for component in components
+        if component.id != label.owner_id and label.bbox.intersects(component.bbox, padding=0.02)
+    )
+    return overlap_count * 100.0 + abs(label.x - original.x) + abs(label.y - original.y)
+
+
+def _moved_label(label: LayoutLabel, x: float, y: float) -> LayoutLabel:
+    return replace(
+        label,
+        x=x,
+        y=y,
+        bbox=BBox(x - label.bbox.width / 2.0, y - label.bbox.height / 2.0, label.bbox.width, label.bbox.height),
+    )
 
 
 def _default_label_offset(component: LayoutComponent) -> tuple[float, float]:
@@ -1767,6 +2687,14 @@ def _route_wires(
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
             continue
+        local_signal_keys = _local_signal_terminal_keys(semantic) | _local_auxiliary_signal_terminal_keys(
+            connected,
+            pin_map,
+            {component.id: component for component in components or []},
+        )
+        wire_connected = [key for key in connected if key not in local_signal_keys]
+        if len(wire_connected) < 2:
+            continue
         policy = _policy_for_net_with_context(
             net,
             route_policies,
@@ -1776,15 +2704,15 @@ def _route_wires(
         )
         if policy == "bottom_auxiliary_corridor":
             route = _bottom_auxiliary_corridor_route(
-                [pin_map[key] for key in connected],
+                [pin_map[key] for key in wire_connected],
                 components or [],
                 net=net,
                 canvas_bottom=canvas_bottom,
             )
         elif policy in {"top_feedback_corridor", "bottom_feedback_corridor"}:
-            route = _feedback_corridor_route([pin_map[key] for key in connected], components or [], policy=policy)
+            route = _feedback_corridor_route([pin_map[key] for key in wire_connected], components or [], policy=policy)
         else:
-            route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in connected])
+            route = _generic_route([Point(pin_map[key].x, pin_map[key].y) for key in wire_connected])
         if not route:
             continue
         wires.append(
@@ -1792,7 +2720,7 @@ def _route_wires(
                 net=net,
                 points=_finalize_route(
                     net,
-                    connected,
+                    wire_connected,
                     route,
                     pin_map,
                     semantic=semantic,
@@ -1800,7 +2728,7 @@ def _route_wires(
                     labels=labels,
                     preferred_policy=policy,
                 ),
-                connected_pins=connected,
+                connected_pins=wire_connected,
             )
         )
     return wires
@@ -1889,7 +2817,38 @@ def _policy_for_net_with_context(
         and not any(_is_opamp_output_pin(pin.pin_name) for pin in pins)
     ):
         return _feedback_corridor_policy_for_pins(pins, components)
+    if _is_auxiliary_sense_net(net, pins, components):
+        return "bottom_auxiliary_corridor"
     return None
+
+
+def _is_auxiliary_sense_net(net: str, pins: list[LayoutPin], components: list[LayoutComponent]) -> bool:
+    if len(pins) < 3 or not any(_is_opamp_output_pin(pin.pin_name) for pin in pins):
+        return False
+    component_by_id = {component.id: component for component in components}
+    driver_ids = {
+        pin.component_id
+        for pin in pins
+        if _is_opamp_output_pin(pin.pin_name)
+        and _is_opamp_layout(component_by_id.get(pin.component_id, _null_component()))
+    }
+    if not driver_ids:
+        return False
+    net_key = _key(net)
+    for pin in pins:
+        if pin.component_id in driver_ids or not _is_opamp_input_pin(pin):
+            continue
+        component = component_by_id.get(pin.component_id)
+        if component is None or not _is_opamp_layout(component):
+            continue
+        identity = _key(" ".join(filter(None, [component.id, component.type, component.label, component.value, component.role])))
+        if _is_auxiliary_identity(identity) or _is_auxiliary_identity(net_key):
+            return True
+    return False
+
+
+def _is_auxiliary_identity(value: str) -> bool:
+    return any(token in value for token in ("right_leg", "rld", "driven_right_leg", "auxiliary", "common_mode", "cmfb"))
 
 
 def _has_explicit_feedback_passive(net: str, pins: list[LayoutPin], components: list[LayoutComponent]) -> bool:
@@ -2059,13 +3018,29 @@ def _local_feedback_branches_for_output_net(
         if pin is driver:
             continue
         component = component_by_id.get(pin.component_id)
-        if component is None or not _is_resistor_layout(component):
+        if component is None:
             continue
-        if "feedback" not in _key(component.role):
+        if component.id == driver.component_id and _is_opamp_layout(component) and _is_opamp_input_pin(pin):
+            branches.append(pin)
+            continue
+        if not _is_resistor_layout(component):
+            continue
+        role_key = _key(component.role)
+        if any(token in role_key for token in ("drive", "output", "load")):
+            continue
+        if "feedback" not in role_key and not _is_local_output_passive_branch(driver, pin, component):
             continue
         if window_left <= pin.x <= window_right and window_top <= pin.y <= window_bottom:
             branches.append(pin)
     return branches
+
+
+def _is_local_output_passive_branch(driver: LayoutPin, pin: LayoutPin, component: LayoutComponent) -> bool:
+    if pin.x < driver.x - 0.2:
+        return False
+    if component.bbox.x > driver.x + 3.2:
+        return False
+    return abs(pin.y - driver.y) < 0.9
 
 
 def _opamp_output_bottom_auxiliary_route(
@@ -2080,7 +3055,7 @@ def _opamp_output_bottom_auxiliary_route(
     driver_point = Point(driver.x, driver.y)
     route = [driver_point]
     for branch in sorted(local_branches, key=lambda pin: (abs(pin.y - driver.y), pin.x, pin.component_id, pin.pin_name)):
-        route.extend(_local_output_feedback_branch(driver, branch))
+        route.extend(_local_output_branch(driver, branch, components))
     if not corridor_branches:
         return route
 
@@ -2095,11 +3070,145 @@ def _opamp_output_bottom_auxiliary_route(
     corridor_y = bottom + _bottom_auxiliary_corridor_offset(net)
     corridor_y = _avoid_bottom_corridor_blockers(corridor_y, corridor_pins, components)
     corridor_y = _fit_bottom_corridor_to_canvas(corridor_y, net, canvas_bottom)
-    trunk_x = driver.x + 0.54
-    route.extend([Point(trunk_x, driver.y), Point(trunk_x, corridor_y)])
+    auxiliary_receivers = _auxiliary_opamp_input_branches(corridor_branches, component_by_id)
+    if auxiliary_receivers and len(auxiliary_receivers) == len(corridor_branches):
+        return route
+    if auxiliary_receivers:
+        route.extend(_auxiliary_sense_corridor_departure(driver, local_branches, corridor_branches, components, corridor_y))
+    else:
+        trunk_x = driver.x + 0.54
+        route.extend([Point(trunk_x, driver.y), Point(trunk_x, corridor_y)])
     for pin in sorted(corridor_branches, key=lambda pin: (pin.x, pin.y, pin.component_id, pin.pin_name)):
         route.extend(_bottom_corridor_branch_route(pin, corridor_y, components))
     return route
+
+
+def _local_output_branch(driver: LayoutPin, branch: LayoutPin, components: list[LayoutComponent]) -> list[Point]:
+    component_by_id = {component.id: component for component in components}
+    branch_component = component_by_id.get(branch.component_id)
+    if (
+        branch.component_id == driver.component_id
+        and branch_component is not None
+        and _is_opamp_layout(branch_component)
+        and _is_opamp_input_pin(branch)
+    ):
+        return _local_opamp_output_input_branch(driver, branch, components)
+    return _local_output_feedback_branch(driver, branch)
+
+
+def _local_opamp_output_input_branch(
+    driver: LayoutPin,
+    branch: LayoutPin,
+    components: list[LayoutComponent],
+) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    branch_point = Point(branch.x, branch.y)
+    bend_y = (
+        max(0.55, driver.y - OPAMP_HALF_HEIGHT - 0.18)
+        if branch.y <= driver.y
+        else driver.y + OPAMP_HALF_HEIGHT + 0.18
+    )
+    right_x = _driver_clear_departure_x(driver, components, bend_y)
+    left_x = branch.x - 0.58
+    return [
+        Point(right_x, driver.y),
+        Point(right_x, bend_y),
+        Point(left_x, bend_y),
+        Point(left_x, branch.y),
+        branch_point,
+        Point(left_x, branch.y),
+        Point(left_x, bend_y),
+        Point(right_x, bend_y),
+        Point(right_x, driver.y),
+        driver_point,
+    ]
+
+
+def _auxiliary_opamp_input_branches(
+    branches: list[LayoutPin],
+    component_by_id: dict[str, LayoutComponent],
+) -> list[LayoutPin]:
+    return [
+        pin
+        for pin in branches
+        if _is_opamp_input_pin(pin)
+        and (component := component_by_id.get(pin.component_id)) is not None
+        and _is_opamp_layout(component)
+        and _is_auxiliary_identity(_key(" ".join(filter(None, [component.id, component.type, component.label, component.value, component.role]))))
+    ]
+
+
+def _auxiliary_sense_corridor_departure(
+    driver: LayoutPin,
+    local_branches: list[LayoutPin],
+    corridor_branches: list[LayoutPin],
+    components: list[LayoutComponent],
+    corridor_y: float,
+) -> list[Point]:
+    component_by_id = {component.id: component for component in components}
+    involved_components = [
+        component_by_id[pin.component_id]
+        for pin in [driver, *local_branches]
+        if pin.component_id in component_by_id
+    ]
+    top_y = max(0.45, min([component.bbox.y for component in involved_components] + [driver.y]) - 0.86)
+    departure_x = _driver_clear_departure_x(driver, components, top_y)
+    trunk_x = _auxiliary_sense_trunk_x(driver, local_branches, corridor_branches, components, component_by_id, top_y, corridor_y)
+    return [
+        Point(departure_x, driver.y),
+        Point(departure_x, top_y),
+        Point(trunk_x, top_y),
+        Point(trunk_x, corridor_y),
+    ]
+
+
+def _driver_clear_departure_x(driver: LayoutPin, components: list[LayoutComponent], target_y: float) -> float:
+    desired = driver.x + 0.58
+    limit = desired
+    top = min(driver.y, target_y)
+    bottom = max(driver.y, target_y)
+    for component in components:
+        if component.id == driver.component_id or component.bbox.x < driver.x - 0.02:
+            continue
+        if _intervals_overlap(top, bottom, component.bbox.y - 0.04, component.bbox.bottom + 0.04):
+            limit = min(limit, component.bbox.x - 0.1)
+    return max(driver.x + 0.1, limit)
+
+
+def _auxiliary_sense_trunk_x(
+    driver: LayoutPin,
+    local_branches: list[LayoutPin],
+    corridor_branches: list[LayoutPin],
+    components: list[LayoutComponent],
+    component_by_id: dict[str, LayoutComponent],
+    top_y: float,
+    corridor_y: float,
+) -> float:
+    left_lane_candidates = [
+        component.bbox.x - 0.8
+        for component in components
+        if component.bbox.x < driver.x
+        and _intervals_overlap(top_y, corridor_y, component.bbox.y - 0.08, component.bbox.bottom + 0.08)
+    ]
+    if left_lane_candidates:
+        return max(0.45, min(left_lane_candidates))
+
+    local_right = max(
+        [driver.x + 0.9]
+        + [
+            component_by_id[pin.component_id].bbox.right + 0.62
+            for pin in local_branches
+            if pin.component_id in component_by_id and pin.component_id != driver.component_id
+        ]
+    )
+    receiver_approaches = [
+        _opamp_input_approach(pin).x
+        for pin in corridor_branches
+        if _is_opamp_input_pin(pin)
+    ]
+    if not receiver_approaches:
+        return local_right
+    return max(local_right, min(receiver_approaches))
 
 
 def _local_output_feedback_branch(driver: LayoutPin, branch: LayoutPin) -> list[Point]:
@@ -2533,9 +3642,18 @@ def _route_known_motif(
     routes = builder(pin_map, net_to_pins)
     if routes is None:
         return None
+    protected_route_nets = _protected_known_route_nets(motif_key, pin_map)
     wires: list[LayoutWire] = []
     for net, connected in sorted(net_to_pins.items()):
         if _net_is_terminalized(net, semantic):
+            continue
+        local_signal_keys = _local_signal_terminal_keys(semantic) | _local_auxiliary_signal_terminal_keys(
+            connected,
+            pin_map,
+            {component.id: component for component in components or []},
+        )
+        wire_connected = [key for key in connected if key not in local_signal_keys]
+        if len(wire_connected) < 2:
             continue
         policy = _policy_for_net_with_context(
             net,
@@ -2544,26 +3662,28 @@ def _route_known_motif(
             pins=[pin_map[key] for key in connected],
             components=components or [],
         )
-        if policy == "bottom_auxiliary_corridor":
+        if net in protected_route_nets:
+            route = routes.get(net)
+        elif policy == "bottom_auxiliary_corridor":
             route = _bottom_auxiliary_corridor_route(
-                [pin_map[key] for key in connected],
+                [pin_map[key] for key in wire_connected],
                 components or [],
                 net=net,
                 canvas_bottom=canvas_bottom,
             )
         elif policy in {"top_feedback_corridor", "bottom_feedback_corridor"}:
-            route = _feedback_corridor_route([pin_map[key] for key in connected], components or [], policy=policy)
+            route = _feedback_corridor_route([pin_map[key] for key in wire_connected], components or [], policy=policy)
         else:
             route = routes.get(net)
         if route is None:
-            route = _generic_route([_point(pin_map, key) for key in connected])
+            route = _generic_route([_point(pin_map, key) for key in wire_connected])
         if route:
             wires.append(
                 LayoutWire(
                     net=net,
                     points=_finalize_route(
                         net,
-                        connected,
+                        wire_connected,
                         route,
                         pin_map,
                         semantic=semantic,
@@ -2571,10 +3691,47 @@ def _route_known_motif(
                         labels=labels,
                         preferred_policy=policy,
                     ),
-                    connected_pins=connected,
+                    connected_pins=wire_connected,
                 )
             )
     return wires
+
+
+def _protected_known_route_nets(motif_key: str, pin_map: dict[tuple[str, str], LayoutPin]) -> set[str]:
+    if motif_key != "op_amp_network":
+        return set()
+    required_components = {"A1", "A2", "A3", "A4", "A_AUX", "C1", "R6", "C2", "R_RL"}
+    if not required_components <= {component_id for component_id, _ in pin_map}:
+        return set()
+    return {
+        "lead_plus",
+        "lead_minus",
+        "v2",
+        "a2_out",
+        "a1_inv",
+        "a2_inv",
+        "a3_minus",
+        "a3_plus",
+        "v4_raw",
+        "v4_ac",
+        "a4_minus",
+        "a4_feedback_node",
+        "v5",
+        "v3_cm",
+        "aux_out",
+        "right_leg_drive",
+        "right_leg_electrode",
+    }
+
+
+def _local_signal_terminal_keys(semantic: TopologySemanticPlan | None) -> set[tuple[str, str]]:
+    if semantic is None:
+        return set()
+    return {
+        (terminal.component_id, terminal.pin_name)
+        for terminal in semantic.local_terminals
+        if terminal.terminal_type == "signal_label"
+    }
 
 
 def _net_is_terminalized(net: str, semantic: TopologySemanticPlan | None) -> bool:
@@ -2765,7 +3922,7 @@ def _op_amp_network_routes(
     pin_map: dict[tuple[str, str], LayoutPin],
     net_to_pins: dict[str, list[tuple[str, str]]],
 ) -> dict[str, list[Point]] | None:
-    routes: dict[str, list[Point]] = {}
+    routes: dict[str, list[Point]] = _ecg_frontend_routes(pin_map, net_to_pins) or {}
     max_pin_x = max(pin.x for pin in pin_map.values())
     min_pin_y = min(pin.y for pin in pin_map.values())
     max_pin_y = max(pin.y for pin in pin_map.values())
@@ -2774,6 +3931,8 @@ def _op_amp_network_routes(
     top_gutter = max(0.75, min_pin_y - 0.6)
     bottom_gutter = max_pin_y + 0.6
     for net, connected in net_to_pins.items():
+        if net in routes:
+            continue
         pins = [pin_map[key] for key in connected]
         if _net_has_ground_pin(pins):
             routes[net] = _op_amp_ground_route(pins, right_gutter=ground_gutter)
@@ -2811,6 +3970,14 @@ def _op_amp_network_routes(
                 top_gutter=top_gutter,
                 bottom_gutter=bottom_gutter,
             )
+            continue
+        if driver:
+            routes[net] = _op_amp_output_passive_route(
+                driver,
+                [pin for pin in pins if pin is not driver],
+                top_gutter=top_gutter,
+                bottom_gutter=bottom_gutter,
+            )
     return routes
 
 
@@ -2839,6 +4006,148 @@ def _single_input_mid_x(source: LayoutPin, receiver: LayoutPin, approach: Point)
         ratio = 0.62 if receiver.y < source.y else 0.4
     mid_x = left + span * ratio
     return max(left + 0.42, min(right - 0.42, mid_x))
+
+
+def _ecg_frontend_routes(
+    pin_map: dict[tuple[str, str], LayoutPin],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+) -> dict[str, list[Point]] | None:
+    required_components = {"A1", "A2", "A3", "A4", "A_AUX", "C1", "R6", "C2", "R_RL"}
+    if not required_components <= {component_id for component_id, _ in pin_map}:
+        return None
+
+    def point(component_id: str, net: str) -> Point | None:
+        for key in net_to_pins.get(net, []):
+            if key[0] == component_id:
+                return _point(pin_map, key)
+        return None
+
+    def pin(component_id: str, net: str) -> LayoutPin | None:
+        for key in net_to_pins.get(net, []):
+            if key[0] == component_id:
+                return pin_map[key]
+        return None
+
+    def driver_branches(driver_component: str, driver_net: str, branch_components: list[str], *, trunk_dx: float = 0.62) -> list[Point] | None:
+        driver = point(driver_component, driver_net)
+        branches = [point(component_id, driver_net) for component_id in branch_components]
+        branches = [branch for branch in branches if branch is not None]
+        if driver is None or not branches:
+            return None
+        trunk = Point(driver.x + trunk_dx, driver.y)
+        route = [driver, trunk]
+        for branch in sorted(branches, key=lambda item: (abs(item.y - driver.y), item.x)):
+            tap = Point(trunk.x, branch.y)
+            route.extend([tap, branch, tap, trunk])
+        route.append(driver)
+        return route
+
+    def input_fanout(input_component: str, net: str, receiver_component: str, *, approach_dx: float = 0.65) -> list[Point] | None:
+        source = point(input_component, net)
+        receiver = point(receiver_component, net)
+        if source is None or receiver is None:
+            return None
+        approach = Point(receiver.x - approach_dx, receiver.y)
+        return [source, Point(approach.x, source.y), approach, receiver]
+
+    def input_bus(net: str, receiver_component: str, branch_components: list[str], *, bus_dx: float = 0.72) -> list[Point] | None:
+        receiver = point(receiver_component, net)
+        branches = [point(component_id, net) for component_id in branch_components]
+        branches = [branch for branch in branches if branch is not None]
+        if receiver is None or not branches:
+            return None
+        bus = Point(receiver.x - bus_dx, receiver.y)
+        route = [receiver, bus]
+        for branch in sorted(branches, key=lambda item: (abs(item.y - receiver.y), item.x)):
+            tap = Point(bus.x, branch.y)
+            route.extend([tap, branch, tap, bus])
+        return route
+
+    def upper_feedback_bus(net: str, receiver_component: str, upper_component: str, lower_components: list[str], *, bus_dx: float = 0.72) -> list[Point] | None:
+        receiver = point(receiver_component, net)
+        upper = point(upper_component, net)
+        lowers = [point(component_id, net) for component_id in lower_components]
+        lowers = [branch for branch in lowers if branch is not None]
+        if receiver is None or upper is None:
+            return None
+        bus = Point(receiver.x - bus_dx, receiver.y)
+        corridor_y = max(0.85, min(receiver.y, upper.y) - 0.48)
+        route = [receiver, bus]
+        for branch in sorted(lowers, key=lambda item: (abs(item.y - receiver.y), item.x)):
+            tap = Point(bus.x, branch.y)
+            route.extend([tap, branch, tap, bus])
+        route.extend(
+            [
+                Point(bus.x, corridor_y),
+                Point(upper.x, corridor_y),
+                upper,
+                Point(upper.x, corridor_y),
+                Point(bus.x, corridor_y),
+                bus,
+            ]
+        )
+        return route
+
+    def passive_bus(net: str, component_ids: list[str], *, bus_x: float | None = None, bus_y: float | None = None) -> list[Point] | None:
+        points = [point(component_id, net) for component_id in component_ids]
+        points = [item for item in points if item is not None]
+        if len(points) < 2:
+            return None
+        hub = Point(
+            bus_x if bus_x is not None else median(item.x for item in points),
+            bus_y if bus_y is not None else median(item.y for item in points),
+        )
+        route = [hub]
+        for item in sorted(points, key=lambda value: (value.x, value.y)):
+            tap = Point(hub.x, item.y)
+            route.extend([tap, item, tap, hub])
+        return route
+
+    def horizontal_chain(net: str, component_ids: list[str], *, snap_tolerance: float = 0.12) -> list[Point] | None:
+        points = [point(component_id, net) for component_id in component_ids]
+        points = [item for item in points if item is not None]
+        if len(points) < 2:
+            return None
+        y = median(item.y for item in points)
+        if max(abs(item.y - y) for item in points) <= snap_tolerance:
+            points = [Point(item.x, y) for item in points]
+        return sorted(points, key=lambda item: (item.x, item.y))
+
+    def direct_between(net: str, first_component: str, second_component: str) -> list[Point] | None:
+        first = point(first_component, net)
+        second = point(second_component, net)
+        if first is None or second is None:
+            return None
+        return [first, second]
+
+    routes: dict[str, list[Point]] = {}
+    maybe_routes = {
+        "lead_plus": input_fanout("E_PLUS", "lead_plus", "A1", approach_dx=1.45),
+        "lead_minus": input_fanout("E_MINUS", "lead_minus", "A2", approach_dx=1.45),
+        "v2": driver_branches("A1", "v2", ["R2_TOP", "RA_TOP", "R3_MINUS"]),
+        "a2_out": driver_branches("A2", "a2_out", ["R2_BOT", "RA_BOT", "R3_PLUS"]),
+        "a1_inv": upper_feedback_bus("a1_inv", "A1", "R2_TOP", ["R1_GAIN"]),
+        "a2_inv": input_bus("a2_inv", "A2", ["R2_BOT", "R1_GAIN"]),
+        "a3_minus": input_bus("a3_minus", "A3", ["R3_MINUS", "R4_FEEDBACK_A3"]),
+        "a3_plus": input_bus("a3_plus", "A3", ["R3_PLUS", "R4_PLUS_GND"]),
+        "v4_raw": driver_branches("A3", "v4_raw", ["R4_FEEDBACK_A3", "C1"]),
+        "v4_ac": horizontal_chain("v4_ac", ["C1", "S1", "R7_BIAS_A4", "A4"]),
+        "a4_minus": input_bus("a4_minus", "A4", ["R7_A4_MINUS"]),
+        "a4_feedback_node": passive_bus(
+            "a4_feedback_node",
+            ["R5", "R7_A4_MINUS", "R6", "C2"],
+            bus_x=point("R7_A4_MINUS", "a4_feedback_node").x if point("R7_A4_MINUS", "a4_feedback_node") else None,
+        ),
+        "v5": driver_branches("A4", "v5", ["R6", "C2", "V5_OUT"], trunk_dx=0.72),
+        "v3_cm": direct_between("v3_cm", "RA_TOP", "RA_BOT"),
+        "aux_out": driver_branches("A_AUX", "aux_out", ["RO_AUX"]),
+        "right_leg_drive": passive_bus("right_leg_drive", ["RF_AUX", "RO_AUX", "R_RL"], bus_y=(point("RO_AUX", "right_leg_drive").y + 0.85) if point("RO_AUX", "right_leg_drive") else None),
+        "right_leg_electrode": passive_bus("right_leg_electrode", ["R_RL", "RL_ELECTRODE"]),
+    }
+    for net, route in maybe_routes.items():
+        if route is not None:
+            routes[net] = _dedupe(route)
+    return routes
 
 
 def _op_amp_ground_route(pins: list[LayoutPin], *, right_gutter: float) -> list[Point]:
@@ -2978,6 +4287,42 @@ def _op_amp_output_route(
                     driver_point,
                 ]
             )
+    return route
+
+
+def _op_amp_output_passive_route(
+    driver: LayoutPin,
+    branches: list[LayoutPin],
+    *,
+    top_gutter: float,
+    bottom_gutter: float,
+) -> list[Point]:
+    driver_point = Point(driver.x, driver.y)
+    if not branches:
+        return [driver_point]
+    departure_x = driver.x + 0.62
+    route = [driver_point, Point(departure_x, driver.y)]
+    for branch in sorted(branches, key=lambda pin: (abs(pin.y - driver.y), pin.x, pin.y)):
+        branch_point = Point(branch.x, branch.y)
+        if abs(branch.y - driver.y) < 0.18 and branch.x >= driver.x:
+            route.extend([branch_point, Point(departure_x, driver.y)])
+            continue
+        if branch.y < driver.y:
+            lane_y = top_gutter if branch.y < driver.y - 2.5 else branch.y - 0.38
+        else:
+            lane_y = bottom_gutter if branch.y > driver.y + 2.5 else branch.y + 0.38
+        tap_x = branch.x
+        route.extend(
+            [
+                Point(departure_x, lane_y),
+                Point(tap_x, lane_y),
+                branch_point,
+                Point(tap_x, lane_y),
+                Point(departure_x, lane_y),
+                Point(departure_x, driver.y),
+            ]
+        )
+    route.append(driver_point)
     return route
 
 
@@ -3261,7 +4606,11 @@ def _is_output_layout(component: LayoutComponent) -> bool:
 
 def _is_terminal_layout(component: LayoutComponent) -> bool:
     key = _key(component.type)
-    return key in {"input", "output", "input_terminal", "voltage_source", "source"} or "source" in key
+    if key in {"input", "output", "input_terminal"}:
+        return True
+    if key in {"voltage_source", "current_source", "source"} or "source" in key:
+        return len(component.pins) <= 1
+    return False
 
 
 def _is_explicit_terminal_component(component: LayoutComponent) -> bool:

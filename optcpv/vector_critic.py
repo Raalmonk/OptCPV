@@ -16,7 +16,8 @@ MAX_VIEWBOX_AREA = 1_200_000
 
 def critique_layout(layout: LayoutPlan) -> CriticReport:
     violations: list[CriticViolation] = []
-    component_bbox = _union([component.bbox for component in layout.components])
+    visible_components = _visible_components(layout)
+    component_bbox = _union([component.bbox for component in visible_components])
     fill_ratio = component_bbox.area() / max(1.0, (layout.width / layout.grid) * (layout.height / layout.grid))
     wire_length = _total_wire_length(layout)
     avg_distance = _average_component_distance(layout)
@@ -56,7 +57,7 @@ def critique_layout(layout: LayoutPlan) -> CriticReport:
 
 
 def _component_overlaps(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
-    for left, right in combinations(layout.components, 2):
+    for left, right in combinations(_visible_components(layout), 2):
         if left.bbox.intersects(right.bbox, padding=0.05):
             violations.append(
                 CriticViolation(
@@ -70,10 +71,14 @@ def _component_overlaps(layout: LayoutPlan, violations: list[CriticViolation]) -
 
 
 def _label_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
+    hidden_component_ids = {component.id for component in _hidden_signal_label_components(layout)}
+    visible_components = _visible_components(layout)
     for label in layout.labels:
+        if label.owner_id in hidden_component_ids:
+            continue
         if label.bbox.x < 0 or label.bbox.y < 0 or label.bbox.right > layout.width / layout.grid or label.bbox.bottom > layout.height / layout.grid:
             violations.append(CriticViolation("label_outside_canvas", f"{label.id} is outside canvas.", 12, subject=label.id))
-        for component in layout.components:
+        for component in visible_components:
             if component.id != label.owner_id and label.bbox.intersects(component.bbox, padding=0.05):
                 violations.append(
                     CriticViolation("label_component_overlap", f"{label.id} overlaps {component.id}.", 16, subject=label.id)
@@ -84,6 +89,7 @@ def _label_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> 
 
 
 def _wire_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
+    visible_components = _visible_components(layout)
     for wire in layout.wires:
         for start, end in zip(wire.points, wire.points[1:]):
             if not is_axis_aligned(start, end):
@@ -96,7 +102,7 @@ def _wire_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> N
                         subject=wire.net,
                     )
                 )
-        for component in layout.components:
+        for component in visible_components:
             connected = {component_id for component_id, _ in wire.connected_pins}
             if component.id in connected:
                 continue
@@ -297,6 +303,8 @@ def _feedback_semantic_violations(layout: LayoutPlan, violations: list[CriticVio
         feedback_nets = {output_net, *input_nets}
         for wire in layout.wires:
             if wire.net not in feedback_nets:
+                continue
+            if wire.net == output_net and output_net not in input_nets:
                 continue
             if not _polyline_intersects_bbox_interior(wire.points, _opamp_body_bbox(opamp)):
                 continue
@@ -514,6 +522,24 @@ def _is_terminal_net_class(net_class: NetClass) -> bool:
 
 def _component_by_id(layout: LayoutPlan, component_id: str) -> LayoutComponent | None:
     return next((component for component in layout.components if component.id == component_id), None)
+
+
+def _visible_components(layout: LayoutPlan) -> list[LayoutComponent]:
+    hidden_ids = {component.id for component in _hidden_signal_label_components(layout)}
+    return [component for component in layout.components if component.id not in hidden_ids]
+
+
+def _hidden_signal_label_components(layout: LayoutPlan) -> list[LayoutComponent]:
+    hidden_ids = {
+        terminal.component_id
+        for terminal in layout.semantic.local_terminals
+        if terminal.terminal_type == "signal_label"
+    }
+    return [
+        component
+        for component in layout.components
+        if component.id in hidden_ids and _is_explicit_terminal_component(component)
+    ]
 
 
 def _is_explicit_terminal_component(component: LayoutComponent) -> bool:

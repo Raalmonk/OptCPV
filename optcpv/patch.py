@@ -38,11 +38,19 @@ class SetWirePoints:
 
 
 @dataclass(frozen=True)
+class SetRoutePolicy:
+    net: str
+    policy: str
+    net_role: str = "feedback"
+
+
+@dataclass(frozen=True)
 class LayoutPatch:
     move_component: list[MoveComponent] = field(default_factory=list)
     move_label: list[MoveLabel] = field(default_factory=list)
     set_orientation: list[SetOrientation] = field(default_factory=list)
     set_wire_points: list[SetWirePoints] = field(default_factory=list)
+    set_route_policy: list[SetRoutePolicy] = field(default_factory=list)
 
 
 def apply_patch(circuit: Circuit, layout: LayoutPlan, patch: LayoutPatch) -> LayoutPlan:
@@ -63,7 +71,8 @@ def apply_patch(circuit: Circuit, layout: LayoutPlan, patch: LayoutPatch) -> Lay
         _move_label(label, label_moves[label.id]) if label.id in label_moves else label
         for label in layout.labels
     ]
-    candidate = replace(layout, components=components, labels=labels)
+    support = _support_with_route_policies(layout, patch.set_route_policy)
+    candidate = replace(layout, components=components, labels=labels, support=support)
     candidate = rebuild_layout_geometry(candidate)
 
     if patch.set_wire_points:
@@ -80,6 +89,42 @@ def apply_patch(circuit: Circuit, layout: LayoutPlan, patch: LayoutPatch) -> Lay
     assert_no_diagonal_wires(candidate)
     _reject_scale_hack(layout, candidate)
     return candidate
+
+
+def _support_with_route_policies(layout: LayoutPlan, policies: list[SetRoutePolicy]):
+    if not policies:
+        return layout.support
+    planning_hints = dict(layout.support.planning_hints or {})
+    raw_policies = planning_hints.get("route_policies", [])
+    route_policies = [dict(item) for item in raw_policies if isinstance(item, dict)]
+    by_net = {
+        str(item.get("net")): item
+        for item in route_policies
+        if item.get("net") is not None
+    }
+    ordered_nets = [str(item.get("net")) for item in route_policies if item.get("net") is not None]
+    for policy in policies:
+        item = {"net": policy.net, "net_role": policy.net_role, "policy": policy.policy}
+        if policy.net not in by_net:
+            ordered_nets.append(policy.net)
+        by_net[policy.net] = item
+    replaced = []
+    emitted: set[str] = set()
+    for item in route_policies:
+        net = item.get("net")
+        if net is None:
+            replaced.append(item)
+            continue
+        net_key = str(net)
+        if net_key in by_net and net_key not in emitted:
+            replaced.append(by_net[net_key])
+            emitted.add(net_key)
+    for net in ordered_nets:
+        if net not in emitted and net in by_net:
+            replaced.append(by_net[net])
+            emitted.add(net)
+    planning_hints["route_policies"] = replaced
+    return replace(layout.support, planning_hints=planning_hints)
 
 
 def _move_label(label: LayoutLabel, move: MoveLabel) -> LayoutLabel:

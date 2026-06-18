@@ -247,6 +247,162 @@ class MotifHint:
             members=tuple(str(item) for item in raw.get("members", ())),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"motif_type": self.motif_type, "members": list(self.members)}
+
+
+@dataclass(frozen=True)
+class BlockHint:
+    block_id: str
+    block_type: str
+    members: tuple[str, ...] = field(default_factory=tuple)
+    stage_x: int = 0
+    lane_y: int = 0
+    ports: dict[str, str] = field(default_factory=dict)
+    route_policy: str | None = None
+
+    def __post_init__(self) -> None:
+        policy = None if self.route_policy is None else str(self.route_policy)
+        if policy is not None and policy not in ROUTE_POLICIES:
+            raise ValueError(f"Unknown block route policy {policy!r}.")
+        object.__setattr__(self, "block_id", str(self.block_id))
+        object.__setattr__(self, "block_type", str(self.block_type))
+        object.__setattr__(self, "members", tuple(str(item) for item in self.members))
+        object.__setattr__(self, "stage_x", int(self.stage_x))
+        object.__setattr__(self, "lane_y", int(self.lane_y))
+        object.__setattr__(self, "ports", {str(key): str(value) for key, value in self.ports.items()})
+        object.__setattr__(self, "route_policy", policy)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "BlockHint":
+        if not isinstance(raw, dict):
+            raise ValueError("BlockHint must be an object.")
+        ports = raw.get("ports", {})
+        if not isinstance(ports, dict):
+            raise ValueError("BlockHint.ports must be an object.")
+        return cls(
+            block_id=str(raw.get("block_id", raw.get("id", ""))),
+            block_type=str(raw.get("block_type", raw.get("type", ""))),
+            members=tuple(str(item) for item in raw.get("members", ())),
+            stage_x=int(raw.get("stage_x", raw.get("stage", 0))),
+            lane_y=int(raw.get("lane_y", raw.get("lane", 0))),
+            ports={str(key): str(value) for key, value in ports.items()},
+            route_policy=_optional_str(raw.get("route_policy", raw.get("policy"))),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block_id": self.block_id,
+            "block_type": self.block_type,
+            "members": list(self.members),
+            "stage_x": self.stage_x,
+            "lane_y": self.lane_y,
+            "ports": dict(self.ports),
+            "route_policy": self.route_policy,
+        }
+
+
+@dataclass(frozen=True)
+class InterBlockRouteHint:
+    net: str
+    route_from: str
+    route_to: str
+    policy: str
+
+    def __post_init__(self) -> None:
+        policy = str(self.policy)
+        if policy not in ROUTE_POLICIES:
+            raise ValueError(f"Unknown inter-block route policy {policy!r}.")
+        object.__setattr__(self, "net", str(self.net))
+        object.__setattr__(self, "route_from", str(self.route_from))
+        object.__setattr__(self, "route_to", str(self.route_to))
+        object.__setattr__(self, "policy", policy)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "InterBlockRouteHint":
+        if not isinstance(raw, dict):
+            raise ValueError("InterBlockRouteHint must be an object.")
+        return cls(
+            net=str(raw.get("net", "")),
+            route_from=str(raw.get("from", raw.get("source", ""))),
+            route_to=str(raw.get("to", raw.get("target", ""))),
+            policy=str(raw.get("policy", "left_to_right_manhattan")),
+        )
+
+    def to_route_policy(self) -> RoutePolicyHint:
+        return RoutePolicyHint(net=self.net, net_role="inter_block", policy=self.policy)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"net": self.net, "from": self.route_from, "to": self.route_to, "policy": self.policy}
+
+
+@dataclass(frozen=True)
+class AuxiliaryLoopHint:
+    loop_id: str
+    loop_type: str
+    members: tuple[str, ...] = field(default_factory=tuple)
+    nets: tuple[str, ...] = field(default_factory=tuple)
+    route_policy: str = "bottom_auxiliary_corridor"
+
+    def __post_init__(self) -> None:
+        if self.route_policy not in ROUTE_POLICIES:
+            raise ValueError(f"Unknown auxiliary loop route policy {self.route_policy!r}.")
+        object.__setattr__(self, "loop_id", str(self.loop_id))
+        object.__setattr__(self, "loop_type", str(self.loop_type))
+        object.__setattr__(self, "members", tuple(str(item) for item in self.members))
+        object.__setattr__(self, "nets", tuple(str(item) for item in self.nets))
+        object.__setattr__(self, "route_policy", str(self.route_policy))
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "AuxiliaryLoopHint":
+        if not isinstance(raw, dict):
+            raise ValueError("AuxiliaryLoopHint must be an object.")
+        return cls(
+            loop_id=str(raw.get("loop_id", raw.get("id", ""))),
+            loop_type=str(raw.get("loop_type", raw.get("type", ""))),
+            members=tuple(str(item) for item in raw.get("members", ())),
+            nets=tuple(str(item) for item in raw.get("nets", ())),
+            route_policy=str(raw.get("route_policy", raw.get("policy", "bottom_auxiliary_corridor"))),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "loop_id": self.loop_id,
+            "loop_type": self.loop_type,
+            "members": list(self.members),
+            "nets": list(self.nets),
+            "route_policy": self.route_policy,
+        }
+
+
+@dataclass(frozen=True)
+class OrientationOverrideHint:
+    component_id: str
+    orientation: str
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "component_id", str(self.component_id))
+        object.__setattr__(self, "orientation", _normalize_orientation(self.orientation))
+        object.__setattr__(self, "reason", str(self.reason))
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "OrientationOverrideHint":
+        if not isinstance(raw, dict):
+            raise ValueError("OrientationOverrideHint must be an object.")
+        return cls(
+            component_id=str(raw.get("component_id", raw.get("id", ""))),
+            orientation=str(raw.get("orientation", "RIGHT")),
+            reason=str(raw.get("reason", "")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "component_id": self.component_id,
+            "orientation": self.orientation.upper(),
+            "reason": self.reason,
+        }
+
 
 @dataclass(frozen=True, init=False)
 class SchematicLayoutHints:
@@ -261,6 +417,11 @@ class SchematicLayoutHints:
     source: str
     routing_rules: tuple[str, ...]
     motifs: tuple[MotifHint, ...]
+    blocks: tuple[BlockHint, ...]
+    block_internal_motifs: tuple[MotifHint, ...]
+    inter_block_routes: tuple[InterBlockRouteHint, ...]
+    auxiliary_loops: tuple[AuxiliaryLoopHint, ...]
+    orientation_overrides: tuple[OrientationOverrideHint, ...]
 
     def __init__(
         self,
@@ -278,6 +439,11 @@ class SchematicLayoutHints:
         placement_hints: dict[str, GridPlacementHint] | None = None,
         routing_rules: tuple[str, ...] | list[str] | None = None,
         motifs: tuple[MotifHint, ...] | list[MotifHint] | None = None,
+        blocks: tuple[BlockHint, ...] | list[BlockHint] | None = None,
+        block_internal_motifs: tuple[MotifHint, ...] | list[MotifHint] | None = None,
+        inter_block_routes: tuple[InterBlockRouteHint, ...] | list[InterBlockRouteHint] | None = None,
+        auxiliary_loops: tuple[AuxiliaryLoopHint, ...] | list[AuxiliaryLoopHint] | None = None,
+        orientation_overrides: tuple[OrientationOverrideHint, ...] | list[OrientationOverrideHint] | None = None,
     ) -> None:
         use_stages = stages if stages is not None else stage_order
         use_placements = list(placements or ())
@@ -298,6 +464,11 @@ class SchematicLayoutHints:
         object.__setattr__(self, "source", use_source)
         object.__setattr__(self, "routing_rules", tuple(str(item) for item in (routing_rules or ())))
         object.__setattr__(self, "motifs", tuple(motifs or ()))
+        object.__setattr__(self, "blocks", tuple(blocks or ()))
+        object.__setattr__(self, "block_internal_motifs", tuple(block_internal_motifs or ()))
+        object.__setattr__(self, "inter_block_routes", tuple(inter_block_routes or ()))
+        object.__setattr__(self, "auxiliary_loops", tuple(auxiliary_loops or ()))
+        object.__setattr__(self, "orientation_overrides", tuple(orientation_overrides or ()))
 
     @property
     def stage_order(self) -> tuple[StageHint, ...]:
@@ -313,6 +484,11 @@ class SchematicLayoutHints:
             raise ValueError("SchematicLayoutHints must be a JSON object.")
         placements = _placements_from_raw(raw)
         route_policies = tuple(RoutePolicyHint.from_dict(item) for item in _list(raw.get("route_policies")))
+        inter_block_routes = tuple(InterBlockRouteHint.from_dict(item) for item in _list(raw.get("inter_block_routes")))
+        effective_route_policies = list(route_policies)
+        for route in inter_block_routes:
+            if not any(policy.net == route.net and policy.policy == route.policy for policy in effective_route_policies):
+                effective_route_policies.append(route.to_route_policy())
         routing_rules = tuple(str(item) for item in raw.get("routing_rules", ()) if item is not None)
         return cls(
             recognized_topology=str(raw.get("recognized_topology", "")),
@@ -321,11 +497,16 @@ class SchematicLayoutHints:
             stages=tuple(StageHint.from_dict(item) for item in _list(raw.get("stages", raw.get("stage_order")))),
             lanes=tuple(LaneHint.from_dict(item) for item in _list(raw.get("lanes"))),
             placements=placements,
-            route_policies=route_policies,
+            route_policies=tuple(effective_route_policies),
             local_terminal_policy={str(k): str(v) for k, v in raw.get("local_terminal_policy", {}).items()},
             source=str(raw.get("source", "manual")),
             routing_rules=routing_rules,
             motifs=tuple(MotifHint.from_dict(item) for item in _list(raw.get("motifs"))),
+            blocks=tuple(BlockHint.from_dict(item) for item in _list(raw.get("blocks"))),
+            block_internal_motifs=tuple(MotifHint.from_dict(item) for item in _list(raw.get("block_internal_motifs"))),
+            inter_block_routes=inter_block_routes,
+            auxiliary_loops=tuple(AuxiliaryLoopHint.from_dict(item) for item in _list(raw.get("auxiliary_loops"))),
+            orientation_overrides=tuple(OrientationOverrideHint.from_dict(item) for item in _list(raw.get("orientation_overrides"))),
         )
 
     @classmethod
@@ -345,6 +526,11 @@ class SchematicLayoutHints:
             source=updates.get("source", self.source),
             routing_rules=updates.get("routing_rules", self.routing_rules),
             motifs=updates.get("motifs", self.motifs),
+            blocks=updates.get("blocks", self.blocks),
+            block_internal_motifs=updates.get("block_internal_motifs", self.block_internal_motifs),
+            inter_block_routes=updates.get("inter_block_routes", self.inter_block_routes),
+            auxiliary_loops=updates.get("auxiliary_loops", self.auxiliary_loops),
+            orientation_overrides=updates.get("orientation_overrides", self.orientation_overrides),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -358,6 +544,13 @@ class SchematicLayoutHints:
             "route_policies": [policy.to_dict() for policy in self.route_policies],
             "local_terminal_policy": dict(self.local_terminal_policy),
             "source": self.source,
+            "routing_rules": list(self.routing_rules),
+            "motifs": [motif.to_dict() for motif in self.motifs],
+            "blocks": [block.to_dict() for block in self.blocks],
+            "block_internal_motifs": [motif.to_dict() for motif in self.block_internal_motifs],
+            "inter_block_routes": [route.to_dict() for route in self.inter_block_routes],
+            "auxiliary_loops": [loop.to_dict() for loop in self.auxiliary_loops],
+            "orientation_overrides": [override.to_dict() for override in self.orientation_overrides],
         }
 
     def to_json(self) -> str:

@@ -1,4 +1,5 @@
 from optcpv import Circuit, Component, GridPlacementHint, PlanningHints, SemanticPlanningClient, draw_artifact
+from optcpv.planning_agent import planning_client_from_env
 from optcpv.planner import plan_layout
 from optcpv.vector_critic import critique_layout
 
@@ -88,6 +89,14 @@ def test_public_artifact_api_works_without_planning_client() -> None:
 
     assert artifact.svg
     assert artifact.semantic_plan
+
+
+def test_env_gemini_planner_is_opt_in(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPTCPV_USE_GEMINI_PLANNER", raising=False)
+    monkeypatch.delenv("OPTCPV_PLANNING_CLIENT", raising=False)
+
+    assert planning_client_from_env() is None
 
 
 def _planning_fixture() -> Circuit:

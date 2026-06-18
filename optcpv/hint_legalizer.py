@@ -24,7 +24,7 @@ def legalize_planning_hints(circuit: Circuit, hints: SchematicLayoutHints) -> Sc
         return None
     if any(placement.component_id not in component_ids for placement in hints.placements):
         return None
-    if not _members_are_known(hints, component_ids):
+    if not _members_are_known(hints, component_ids, net_names):
         return None
     if not _route_policies_are_legal(hints, net_names):
         return None
@@ -44,7 +44,7 @@ def legalize_planning_hints(circuit: Circuit, hints: SchematicLayoutHints) -> Sc
     return hints.with_updates(placements=tuple(placements.values()), confidence=confidence)
 
 
-def _members_are_known(hints: SchematicLayoutHints, component_ids: set[str]) -> bool:
+def _members_are_known(hints: SchematicLayoutHints, component_ids: set[str], net_names: set[str]) -> bool:
     for stage in hints.stages:
         if set(stage.members) - component_ids:
             return False
@@ -53,6 +53,23 @@ def _members_are_known(hints: SchematicLayoutHints, component_ids: set[str]) -> 
             return False
     for motif in hints.motifs:
         if set(motif.members) - component_ids:
+            return False
+    for motif in hints.block_internal_motifs:
+        if set(motif.members) - component_ids:
+            return False
+    for block in hints.blocks:
+        if set(block.members) - component_ids:
+            return False
+        if set(block.ports.values()) - net_names:
+            return False
+    for route in hints.inter_block_routes:
+        if route.net not in net_names:
+            return False
+    for loop in hints.auxiliary_loops:
+        if set(loop.members) - component_ids or set(loop.nets) - net_names:
+            return False
+    for override in hints.orientation_overrides:
+        if override.component_id not in component_ids:
             return False
     return True
 

@@ -1,10 +1,12 @@
+from dataclasses import replace
 import xml.etree.ElementTree as ET
 
 from optcpv import draw_svg
 from optcpv.examples import EXAMPLES, instrumentation_amplifier
+from optcpv.models import LayoutWire, Point
 from optcpv.planner import plan_layout
 from optcpv.renderers.schemdraw_backend import FALLBACK_RENDERER_ID, SchemdrawRenderer
-from optcpv.renderers.svg_postprocess import render_layer_svg
+from optcpv.renderers.svg_postprocess import render_debug_svg, render_layer_svg
 
 
 def test_default_renderer_is_schemdraw_and_preserves_metadata() -> None:
@@ -52,3 +54,18 @@ def test_label_halo_preserves_label_metadata() -> None:
 
     assert 'data-label-id="label:U1"' in labels_svg
     assert 'class="label-halo"' in labels_svg
+
+
+def test_debug_renderer_draws_wire_crossing_as_jump_bridge() -> None:
+    layout = replace(
+        plan_layout(instrumentation_amplifier()),
+        wires=[
+            LayoutWire(net="horizontal", points=[Point(2.0, 2.0), Point(8.0, 2.0)], connected_pins=[]),
+            LayoutWire(net="vertical", points=[Point(5.0, 0.8), Point(5.0, 4.2)], connected_pins=[]),
+        ],
+    )
+    svg = render_debug_svg(layout)
+
+    assert '<path class="wire"' in svg
+    assert " Q " in svg
+    assert 'data-net-name="horizontal"' in svg

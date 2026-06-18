@@ -8,7 +8,7 @@ from io import StringIO
 from ..labels import component_display_label, display_label_text, wrap_label_lines
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LayoutWire, LocalTerminalIntent, Motif, Point
 from ..segments import junction_points, merged_axis_aligned_segments
-from .svg_postprocess import inject_metadata, render_debug_svg, _set_root_attr
+from .svg_postprocess import draw_wires_with_jumps, inject_metadata, render_debug_svg, _set_root_attr
 
 
 FALLBACK_RENDERER_ID = "optcpv.debug_svg_after_schemdraw_error"
@@ -113,11 +113,22 @@ class SchemdrawRenderer:
             return _first_attr(elm, ["ResistorIEC", "Resistor"])
         if "capacitor" in key or key.startswith("c"):
             return _first_attr(elm, ["Capacitor"])
+        if "inductor" in key or key.startswith("l"):
+            return _first_attr(elm, ["Inductor"])
+        if "diode" in key:
+            return _first_attr(elm, ["Photodiode", "Diode"]) if "photo" in key else _first_attr(elm, ["Diode"])
+        if "switch" in key or key.startswith("sw"):
+            return _first_attr(elm, ["Switch"])
         if _is_filter_block(component):
             return None
         if key in {"ground", "gnd"}:
             return _first_attr(elm, ["GroundSignal", "Ground"])
-        if key in {"input", "output", "voltage_source", "source", "input_terminal"} or "source" in key:
+        if _is_physical_source(component):
+            if "current" in key:
+                return _first_attr(elm, ["SourceI", "Source"])
+            if "voltage" in key or key == "source":
+                return _first_attr(elm, ["SourceV", "Source"])
+        if key in {"input", "output", "input_terminal"} or ("source" in key and len(component.pins) <= 1):
             return _first_attr(elm, ["Dot"])
         return _first_attr(elm, ["Rect", "Dot"])
 
@@ -604,8 +615,7 @@ def _visible_wires_svg(layout: LayoutPlan) -> str:
         '<g id="optcpv-visible-wires" fill="none" stroke="#111827" stroke-width="2.4" '
         'stroke-linecap="round" stroke-linejoin="round">'
     ]
-    for wire in layout.wires:
-        parts.append(draw_signal_route(layout, wire))
+    parts.append(draw_wires_with_jumps(layout, class_name=""))
     parts.append("</g>")
     parts.append('<g id="optcpv-visible-junctions" fill="#111827" stroke="none">')
     for wire in layout.wires:
@@ -640,6 +650,8 @@ def draw_local_supply_or_ground(layout: LayoutPlan, terminal: LocalTerminalInten
         return ""
     direction = terminal.preferred_direction
     label = terminal.label or terminal.net
+    if terminal.terminal_type == "signal_label":
+        return _draw_signal_label_terminal(layout, terminal, pin, label)
     if terminal.terminal_type == "positive_supply":
         return _draw_supply_terminal(layout, terminal, Point(pin.x, pin.y), label, up=True)
     if terminal.terminal_type == "negative_supply":
@@ -649,6 +661,35 @@ def draw_local_supply_or_ground(layout: LayoutPlan, terminal: LocalTerminalInten
 
 def draw_resistor_to_ground_leg(layout: LayoutPlan, terminal: LocalTerminalIntent) -> str:
     return draw_local_supply_or_ground(layout, terminal)
+
+
+def _draw_signal_label_terminal(
+    layout: LayoutPlan,
+    terminal: LocalTerminalIntent,
+    pin,
+    label: str,
+) -> str:
+    direction = -1 if terminal.preferred_direction == "left" or (terminal.preferred_direction not in {"right", "left"} and pin.side == "left") else 1
+    x0 = pin.x * layout.grid
+    y = pin.y * layout.grid
+    x1 = (pin.x + direction * 0.52) * layout.grid
+    label_x = (pin.x + direction * 0.66) * layout.grid
+    label_y = y - 7.5
+    anchor = "end" if direction < 0 else "start"
+    return "\n".join(
+        [
+            f'<g class="optcpv-local-terminal" data-local-terminal="true" '
+            f'data-component-id="{escape(terminal.component_id)}" data-pin-name="{escape(terminal.pin_name)}" '
+            f'data-net-name="{escape(terminal.net)}" data-terminal-type="{escape(terminal.terminal_type)}">',
+            f'<line x1="{x0:.1f}" y1="{y:.1f}" x2="{x1:.1f}" y2="{y:.1f}" '
+            'stroke="#111827" stroke-width="2.2" stroke-linecap="round"/>',
+            f'<circle cx="{x0:.1f}" cy="{y:.1f}" r="3.8" fill="#ffffff" stroke="#111827" stroke-width="1.8"/>',
+            f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" dominant-baseline="auto" '
+            'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
+            f"{escape(label)}</text>",
+            "</g>",
+        ]
+    )
 
 
 def draw_filter_block(layout: LayoutPlan, component: LayoutComponent) -> str:
@@ -819,6 +860,8 @@ def _terminal_owner_is_filter_block(layout: LayoutPlan, terminal: LocalTerminalI
 
 
 def _is_redundant_terminal_component(layout: LayoutPlan, component: LayoutComponent) -> bool:
+    if _has_signal_label_terminal(layout, component) and _is_signal_label_terminal_component(component):
+        return True
     if not _is_standalone_terminal_component(component):
         return False
     nets = set(component.pins.values())
@@ -828,9 +871,28 @@ def _is_redundant_terminal_component(layout: LayoutPlan, component: LayoutCompon
     return bool(nets & local_nets)
 
 
+def _has_signal_label_terminal(layout: LayoutPlan, component: LayoutComponent) -> bool:
+    return any(
+        terminal.component_id == component.id and terminal.terminal_type == "signal_label"
+        for terminal in layout.semantic.local_terminals
+    )
+
+
+def _is_physical_source(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return len(component.pins) >= 2 and (
+        key in {"voltage_source", "current_source", "source"} or "source" in key
+    )
+
+
 def _is_standalone_terminal_component(component: LayoutComponent) -> bool:
     key = _key(component.type)
     return key in {"ground", "gnd", "supply", "power", "vcc", "vdd", "vee", "vss"}
+
+
+def _is_signal_label_terminal_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    return key in {"input", "output", "input_terminal"} or _is_standalone_terminal_component(component)
 
 
 def _terminal_owner_is_resistor(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
