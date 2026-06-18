@@ -51,10 +51,12 @@ GRID = 48
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 800
 CANVAS_EDGE_PADDING = 0.55
+GEMINI_PLANNING_SCORE_MARGIN = 20.0
 NATIVE_MOTIFS = {
     "voltage_divider",
     "rc_low_pass",
     "non_inverting_op_amp",
+    "two_electrode_voltage_clamp",
     "instrumentation_amplifier",
     "bridge_or_wheatstone",
 }
@@ -99,6 +101,7 @@ def _plan_layout_deterministic(native: Circuit) -> LayoutPlan:
         "voltage_divider": _plan_voltage_divider,
         "rc_low_pass": _plan_rc_low_pass,
         "non_inverting_op_amp": _plan_non_inverting_op_amp,
+        "two_electrode_voltage_clamp": _plan_two_electrode_voltage_clamp,
         "instrumentation_amplifier": _plan_instrumentation_amplifier,
         "bridge_or_wheatstone": _plan_bridge,
         "op_amp_network": _plan_op_amp_network,
@@ -210,6 +213,56 @@ def _plan_non_inverting_op_amp(circuit: Circuit) -> LayoutPlan:
         placements,
         ["motif: non_inverting_op_amp"],
         support=_native_motif_support("non_inverting_op_amp"),
+    )
+
+
+def _plan_two_electrode_voltage_clamp(circuit: Circuit) -> LayoutPlan:
+    placements: dict[str, tuple[float, float, str]] = {}
+    label_offsets: dict[str, tuple[float, float]] = {}
+    opamp = _first(circuit, _is_opamp)
+    ground = _first(circuit, _is_ground)
+    command = _first(circuit, lambda item: item.id == "VC") or _first(circuit, _is_input_or_source)
+    membrane = _first(circuit, lambda item: item.id == "VM")
+    amp_output = _first(circuit, lambda item: item.id == "VO")
+    resistors = [component for component in circuit.components if _is_type(component, "resistor")]
+    membrane_resistor = _first(
+        circuit,
+        lambda item: _is_type(item, "resistor") and ("rm" in _key(item.id) or "membrane" in _key(item.label)),
+    ) or (resistors[0] if resistors else None)
+    output_resistor = _first(
+        circuit,
+        lambda item: _is_type(item, "resistor") and ("ro" in _key(item.id) or "output" in _key(item.label)),
+    ) or (next((item for item in resistors if item != membrane_resistor), None))
+
+    if command:
+        placements[command.id] = (3.9, 7.125, "right")
+        label_offsets[command.id] = (-0.15, -0.42)
+    if opamp:
+        placements[opamp.id] = (8.5, 6.5, "right")
+        label_offsets[opamp.id] = (0.65, -1.65)
+    if output_resistor:
+        placements[output_resistor.id] = (14.0, 4.95, "down")
+        label_offsets[output_resistor.id] = (0.78, 0.08)
+    if membrane_resistor:
+        placements[membrane_resistor.id] = (14.0, 8.35, "down")
+        label_offsets[membrane_resistor.id] = (0.78, 0.08)
+    if membrane:
+        placements[membrane.id] = (17.3, 7.2, "right")
+        label_offsets[membrane.id] = (0.35, -0.28)
+    if amp_output:
+        placements[amp_output.id] = (17.3, 5.25, "right")
+        label_offsets[amp_output.id] = (0.35, -0.28)
+    if ground:
+        placements[ground.id] = (14.0, 11.05, "right")
+
+    return _build_layout(
+        circuit,
+        placements,
+        ["motif: two_electrode_voltage_clamp"],
+        width=920,
+        height=600,
+        label_offsets=label_offsets,
+        support=_native_motif_support("two_electrode_voltage_clamp"),
     )
 
 
@@ -1083,9 +1136,23 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
     candidate_overlaps = _violation_count(candidate_report, "component_overlap")
     if candidate_overlaps > base_overlaps:
         return None
-    if candidate_hard > base_hard or candidate_report.score > base_report.score:
+    if candidate_hard > base_hard:
+        return None
+    if candidate_report.score > base_report.score and not _gemini_planning_guidance_allowed(
+        legal_hints,
+        base_report.score,
+        candidate_report.score,
+    ):
         return None
     return candidate
+
+
+def _gemini_planning_guidance_allowed(hints: SchematicLayoutHints, base_score: float, candidate_score: float) -> bool:
+    if hints.source != "gemini":
+        return False
+    if not (hints.blocks or hints.route_policies or hints.inter_block_routes or hints.auxiliary_loops or hints.orientation_overrides):
+        return False
+    return candidate_score <= base_score + GEMINI_PLANNING_SCORE_MARGIN
 
 
 def _improve_hint_opamp_orientations(circuit: Circuit, layout: LayoutPlan) -> LayoutPlan:
@@ -1209,8 +1276,13 @@ def _hint_label_offsets(circuit: Circuit, hints: SchematicLayoutHints) -> dict[s
         "A3": (1.35, -1.05),
         "A4": (1.35, -1.05),
         "A_AUX": (1.35, -1.05),
-        "RA_TOP": (-0.9, -0.1),
-        "RA_BOT": (-0.9, 0.1),
+        "E_PLUS": (0.0, -0.45),
+        "E_MINUS": (0.0, 0.82),
+        "R2_TOP": (0.0, -0.28),
+        "R2_BOT": (0.0, 0.65),
+        "R1_GAIN": (-0.82, 0.0),
+        "RA_TOP": (0.88, -0.08),
+        "RA_BOT": (0.88, 0.08),
         "R7_A4_MINUS": (0.0, -0.95),
         "S1": (-0.95, 0.18),
         "R7_BIAS_A4": (1.05, -0.18),
@@ -1431,17 +1503,17 @@ def _place_ecg_frontend_blocks(
         return placements
     ids = {component.id: component for component in circuit.components}
     result = dict(placements)
-    top_y = 2.35
+    top_y = 2.65
     mid_y = 5.55
     bot_y = 8.75
     aux_y = min(span_y - 3.0, 12.0)
-    x0 = 1.2
     x1 = 4.2
-    xbuf = 8.6
-    x2 = 12.0
-    x3 = 16.9
-    x4 = min(span_x - 5.4, 20.5)
-    x5 = min(span_x - 1.4, 26.0)
+    gain_x = 8.15
+    sense_x = 9.85
+    x2 = 13.0
+    x3 = 18.2
+    x4 = min(span_x - 5.4, 22.0)
+    x5 = min(span_x - 1.4, 28.0)
 
     def put(component_id: str, x: float, y: float, orientation: str = "right") -> None:
         if component_id in components:
@@ -1450,13 +1522,13 @@ def _place_ecg_frontend_blocks(
     input_blocks = [block for block in hints.blocks if _block_key(block, ("differential", "input"))]
     input_members = _block_member_ids(input_blocks)
     if {"A1", "A2"} & input_members or any(component_id in input_members for component_id in ("E_PLUS", "E_MINUS")):
-        put("E_PLUS", x0, top_y + 0.35)
-        put("E_MINUS", x0, bot_y - 0.35)
-        put("A1", x1, top_y, "right_flip")
+        put("A1", x1, top_y, "right")
         put("A2", x1, bot_y, "right")
-        put("R2_TOP", xbuf + 0.4, top_y - 1.0, "left")
-        put("R2_BOT", xbuf + 0.4, bot_y + 1.7, "right")
-        put("R1_GAIN", x1 - 0.85, mid_y, "down")
+        put("E_PLUS", x1 - 0.9, top_y + OPAMP_INPUT_LEAD_Y)
+        put("E_MINUS", x1 - 0.9, bot_y + OPAMP_INPUT_LEAD_Y)
+        put("R2_TOP", gain_x, top_y + 0.85, "down")
+        put("R1_GAIN", gain_x, mid_y + 0.1, "down")
+        put("R2_BOT", gain_x, bot_y - 0.9, "down")
 
     common_mode_blocks = [
         block
@@ -1465,14 +1537,14 @@ def _place_ecg_frontend_blocks(
     ]
     common_members = _block_member_ids(common_mode_blocks) or {component.id for component in circuit.components if "common_mode" in _key(component.role)}
     if common_members:
-        put("RA_TOP", xbuf - 0.2, mid_y - 1.3, "down")
-        put("RA_BOT", xbuf - 0.2, mid_y + 1.3, "down")
+        put("RA_TOP", sense_x, mid_y - 1.35, "down")
+        put("RA_BOT", sense_x, mid_y + 0.85, "down")
 
     diff_blocks = [block for block in hints.blocks if _block_key(block, ("difference",)) or _block_has_member(block, "A3")]
     if diff_blocks:
         put("A3", x2, mid_y)
-        put("R3_MINUS", x2 - 1.8, mid_y - 0.62)
-        put("R3_PLUS", x2 - 1.8, mid_y + 0.62)
+        put("R3_MINUS", x2 - 1.25, mid_y - 0.62)
+        put("R3_PLUS", x2 - 1.25, mid_y + 0.62)
         put("R4_FEEDBACK_A3", x2 + 1.3, mid_y - 2.85, "left")
         put("R4_PLUS_GND", x2 - 1.8, mid_y + 3.05, "down")
 
@@ -1488,21 +1560,21 @@ def _place_ecg_frontend_blocks(
         put("R6", x4 + 0.9, mid_y - 3.0, "right")
         put("C2", x4 + 3.0, mid_y - 2.25, "right")
         put("R7_A4_MINUS", x4 - 1.7, mid_y - 0.62, "right")
-        put("R5", x4 - 0.9, mid_y + 4.05, "down")
+        put("R5", x4 - 3.25, mid_y - 3.0, "right")
         put("V5_OUT", x5, mid_y)
 
     aux_blocks = [block for block in hints.blocks if _block_key(block, ("auxiliary",)) or _block_key(block, ("right_leg",)) or _block_has_member(block, "A_AUX")]
     if aux_blocks:
         put("A_AUX", x2 - 1.2, aux_y)
-        put("RF_AUX", x2 + 2.7, aux_y - 2.8, "right")
+        put("RF_AUX", x2 + 2.7, aux_y - 1.9, "right")
         put("RO_AUX", x3 - 0.2, aux_y, "right")
-        put("R_RL", x3 + 2.2, aux_y, "right")
-        put("RL_ELECTRODE", x4 + 0.35, aux_y)
+        put("R_RL", x4 + 1.45, aux_y, "right")
+        put("RL_ELECTRODE", x5 - 1.2, aux_y)
         put("AUX_OUT_MON", x3 - 1.65, aux_y, "left")
         put("VO_MON", x3 + 0.9, aux_y + 0.85, "right")
-        put("V3_MON", xbuf - 0.2, mid_y, "left")
+        put("V3_MON", sense_x - 0.2, mid_y, "left")
 
-    put("V2_MON", xbuf - 0.35, top_y, "right")
+    put("V2_MON", sense_x - 0.35, top_y, "right")
     put("V4_MON", x3 - 1.25, mid_y, "right")
     put("GND", x5 - 0.7, min(span_y - 1.15, aux_y + 1.85))
     return result
@@ -3632,6 +3704,7 @@ def _route_known_motif(
         "voltage_divider": _voltage_divider_routes,
         "rc_low_pass": _rc_low_pass_routes,
         "non_inverting_op_amp": _non_inverting_op_amp_routes,
+        "two_electrode_voltage_clamp": _two_electrode_voltage_clamp_routes,
         "instrumentation_amplifier": _instrumentation_amplifier_routes,
         "bridge_or_wheatstone": _bridge_routes,
         "op_amp_network": _op_amp_network_routes,
@@ -3799,6 +3872,50 @@ def _non_inverting_op_amp_routes(
         "vout": [out, _p(pin_map, "VOUT", "in"), out, Point(out.x, _p(pin_map, "Rf", "a").y), _p(pin_map, "Rf", "a")],
         "vm": [_p(pin_map, "Rf", "b"), vm_left, minus, vm_left, rg_drop, _p(pin_map, "Rg", "a")],
         "gnd": [_p(pin_map, "Rg", "b"), _p(pin_map, "GND", "gnd")],
+    }
+
+
+def _two_electrode_voltage_clamp_routes(
+    pin_map: dict[tuple[str, str], LayoutPin],
+    net_to_pins: dict[str, list[tuple[str, str]]],
+) -> dict[str, list[Point]] | None:
+    required = [
+        ("VC", "out"),
+        ("DiffAmp", "+"),
+        ("DiffAmp", "-"),
+        ("DiffAmp", "out"),
+        ("R_o", "a"),
+        ("R_o", "b"),
+        ("R_m", "a"),
+        ("R_m", "b"),
+        ("VM", "in"),
+        ("VO", "in"),
+        ("GND", "gnd"),
+    ]
+    if not _has_pins(pin_map, required):
+        return None
+
+    amp_out = _p(pin_map, "DiffAmp", "out")
+    ro_top = _p(pin_map, "R_o", "a")
+    ro_bottom = _p(pin_map, "R_o", "b")
+    rm_top = _p(pin_map, "R_m", "a")
+    minus = _p(pin_map, "DiffAmp", "-")
+    vm_hub = Point(ro_bottom.x, minus.y)
+    vo_hub = Point(ro_top.x, amp_out.y)
+    return {
+        "Vc": [_p(pin_map, "VC", "out"), _p(pin_map, "DiffAmp", "+")],
+        "Vo": [amp_out, vo_hub, ro_top, vo_hub, _p(pin_map, "VO", "in")],
+        "Vm": [
+            ro_bottom,
+            Point(ro_bottom.x, vm_hub.y),
+            minus,
+            vm_hub,
+            Point(ro_bottom.x, rm_top.y),
+            rm_top,
+            Point(ro_bottom.x, vm_hub.y),
+            _p(pin_map, "VM", "in"),
+        ],
+        "0": [_p(pin_map, "R_m", "b"), _p(pin_map, "GND", "gnd")],
     }
 
 
@@ -4042,14 +4159,6 @@ def _ecg_frontend_routes(
         route.append(driver)
         return route
 
-    def input_fanout(input_component: str, net: str, receiver_component: str, *, approach_dx: float = 0.65) -> list[Point] | None:
-        source = point(input_component, net)
-        receiver = point(receiver_component, net)
-        if source is None or receiver is None:
-            return None
-        approach = Point(receiver.x - approach_dx, receiver.y)
-        return [source, Point(approach.x, source.y), approach, receiver]
-
     def input_bus(net: str, receiver_component: str, branch_components: list[str], *, bus_dx: float = 0.72) -> list[Point] | None:
         receiver = point(receiver_component, net)
         branches = [point(component_id, net) for component_id in branch_components]
@@ -4120,28 +4229,118 @@ def _ecg_frontend_routes(
             return None
         return [first, second]
 
+    def ia_output_spine(
+        driver_component: str,
+        driver_net: str,
+        gain_component: str,
+        sense_component: str,
+        load_component: str,
+    ) -> list[Point] | None:
+        driver = point(driver_component, driver_net)
+        gain = point(gain_component, driver_net)
+        sense = point(sense_component, driver_net)
+        load = point(load_component, driver_net)
+        if driver is None or gain is None or sense is None or load is None:
+            return None
+        trunk_x = min(sense.x, load.x) - 0.5
+        return [
+            driver,
+            Point(gain.x, driver.y),
+            gain,
+            Point(trunk_x, gain.y),
+            Point(trunk_x, sense.y),
+            sense,
+            Point(trunk_x, sense.y),
+            Point(trunk_x, load.y),
+            load,
+        ]
+
+    def ia_input_return(net: str, receiver_component: str, gain_components: list[str]) -> list[Point] | None:
+        receiver = point(receiver_component, net)
+        taps = [point(component_id, net) for component_id in gain_components]
+        taps = [tap for tap in taps if tap is not None]
+        if receiver is None or not taps:
+            return None
+        hub_x = median(tap.x for tap in taps)
+        hub_y = median(tap.y for tap in taps)
+        return_x = receiver.x - 1.4
+        route = [
+            receiver,
+            Point(return_x, receiver.y),
+            Point(return_x, hub_y),
+            Point(hub_x, hub_y),
+        ]
+        for tap in sorted(taps, key=lambda item: (abs(item.y - hub_y), item.x)):
+            route.extend([tap, Point(hub_x, hub_y)])
+        return route
+
+    def v3_common_mode_drop() -> list[Point] | None:
+        top = point("RA_TOP", "v3_cm")
+        bottom = point("RA_BOT", "v3_cm")
+        if top is None or bottom is None:
+            return None
+        node_x = min(top.x, bottom.x) - 0.85
+        node_y = median([top.y, bottom.y])
+        branches = [
+            branch
+            for branch in [
+                point("V3_MON", "v3_cm"),
+                point("RF_AUX", "v3_cm"),
+                point("A_AUX", "v3_cm"),
+            ]
+            if branch is not None
+        ]
+        route = [
+            top,
+            Point(top.x, node_y),
+            Point(node_x, node_y),
+            Point(bottom.x, node_y),
+            bottom,
+            Point(bottom.x, node_y),
+            Point(node_x, node_y),
+        ]
+        for branch in sorted(branches, key=lambda item: (item.y, item.x)):
+            tap = Point(node_x, branch.y)
+            route.extend([tap, branch, tap, Point(node_x, node_y)])
+        return route
+
+    def a4_feedback_shelf() -> list[Point] | None:
+        minus_leg = point("R7_A4_MINUS", "a4_feedback_node")
+        r5 = point("R5", "a4_feedback_node")
+        r6 = point("R6", "a4_feedback_node")
+        c2 = point("C2", "a4_feedback_node")
+        branches = [branch for branch in [r5, r6, c2] if branch is not None]
+        if minus_leg is None or not branches:
+            return None
+        hub = min(branches, key=lambda item: (item.y, abs(item.x - minus_leg.x)))
+        route = [minus_leg, Point(hub.x, minus_leg.y), hub]
+        for branch in sorted(branches, key=lambda item: (item.y, item.x)):
+            tap = Point(hub.x, branch.y)
+            route.extend([tap, branch, tap, hub])
+        return route
+
     routes: dict[str, list[Point]] = {}
     maybe_routes = {
-        "lead_plus": input_fanout("E_PLUS", "lead_plus", "A1", approach_dx=1.45),
-        "lead_minus": input_fanout("E_MINUS", "lead_minus", "A2", approach_dx=1.45),
-        "v2": driver_branches("A1", "v2", ["R2_TOP", "RA_TOP", "R3_MINUS"]),
-        "a2_out": driver_branches("A2", "a2_out", ["R2_BOT", "RA_BOT", "R3_PLUS"]),
-        "a1_inv": upper_feedback_bus("a1_inv", "A1", "R2_TOP", ["R1_GAIN"]),
-        "a2_inv": input_bus("a2_inv", "A2", ["R2_BOT", "R1_GAIN"]),
+        "lead_plus": direct_between("lead_plus", "E_PLUS", "A1"),
+        "lead_minus": direct_between("lead_minus", "E_MINUS", "A2"),
+        "v2": ia_output_spine("A1", "v2", "R2_TOP", "RA_TOP", "R3_MINUS"),
+        "a2_out": ia_output_spine("A2", "a2_out", "R2_BOT", "RA_BOT", "R3_PLUS"),
+        "a1_inv": ia_input_return("a1_inv", "A1", ["R2_TOP", "R1_GAIN"]),
+        "a2_inv": ia_input_return("a2_inv", "A2", ["R1_GAIN", "R2_BOT"]),
         "a3_minus": input_bus("a3_minus", "A3", ["R3_MINUS", "R4_FEEDBACK_A3"]),
         "a3_plus": input_bus("a3_plus", "A3", ["R3_PLUS", "R4_PLUS_GND"]),
         "v4_raw": driver_branches("A3", "v4_raw", ["R4_FEEDBACK_A3", "C1"]),
         "v4_ac": horizontal_chain("v4_ac", ["C1", "S1", "R7_BIAS_A4", "A4"]),
         "a4_minus": input_bus("a4_minus", "A4", ["R7_A4_MINUS"]),
-        "a4_feedback_node": passive_bus(
-            "a4_feedback_node",
-            ["R5", "R7_A4_MINUS", "R6", "C2"],
-            bus_x=point("R7_A4_MINUS", "a4_feedback_node").x if point("R7_A4_MINUS", "a4_feedback_node") else None,
-        ),
+        "a4_feedback_node": a4_feedback_shelf(),
         "v5": driver_branches("A4", "v5", ["R6", "C2", "V5_OUT"], trunk_dx=0.72),
-        "v3_cm": direct_between("v3_cm", "RA_TOP", "RA_BOT"),
+        "v3_cm": v3_common_mode_drop(),
         "aux_out": driver_branches("A_AUX", "aux_out", ["RO_AUX"]),
-        "right_leg_drive": passive_bus("right_leg_drive", ["RF_AUX", "RO_AUX", "R_RL"], bus_y=(point("RO_AUX", "right_leg_drive").y + 0.85) if point("RO_AUX", "right_leg_drive") else None),
+        "right_leg_drive": passive_bus(
+            "right_leg_drive",
+            ["RF_AUX", "RO_AUX", "R_RL"],
+            bus_y=point("RO_AUX", "right_leg_drive").y if point("RO_AUX", "right_leg_drive") else None,
+        ),
         "right_leg_electrode": passive_bus("right_leg_electrode", ["R_RL", "RL_ELECTRODE"]),
     }
     for net, route in maybe_routes.items():
@@ -4490,6 +4689,8 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "instrumentation_amplifier" and (opamps != 3 or resistors < 7):
         return None
+    if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
+        return None
     if motif == "non_inverting_op_amp" and (opamps != 1 or resistors < 2):
         return None
     if motif == "op_amp_network" and opamps < 2:
@@ -4516,6 +4717,9 @@ def _canonical_motif(value: str | None) -> str | None:
         "noninverting_op_amp": "non_inverting_op_amp",
         "noninverting_opamp": "non_inverting_op_amp",
         "noninv": "non_inverting_op_amp",
+        "tevc": "two_electrode_voltage_clamp",
+        "two_electrode_voltage_clamp": "two_electrode_voltage_clamp",
+        "twoelectrodevoltageclamp": "two_electrode_voltage_clamp",
         "instrumentation_amplifier": "instrumentation_amplifier",
         "instrumentation_amp": "instrumentation_amplifier",
         "in_amp": "instrumentation_amplifier",

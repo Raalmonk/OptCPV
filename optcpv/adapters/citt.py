@@ -19,9 +19,18 @@ def from_citt_payload(payload: dict[str, Any]) -> Circuit:
     output_node = _goal_output_node(payload)
     input_node = _first_source_node(raw_components, ground_node) or _first_non_ground_node(components, ground_node)
 
-    if input_node and not _has_terminal(components, input_node, "input"):
+    voltage_clamp_terminals_added = False
+    if _is_two_electrode_voltage_clamp(payload):
+        voltage_clamp_terminals_added = _add_voltage_clamp_terminals(
+            components,
+            raw_components,
+            ground_node=ground_node,
+            output_node=output_node,
+        )
+
+    if not voltage_clamp_terminals_added and input_node and not _has_terminal(components, input_node, "input"):
         components.insert(0, Component(id=_unique_id(components, "VIN"), type="input", pins={"out": input_node}, label="VIN"))
-    if output_node and not _has_terminal(components, output_node, "output"):
+    if not voltage_clamp_terminals_added and output_node and not _has_terminal(components, output_node, "output"):
         components.append(
             Component(id=_unique_id(components, "VOUT"), type="output", pins={"in": output_node}, label="VOUT")
         )
@@ -110,6 +119,93 @@ def _first_non_ground_node(components: list[Component], ground_node: str | None)
         for net in component.pins.values():
             if net != ground_node:
                 return net
+    return None
+
+
+def _is_two_electrode_voltage_clamp(payload: dict[str, Any]) -> bool:
+    motif = _key(_optional_str(payload.get("motif") or payload.get("topology") or payload.get("topology_id")))
+    return motif in {"two_electrode_voltage_clamp", "twoelectrodevoltageclamp", "tevc"}
+
+
+def _add_voltage_clamp_terminals(
+    components: list[Component],
+    raw_components: list[Any],
+    *,
+    ground_node: str | None,
+    output_node: str | None,
+) -> bool:
+    command_node, membrane_node, amplifier_output_node = _voltage_clamp_nets(
+        raw_components,
+        ground_node=ground_node,
+        output_node=output_node,
+    )
+    if not command_node or not membrane_node or not amplifier_output_node:
+        return False
+
+    if not _has_terminal(components, command_node, "input"):
+        components.insert(
+            0,
+            Component(id=_unique_id(components, "VC"), type="input", pins={"out": command_node}, label="V_c"),
+        )
+    if not _has_terminal(components, membrane_node, "output"):
+        components.append(
+            Component(id=_unique_id(components, "VM"), type="output", pins={"in": membrane_node}, label="V_m")
+        )
+    if not _has_terminal(components, amplifier_output_node, "output"):
+        components.append(
+            Component(id=_unique_id(components, "VO"), type="output", pins={"in": amplifier_output_node}, label="V_o")
+        )
+    return True
+
+
+def _voltage_clamp_nets(
+    raw_components: list[Any],
+    *,
+    ground_node: str | None,
+    output_node: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    all_nets: list[str] = []
+    for raw in raw_components:
+        if not isinstance(raw, dict):
+            continue
+        nodes = raw.get("nodes")
+        values = list(nodes.values()) if isinstance(nodes, dict) else nodes if isinstance(nodes, list) else []
+        all_nets.extend(str(node) for node in values)
+
+        component_type = _key(str(raw.get("type") or raw.get("kind") or ""))
+        if "op_amp" not in component_type and "opamp" not in component_type:
+            continue
+        if isinstance(nodes, dict):
+            command = _node_for_pin(nodes, ["+", "plus", "non_inverting", "noninverting", "vp", "vplus"])
+            membrane = _node_for_pin(nodes, ["-", "minus", "inverting", "vm", "vminus"])
+            output = _node_for_pin(nodes, ["out", "output", "vo"])
+            if command and membrane and output:
+                return command, membrane, output
+        elif isinstance(nodes, list) and len(nodes) >= 3:
+            return str(nodes[0]), str(nodes[1]), str(nodes[2])
+
+    return (
+        _find_named_net(all_nets, {"vc", "vcommand", "vcmd", "commandvoltage"}),
+        output_node or _find_named_net(all_nets, {"vm", "vmembrane", "membrane"}),
+        _find_named_net(all_nets, {"vo", "vout", "ampout", "amplifieroutput"}),
+    )
+
+
+def _node_for_pin(nodes: dict[Any, Any], keys: list[str]) -> str | None:
+    normalized = {_key(str(pin)): str(net) for pin, net in nodes.items()}
+    for key in keys:
+        value = normalized.get(_key(key))
+        if value:
+            return value
+    return None
+
+
+def _find_named_net(nets: list[str], names: set[str]) -> str | None:
+    for net in nets:
+        if net == "0":
+            continue
+        if _key(net) in names:
+            return net
     return None
 
 

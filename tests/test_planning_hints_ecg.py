@@ -1,4 +1,5 @@
 from dataclasses import replace
+from itertools import combinations
 
 from optcpv import (
     Circuit,
@@ -217,6 +218,21 @@ def test_visual_review_request_reroute_becomes_route_policy_patch() -> None:
     assert any(item["net"] == "ecg_out" for item in rerouted.support.planning_hints["route_policies"])
 
 
+def test_visual_review_can_request_orientation_patch() -> None:
+    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
+    review = VisualReview(
+        passed=False,
+        score=42,
+        recognized_topology="ecg",
+        patches=[VisualPatch(action="set_orientation", component_id="A3", orientation="RIGHT_FLIP")],
+    )
+
+    patch = layout_patch_from_visual_review(review, layout)
+
+    assert patch.set_orientation[0].component_id == "A3"
+    assert patch.set_orientation[0].orientation == "right_flip"
+
+
 def test_local_optimizer_searches_opamp_flip_candidates() -> None:
     circuit = ecg_rld_frontend()
     layout = plan_layout(circuit, planning_client=FakePlanningClient(ecg_rld_hints()))
@@ -373,6 +389,8 @@ def test_chapter6_ecg_monitor_labels_attach_to_source_nodes() -> None:
     assert components["V3_MON"].x < components["A3"].x
     assert components["AUX_OUT_MON"].x < components["RL_ELECTRODE"].x
     assert set(v3_wire.connected_pins) == {("RA_TOP", "b"), ("RA_BOT", "a")}
+    assert (layout.pin_map[("RF_AUX", "a")].x, layout.pin_map[("RF_AUX", "a")].y) in {point.as_tuple() for point in v3_wire.points}
+    assert (layout.pin_map[("A_AUX", "-")].x, layout.pin_map[("A_AUX", "-")].y) in {point.as_tuple() for point in v3_wire.points}
     assert ("A_AUX", "-", "V3") in v3_terminals
     assert ("RF_AUX", "a", "V3") in v3_terminals
 
@@ -382,6 +400,13 @@ def test_chapter6_ecg_auto_structural_fallback_without_external_hints() -> None:
     components = {component.id: component for component in layout.components}
     report = critique_layout(layout)
     v4_ac = next(wire for wire in layout.wires if wire.net == "v4_ac")
+    a4_feedback_node = next(wire for wire in layout.wires if wire.net == "a4_feedback_node")
+    a4_ground_pins = [
+        layout.pin_map[(terminal.component_id, terminal.pin_name)]
+        for terminal in layout.semantic.local_terminals
+        if terminal.terminal_type == "ground" and terminal.component_id in {"S1", "R7_BIAS_A4", "R5"}
+    ]
+    gain_spine = [components["R2_TOP"], components["R1_GAIN"], components["R2_BOT"]]
 
     assert "planning_hints: accepted" in layout.warnings
     assert layout.support.planning_hints["source"] == "deterministic"
@@ -389,8 +414,24 @@ def test_chapter6_ecg_auto_structural_fallback_without_external_hints() -> None:
     assert not any(violation.hard for violation in report.violations)
     assert components["A1"].x < components["A3"].x < components["A4"].x
     assert components["V3_MON"].x < components["A3"].x
+    assert all(component.orientation == "down" for component in gain_spine)
+    assert max(component.x for component in gain_spine) - min(component.x for component in gain_spine) <= 0.05
+    assert components["R2_TOP"].y < components["R1_GAIN"].y < components["R2_BOT"].y
+    assert components["R5"].orientation == "right"
+    assert components["R5"].y < components["A4"].y
+    assert max(point.y for point in a4_feedback_node.points) < min(point.y for point in v4_ac.points)
     assert v4_ac.points == sorted(v4_ac.points, key=lambda point: (point.x, point.y))
     assert len({round(point.y, 3) for point in v4_ac.points}) == 1
+    assert len(a4_ground_pins) == 3
+    assert all(abs(left.x - right.x) >= 0.75 or abs(left.y - right.y) >= 0.9 for left, right in combinations(a4_ground_pins, 2))
+
+
+def test_chapter6_ecg_planned_crossing_renders_as_jump_bridge() -> None:
+    artifact = draw_artifact(chapter6_ecg_frontend())
+
+    assert artifact.critic_report is not None
+    assert not artifact.critic_report["hard_fail"]
+    assert " Q " in artifact.svg
 
 
 def test_tutor_artifact_exposes_bounding_boxes_hints_and_explanation() -> None:

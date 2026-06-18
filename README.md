@@ -53,11 +53,11 @@ from optcpv import GeminiVisionClient, draw_optimized_artifact
 
 artifact = draw_optimized_artifact(
     circuit,
-    vision_client=GeminiVisionClient(model="gemini-3.5-flash"),
+    vision_client=GeminiVisionClient(model="gemini-pro-latest"),
 )
 ```
 
-The Gemini client sends the rendered schematic raster as PNG plus layout/topology metadata, and expects a topology-safe `LayoutPatch` JSON response. Patch validation still runs locally before any move is accepted.
+The Gemini clients default to Pro-family models. The vision client sends the rendered schematic raster as PNG plus layout/topology metadata, and expects a topology-safe `LayoutPatch` JSON response. Gemini may propose coordinated component moves, label moves, orientation changes, and route-corridor guidance; topology, terminal-net safety, canvas size, and scale-hack validation still run locally before any move is accepted.
 
 ## Public API
 

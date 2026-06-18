@@ -18,6 +18,9 @@ from .vector_critic import critique_layout
 from .visual_review import VisualReview, VisualReviewClient, layout_patch_from_visual_review
 from .vision_agent import VisionLayoutClient
 
+EXTERNAL_GUIDANCE_SCORE_MARGIN = 20.0
+EXTERNAL_GUIDANCE_SOURCES = {"visual_review", "vision"}
+
 
 def draw_optimized_svg(
     circuit: Circuit | dict,
@@ -239,7 +242,20 @@ def _evaluate_patch(
     candidate_reports = critique_parts(circuit, candidate_layout, candidate_layers.final_svg, layers=candidate_layers)
     hard_before = sum(1 for violation in current_reports.combined_report.violations if violation.hard)
     hard_after = sum(1 for violation in candidate_reports.combined_report.violations if violation.hard)
+    overlaps_before = _violation_count(current_reports.combined_report, "component_overlap")
+    overlaps_after = _violation_count(candidate_reports.combined_report, "component_overlap")
     accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5 or hard_after < hard_before
+    external_guidance_override = False
+    if not accepted and source in EXTERNAL_GUIDANCE_SOURCES:
+        external_guidance_override = _external_guidance_allowed(
+            current_reports.combined_report.score,
+            candidate_reports.combined_report.score,
+            hard_before,
+            hard_after,
+            overlaps_before,
+            overlaps_after,
+        )
+        accepted = external_guidance_override
     if accepted and visual_review is not None:
         candidate_layout = replace(
             candidate_layout,
@@ -253,11 +269,29 @@ def _evaluate_patch(
             "accepted": accepted,
             "hard_failures_before": hard_before,
             "hard_failures_after": hard_after,
+            "component_overlaps_before": overlaps_before,
+            "component_overlaps_after": overlaps_after,
+            "external_guidance_override": external_guidance_override,
         }
     )
     if not accepted:
         return None
     return candidate_layout, candidate_layers.final_svg, candidate_reports
+
+
+def _external_guidance_allowed(
+    score_before: float,
+    score_after: float,
+    hard_before: int,
+    hard_after: int,
+    overlaps_before: int,
+    overlaps_after: int,
+) -> bool:
+    if hard_after > hard_before:
+        return False
+    if overlaps_after > overlaps_before:
+        return False
+    return score_after <= score_before + EXTERNAL_GUIDANCE_SCORE_MARGIN
 
 
 def _evaluate_visual_review(

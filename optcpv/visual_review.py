@@ -10,12 +10,12 @@ import re
 from typing import Any
 
 from .models import Circuit, CriticReport, LayoutComponent, LayoutPin, LayoutPlan, NetClass
-from .patch import LayoutPatch, MoveComponent, MoveLabel, SetRoutePolicy
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, SetRoutePolicy
 from .raster import RasterImage
 
 
-VISUAL_PATCH_ACTIONS = {"move_component", "move_label", "assign_route_corridor", "request_reroute", "no_op"}
-DEFAULT_GEMINI_VISUAL_REVIEW_MODEL = "gemini-3.5-flash"
+VISUAL_PATCH_ACTIONS = {"move_component", "move_label", "set_orientation", "assign_route_corridor", "request_reroute", "no_op"}
+DEFAULT_GEMINI_VISUAL_REVIEW_MODEL = "gemini-pro-latest"
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,7 @@ class VisualPatch:
     label_id: str | None = None
     net: str | None = None
     corridor: str | None = None
+    orientation: str | None = None
     x: float | None = None
     y: float | None = None
     reason: str = ""
@@ -65,6 +66,7 @@ class VisualPatch:
             label_id=_optional_str(raw.get("label_id")),
             net=_optional_str(raw.get("net")),
             corridor=_optional_str(raw.get("corridor")),
+            orientation=_optional_str(raw.get("orientation")),
             x=_optional_float(raw.get("x")),
             y=_optional_float(raw.get("y")),
             reason=str(raw.get("reason", "")),
@@ -77,6 +79,7 @@ class VisualPatch:
             "label_id": self.label_id,
             "net": self.net,
             "corridor": self.corridor,
+            "orientation": self.orientation,
             "x": self.x,
             "y": self.y,
             "reason": self.reason,
@@ -211,6 +214,7 @@ def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) ->
     label_ids = {label.id for label in layout.labels}
     move_components: list[MoveComponent] = []
     move_labels: list[MoveLabel] = []
+    orientations: list[SetOrientation] = []
     route_policies: list[SetRoutePolicy] = []
 
     for patch in review.patches:
@@ -218,13 +222,29 @@ def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) ->
             move_components.append(MoveComponent(patch.component_id, patch.x, patch.y))
         elif patch.action == "move_label" and patch.label_id in label_ids and patch.x is not None and patch.y is not None:
             move_labels.append(MoveLabel(patch.label_id, patch.x, patch.y))
+        elif patch.action == "set_orientation" and patch.component_id in component_ids:
+            orientation = _normalize_orientation(patch.orientation)
+            if orientation is not None:
+                orientations.append(SetOrientation(patch.component_id, orientation))
         elif patch.action in {"assign_route_corridor", "request_reroute"} and patch.net:
             route_policy = _route_policy_from_visual_patch(patch, layout)
             if route_policy is not None:
                 route_policies.append(route_policy)
         elif patch.action == "no_op":
             continue
-    return LayoutPatch(move_component=move_components, move_label=move_labels, set_route_policy=route_policies)
+    return LayoutPatch(
+        move_component=move_components,
+        move_label=move_labels,
+        set_orientation=orientations,
+        set_route_policy=route_policies,
+    )
+
+
+def _normalize_orientation(value: str | None) -> str | None:
+    key = _key(value or "")
+    aliases = {"east": "right", "west": "left", "north": "up", "south": "down", "rightflip": "right_flip"}
+    key = aliases.get(key, key)
+    return key if key in {"right", "left", "up", "down", "right_flip"} else None
 
 
 def _route_policy_from_visual_patch(patch: VisualPatch, layout: LayoutPlan) -> SetRoutePolicy | None:
@@ -338,9 +358,14 @@ def _review_prompt(circuit: Circuit, layout: LayoutPlan, svg: str, critic_report
             "Do not create, delete, rename, or rewire components, pins, or nets.",
             "Do not change pin mappings.",
             "Do not output absolute pixel-only SVG rewrites.",
-            "Only propose move_component, move_label, assign_route_corridor, request_reroute, or no_op patches.",
+            "You may propose coordinated component moves, label moves, component orientation changes, and route corridor/reroute requests.",
+            "Only propose move_component, move_label, set_orientation, assign_route_corridor, request_reroute, or no_op patches.",
             "All patches must be safe to pass through local LayoutPatch verification.",
         ],
+        "authority": {
+            "drawing_guidance": "High. Prefer the clearest teaching schematic even when deterministic placement is visually conservative.",
+            "local_gate": "Topology, terminal nets, canvas bounds, and scale-hack protections remain enforced locally.",
+        },
         "schema": {
             "passed": "boolean",
             "score": "integer 0-100",
@@ -348,11 +373,12 @@ def _review_prompt(circuit: Circuit, layout: LayoutPlan, svg: str, critic_report
             "visual_errors": [{"code": "string", "message": "string", "subject": "optional string", "severity": "number"}],
             "patches": [
                 {
-                    "action": "move_component|move_label|assign_route_corridor|request_reroute|no_op",
+                    "action": "move_component|move_label|set_orientation|assign_route_corridor|request_reroute|no_op",
                     "component_id": "optional existing id",
                     "label_id": "optional existing label id",
                     "net": "optional existing net",
                     "corridor": "optional corridor name",
+                    "orientation": "optional right|left|up|down|right_flip for set_orientation",
                     "x": "optional layout-grid x for move actions",
                     "y": "optional layout-grid y for move actions",
                     "reason": "string",

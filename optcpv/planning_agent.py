@@ -26,8 +26,8 @@ from .planning_hints import (
 )
 
 
-DEFAULT_GEMINI_PLANNER_MODEL = "gemini-3.5-flash"
-DEFAULT_GEMINI_PLANNER_FALLBACK_MODELS = ("gemini-2.5-flash",)
+DEFAULT_GEMINI_PLANNER_MODEL = "gemini-pro-latest"
+DEFAULT_GEMINI_PLANNER_FALLBACK_MODELS = ("gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-2.5-pro")
 _DOTENV_LOADED = False
 
 
@@ -136,15 +136,16 @@ def _planning_prompt(circuit: Circuit, *, input_mode: str, has_reference_image: 
         reference_image={"provided": True, "role": "relative teaching schematic reference"} if has_reference_image else None,
     )
     payload = {
-        "task": "Return OptCPV pre-render semantic schematic layout hints as strict JSON only.",
+        "task": "Return authoritative OptCPV pre-render schematic drawing guidance as strict JSON only.",
         "input_mode": input_mode,
         "hard_rules": [
             "Return JSON only. No markdown, comments, or prose outside the object.",
-            "Output only semantic blocks, route roles, discrete stage_x/lane_y placements, and orientation hints. Never output absolute pixel coordinates.",
+            "You may choose semantic blocks, route roles, discrete stage_x/lane_y placements, route corridors, orientation overrides, and local terminal policy for every existing component/net.",
+            "Never output absolute pixel coordinates; use stage_x/lane_y and route-policy guidance.",
             "Never create, delete, rename, or rewire components, pins, or nets.",
             "Never create new components for anatomy, electrode art, annotations, or labels unless they already exist in the netlist.",
             "Never create new nets.",
-            "Do not draw SVG paths or wire point lists; route geometry is deterministic.",
+            "Do not draw SVG paths or wire point lists; OptCPV will convert your higher-level drawing guidance into topology-safe geometry.",
             "Use blocks to identify functional subcircuits, their existing member components, and their interface nets.",
             "Never route GND, VCC, VEE, VDD, VSS, or REF/reference nets as global physical wires.",
             "Identify auxiliary feedback loops, especially right-leg-drive, RLD, driven-right-leg, and common-mode feedback.",
@@ -153,6 +154,10 @@ def _planning_prompt(circuit: Circuit, *, input_mode: str, has_reference_image: 
             "Keep parallel differential inputs aligned by stage and separated by lane.",
             "Treat reference-image anatomy or electrode art as annotation, not core electrical layout, unless represented in the netlist.",
         ],
+        "authority": {
+            "drawing_guidance": "High. Gemini may override deterministic staging, lanes, orientation, block decomposition, and signal/feedback corridor choices.",
+            "local_gate": "OptCPV will keep topology, terminal-net safety, canvas bounds, and scale-hack protections.",
+        },
         "mode_guidance": {
             "image_guided": "Use the reference image only to infer relative teaching-schematic stages, lanes, and motifs.",
             "model_guided": "Infer a teaching-schematic layout from netlist semantics only.",

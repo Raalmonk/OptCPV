@@ -208,6 +208,8 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "instrumentation_amplifier" and (opamps != 3 or resistors < 7):
         return None
+    if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
+        return None
     if motif == "non_inverting_op_amp" and (opamps != 1 or resistors < 2):
         return None
     if motif == "op_amp_network" and opamps < 2:
@@ -235,6 +237,9 @@ def _motif_key(value: str | None) -> str | None:
         "noninverting_op_amp": "non_inverting_op_amp",
         "noninverting_opamp": "non_inverting_op_amp",
         "noninv": "non_inverting_op_amp",
+        "tevc": "two_electrode_voltage_clamp",
+        "two_electrode_voltage_clamp": "two_electrode_voltage_clamp",
+        "twoelectrodevoltageclamp": "two_electrode_voltage_clamp",
         "instrumentation_amplifier": "instrumentation_amplifier",
         "instrumentation_amp": "instrumentation_amplifier",
         "in_amp": "instrumentation_amplifier",
