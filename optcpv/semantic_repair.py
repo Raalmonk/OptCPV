@@ -180,8 +180,10 @@ def _infer_motif(circuit: Circuit) -> str | None:
         return "instrumentation_amplifier"
     if opamps >= 2:
         return "op_amp_network"
-    if opamps == 1 and resistors >= 2:
+    if opamps == 1 and resistors == 2 and capacitors == 0:
         return "non_inverting_op_amp"
+    if opamps > 0:
+        return None
     if resistors >= 1 and capacitors >= 1:
         return "rc_low_pass"
     if resistors >= 4:
@@ -210,7 +212,7 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
         return None
-    if motif == "non_inverting_op_amp" and (opamps != 1 or resistors < 2):
+    if motif == "non_inverting_op_amp" and (opamps != 1 or resistors != 2 or capacitors):
         return None
     if motif == "op_amp_network" and opamps < 2:
         return None

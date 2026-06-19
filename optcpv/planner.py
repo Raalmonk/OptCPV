@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import ceil
 from statistics import median
 from typing import Callable, Iterable
@@ -29,6 +29,7 @@ from .models import (
     circuit_from_any,
 )
 from .hint_legalizer import legalize_planning_hints
+from .grammar import infer_schematic_intent, planning_hints_from_intent
 from .planning_agent import SemanticPlanningClient
 from .planning_hints import BlockHint, GridPlacementHint, RoutePolicyHint, SchematicLayoutHints
 from .route_contract import assert_no_diagonal_wires, orthogonalize_route
@@ -51,7 +52,7 @@ GRID = 48
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 800
 CANVAS_EDGE_PADDING = 0.55
-GEMINI_PLANNING_SCORE_MARGIN = 20.0
+SCHEMATIC_GRAMMAR_SCORE_MARGIN = 12.0
 NATIVE_MOTIFS = {
     "voltage_divider",
     "rc_low_pass",
@@ -83,6 +84,11 @@ def plan_layout(
             candidate = _layout_from_planning_hints(native, base_layout, auto_hints)
             if candidate is not None:
                 return candidate
+        grammar_hints = _auto_schematic_grammar_hints(native, base_layout)
+        if grammar_hints is not None:
+            candidate = _layout_from_planning_hints(native, base_layout, grammar_hints)
+            if candidate is not None:
+                return candidate
         return base_layout
     candidate = _layout_from_planning_hints(native, base_layout, hints)
     if candidate is None:
@@ -109,6 +115,12 @@ def _plan_layout_deterministic(native: Circuit) -> LayoutPlan:
     planner = planners.get(motif)
     if planner:
         return planner(native)
+    bridge_frontend = _plan_sensor_bridge_frontend(native)
+    if bridge_frontend is not None:
+        return bridge_frontend
+    differential_frontend = _plan_single_opamp_differential_frontend(native)
+    if differential_frontend is not None:
+        return differential_frontend
     return _plan_diagnostic(native)
 
 
@@ -324,6 +336,172 @@ def _plan_bridge(circuit: Circuit) -> LayoutPlan:
     ):
         placements[component.id] = slot
     return _build_layout(circuit, placements, ["motif: bridge_or_wheatstone"], support=_native_motif_support("bridge_or_wheatstone"))
+
+
+def _plan_sensor_bridge_frontend(circuit: Circuit) -> LayoutPlan | None:
+    opamp = _first(circuit, _is_opamp)
+    source = _first(circuit, _is_input_or_source)
+    output = _first(circuit, _is_output)
+    ground = _first(circuit, _is_ground)
+    if opamp is None or source is None:
+        return None
+    bridge = _detect_bridge_pairs(circuit, source)
+    if bridge is None:
+        return None
+    left, right = bridge
+    placements: dict[str, tuple[float, float, str]] = {
+        source.id: (2.0, 2.4, "right"),
+        left.top.id: (5.2, 3.35, "down"),
+        left.bottom.id: (5.2, 7.15, "down"),
+        right.top.id: (8.2, 3.35, "down"),
+        right.bottom.id: (8.2, 7.15, "down"),
+        opamp.id: (12.4, 5.25, _opamp_orientation(opamp, circuit.components)),
+    }
+    if output:
+        placements[output.id] = (17.2, 5.25, "right")
+    if ground:
+        placements[ground.id] = (6.7, 10.2, "right")
+    return _build_layout(
+        circuit,
+        placements,
+        ["motiflet: sensor_bridge_frontend"],
+        width=980,
+        height=620,
+        label_offsets={
+            source.id: (-0.3, -0.82),
+            opamp.id: (1.65, -1.28),
+            **({output.id: (0.95, -0.62)} if output else {}),
+        },
+        support=LayoutSupport(
+            layout_mode="motif_network",
+            layout_confidence=0.82,
+            matched_motifs=("sensor_bridge_frontend",),
+            fallback_used=False,
+            unsupported_regions=(),
+            notes=("detected bridge motiflet feeding a single op-amp stage",),
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _BridgeLeg:
+    top: Component
+    bottom: Component
+    sense_net: str
+
+
+def _detect_bridge_pairs(circuit: Circuit, source: Component) -> tuple[_BridgeLeg, _BridgeLeg] | None:
+    source_nets = set(source.pins.values())
+    resistors = [component for component in circuit.components if _is_type(component, "resistor")]
+    if len(resistors) < 4:
+        return None
+    top_by_sense: dict[str, Component] = {}
+    bottom_by_sense: dict[str, Component] = {}
+    for resistor in resistors:
+        nets = set(resistor.pins.values())
+        active_sense = [net for net in nets if net not in source_nets and not is_local_terminal_net(net)]
+        if len(active_sense) != 1:
+            continue
+        sense_net = active_sense[0]
+        if nets & source_nets:
+            top_by_sense[sense_net] = resistor
+        if any(is_local_terminal_net(net) for net in nets):
+            bottom_by_sense[sense_net] = resistor
+    legs = [
+        _BridgeLeg(top_by_sense[sense_net], bottom_by_sense[sense_net], sense_net)
+        for sense_net in sorted(set(top_by_sense) & set(bottom_by_sense))
+    ]
+    if len(legs) < 2:
+        return None
+    return (legs[0], legs[1])
+
+
+def _plan_single_opamp_differential_frontend(circuit: Circuit) -> LayoutPlan | None:
+    opamp = _first(circuit, _is_opamp)
+    output = _first(circuit, _is_output)
+    if opamp is None:
+        return None
+    output_net = _opamp_output_net(opamp)
+    input_items = _opamp_input_pin_items(opamp)
+    if output_net is None or len(input_items) < 2:
+        return None
+    series_by_pin = {
+        pin_name: _series_input_resistor_for_net(circuit, net)
+        for pin_name, net in input_items
+    }
+    if sum(1 for item in series_by_pin.values() if item is not None) < 2:
+        return None
+    feedback = _feedback_resistor_for_opamp(circuit, opamp)
+    placements: dict[str, tuple[float, float, str]] = {
+        opamp.id: (10.0, 6.5, "right"),
+    }
+    lane_by_pin = {"-": 5.875, "minus": 5.875, "inverting": 5.875, "+": 7.125, "plus": 7.125, "non_inverting": 7.125}
+    for pin_name, net in input_items:
+        pin_kind = _pin_kind(pin_name)
+        lane_y = lane_by_pin.get(pin_kind, 7.125 if len(placements) % 2 else 5.875)
+        resistor = series_by_pin.get(pin_name)
+        if resistor is None:
+            continue
+        placements[resistor.id] = (5.7, lane_y, "right")
+        source = _source_for_series_resistor(circuit, resistor, net)
+        if source is not None:
+            placements[source.id] = (2.2, lane_y, "right")
+    if feedback is not None:
+        placements[feedback.id] = (10.2, 3.3, "left")
+    if output is not None:
+        placements[output.id] = (15.2, 6.5, "right")
+    return _build_layout(
+        circuit,
+        placements,
+        ["motiflet: single_opamp_differential_frontend"],
+        width=920,
+        height=560,
+        label_offsets={
+            opamp.id: (1.55, -1.45),
+            **({output.id: (0.95, -0.62)} if output else {}),
+        },
+        support=LayoutSupport(
+            layout_mode="motif_network",
+            layout_confidence=0.78,
+            matched_motifs=("single_opamp_differential_frontend",),
+            fallback_used=False,
+            unsupported_regions=(),
+            notes=("detected paired input resistors feeding a single op-amp differential stage",),
+        ),
+    )
+
+
+def _series_input_resistor_for_net(circuit: Circuit, input_net: str) -> Component | None:
+    candidates = []
+    for component in circuit.components:
+        if not _is_type(component, "resistor") or input_net not in component.pins.values():
+            continue
+        if any(is_local_terminal_net(net) for net in component.pins.values()):
+            continue
+        if _opamp_output_net(_first(circuit, _is_opamp) or component) in component.pins.values():
+            continue
+        candidates.append(component)
+    return sorted(candidates, key=lambda item: item.id)[0] if candidates else None
+
+
+def _feedback_resistor_for_opamp(circuit: Circuit, opamp: Component) -> Component | None:
+    output_net = _opamp_output_net(opamp)
+    input_nets = set(_opamp_input_nets(opamp))
+    if output_net is None:
+        return None
+    for resistor in [component for component in circuit.components if _is_type(component, "resistor")]:
+        nets = set(resistor.pins.values())
+        if output_net in nets and nets & input_nets:
+            return resistor
+    return None
+
+
+def _source_for_series_resistor(circuit: Circuit, resistor: Component, input_net: str) -> Component | None:
+    source_nets = {net for net in resistor.pins.values() if net != input_net}
+    for component in circuit.components:
+        if _is_input_or_source(component) and set(component.pins.values()) & source_nets:
+            return component
+    return None
 
 
 def _plan_op_amp_network(circuit: Circuit) -> LayoutPlan:
@@ -823,6 +1001,17 @@ def _opamp_input_nets(opamp: Component) -> list[str]:
     ]
 
 
+def _opamp_input_pin_items(opamp: Component) -> list[tuple[str, str]]:
+    return [
+        (pin_name, net)
+        for pin_name, net in opamp.pins.items()
+        if not _is_opamp_output_pin(pin_name)
+        and not is_positive_supply_pin(pin_name, net)
+        and not is_negative_supply_pin(pin_name, net)
+        and not is_reference_pin(pin_name, net)
+    ]
+
+
 def _is_opamp_output_pin(pin_name: str) -> bool:
     return _pin_kind(pin_name) in {"out", "output", "o", "vout"}
 
@@ -1090,12 +1279,44 @@ def _auto_ecg_frontend_hints(circuit: Circuit) -> SchematicLayoutHints | None:
     )
 
 
+def _auto_schematic_grammar_hints(circuit: Circuit, base_layout: LayoutPlan) -> SchematicLayoutHints | None:
+    if base_layout.support.layout_mode not in {"motif_network", "diagnostic_fallback"}:
+        return None
+    intent = infer_schematic_intent(circuit)
+    if intent.confidence < 0.5:
+        return None
+    if not _intent_has_layout_grammar(intent):
+        return None
+    return planning_hints_from_intent(circuit, intent)
+
+
+def _intent_has_layout_grammar(intent) -> bool:
+    roles = {role for component_roles in intent.component_roles.values() for role in component_roles}
+    if roles & {
+        "op_amp",
+        "op_amp_feedback_stage",
+        "active_device",
+        "transistor_gain_stage",
+        "feedback_element",
+        "shunt_reference_element",
+        "filter_block",
+        "shunt_filter_element",
+        "coupling_element",
+    }:
+        return True
+    return any(
+        any(token in block.block_type for token in ("feedback", "filter", "active", "transistor", "comparator"))
+        for block in intent.blocks
+    )
+
+
 def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints: SchematicLayoutHints) -> LayoutPlan | None:
     legal_hints = legalize_planning_hints(circuit, hints)
     if legal_hints is None:
         return None
+    target_width, target_height = _hint_target_canvas_size(base_layout, legal_hints)
     try:
-        placements = _hint_placements(circuit, base_layout, legal_hints)
+        placements = _hint_placements(circuit, base_layout, legal_hints, width=target_width, height=target_height)
     except ValueError:
         return None
     if placements is None:
@@ -1103,7 +1324,7 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
 
     support = replace(
         base_layout.support,
-        layout_confidence=max(base_layout.support.layout_confidence, legal_hints.confidence),
+        layout_confidence=_hint_layout_confidence(base_layout, legal_hints),
         fallback_used=False,
         notes=_unique((*base_layout.support.notes, "external semantic planning hints applied")),
         planning_hints=legal_hints.to_dict(),
@@ -1113,8 +1334,8 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         circuit,
         placements,
         [*base_layout.warnings, "planning_hints: accepted"],
-        width=base_layout.width,
-        height=base_layout.height,
+        width=target_width,
+        height=target_height,
         grid=base_layout.grid,
         label_offsets=_hint_label_offsets(circuit, legal_hints),
         support=support,
@@ -1138,8 +1359,9 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
         return None
     if candidate_hard > base_hard:
         return None
-    if candidate_report.score > base_report.score and not _gemini_planning_guidance_allowed(
+    if candidate_report.score > base_report.score and not _schematic_grammar_guidance_allowed(
         legal_hints,
+        base_layout,
         base_report.score,
         candidate_report.score,
     ):
@@ -1147,12 +1369,27 @@ def _layout_from_planning_hints(circuit: Circuit, base_layout: LayoutPlan, hints
     return candidate
 
 
-def _gemini_planning_guidance_allowed(hints: SchematicLayoutHints, base_score: float, candidate_score: float) -> bool:
-    if hints.source != "gemini":
+def _hint_layout_confidence(base_layout: LayoutPlan, hints: SchematicLayoutHints) -> float:
+    if (
+        hints.source == "deterministic"
+        and base_layout.support.layout_mode == "motif_network"
+        and base_layout.support.matched_motifs
+    ):
+        return base_layout.support.layout_confidence
+    return max(base_layout.support.layout_confidence, hints.confidence)
+
+
+def _schematic_grammar_guidance_allowed(
+    hints: SchematicLayoutHints,
+    base_layout: LayoutPlan,
+    base_score: float,
+    candidate_score: float,
+) -> bool:
+    if hints.source != "deterministic" or hints.intent is None:
         return False
-    if not (hints.blocks or hints.route_policies or hints.inter_block_routes or hints.auxiliary_loops or hints.orientation_overrides):
+    if base_layout.support.layout_mode not in {"diagnostic_fallback", "motif_network"} and not base_layout.support.fallback_used:
         return False
-    return candidate_score <= base_score + GEMINI_PLANNING_SCORE_MARGIN
+    return candidate_score <= base_score + SCHEMATIC_GRAMMAR_SCORE_MARGIN
 
 
 def _improve_hint_opamp_orientations(circuit: Circuit, layout: LayoutPlan) -> LayoutPlan:
@@ -1207,7 +1444,13 @@ def _orientation_candidate_better(candidate_report, best_report) -> bool:
         return False
     if candidate_hard < best_hard:
         return True
+    if candidate_report.score <= best_report.score + 0.1 and _wire_crossing_count(candidate_report) < _wire_crossing_count(best_report):
+        return True
     return candidate_report.score < best_report.score - 0.1
+
+
+def _wire_crossing_count(report) -> float:
+    return float(report.metrics.get("wire_crossing_count", report.metrics.get("vector.wire_crossing_count", 0)))
 
 
 def _violation_count(report, code: str) -> int:
@@ -1218,11 +1461,14 @@ def _hint_placements(
     circuit: Circuit,
     base_layout: LayoutPlan,
     hints: SchematicLayoutHints,
+    *,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict[str, tuple[float, float, str]] | None:
     base_components = {component.id: component for component in base_layout.components}
     placements = {component.id: (component.x, component.y, component.orientation) for component in base_layout.components}
-    span_x = base_layout.width / base_layout.grid
-    span_y = base_layout.height / base_layout.grid
+    span_x = (width or base_layout.width) / base_layout.grid
+    span_y = (height or base_layout.height) / base_layout.grid
     orientations = {
         hint.component_id: _legalized_hint_orientation(base_components[hint.component_id], hint.orientation)
         for hint in hints.placements
@@ -1260,10 +1506,98 @@ def _hint_placements(
     placements = _apply_block_internal_placements(circuit, hints, base_components, placements, span_x, span_y)
     placements = _anchor_hint_ground_symbols(circuit, base_components, placements, span_x, span_y)
     placements = _align_hint_passive_output_terminals(circuit, base_components, placements, span_x, span_y)
+    placements = _place_two_opamp_named_net_sense_network(circuit, hints, base_components, placements, span_x, span_y)
     if _ecg_frontend_blocks_present(hints):
         placements = _apply_block_internal_placements(circuit, hints, base_components, placements, span_x, span_y)
         return placements
     return _relax_hint_component_overlaps(base_components, placements, span_x, span_y)
+
+
+def _hint_target_canvas_size(base_layout: LayoutPlan, hints: SchematicLayoutHints) -> tuple[int, int]:
+    components = {component.id: component for component in base_layout.components}
+    if _hint_is_linear_block_chain(hints, components):
+        return (min(base_layout.width, 980), 360)
+    if _hint_is_compact_named_net_opamp_network(hints, components):
+        return (min(base_layout.width, 980), min(base_layout.height, 600))
+    return (base_layout.width, base_layout.height)
+
+
+def _hint_is_compact_named_net_opamp_network(hints: SchematicLayoutHints, components: dict[str, LayoutComponent]) -> bool:
+    if hints.source != "deterministic" or hints.intent is None or len(hints.placements) > 10:
+        return False
+    if not any(policy.policy == "named_net_label" for policy in hints.route_policies):
+        return False
+    opamp_count = sum(
+        1
+        for hint in hints.placements
+        if (component := components.get(hint.component_id)) is not None and _is_opamp_layout(component)
+    )
+    return opamp_count >= 2
+
+
+def _place_two_opamp_named_net_sense_network(
+    circuit: Circuit,
+    hints: SchematicLayoutHints,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    named_nets = {policy.net for policy in hints.route_policies if policy.policy == "named_net_label" and policy.net}
+    opamps = [component for component in circuit.components if _is_opamp(component)]
+    if len(opamps) != 2 or len(named_nets) != 1:
+        return placements
+
+    named_net = next(iter(named_nets))
+    buffer = next((opamp for opamp in opamps if _opamp_output_net(opamp) in set(_opamp_input_nets(opamp))), None)
+    if buffer is None:
+        return placements
+    diff = next((opamp for opamp in opamps if opamp.id != buffer.id), None)
+    if diff is None:
+        return placements
+
+    source = _first(circuit, _is_input_or_source)
+    meter = _first(circuit, lambda item: _key(item.type) == "ammeter")
+    output = _first(circuit, lambda item: _is_output(item) and named_net in item.pins.values())
+    ground = _first(circuit, _is_ground)
+    series = next(
+        (
+            component
+            for component in circuit.components
+            if _is_type(component, "resistor")
+            and named_net in component.pins.values()
+            and not any(is_local_terminal_net(net) for net in component.pins.values())
+        ),
+        None,
+    )
+    shunt = next(
+        (
+            component
+            for component in circuit.components
+            if _is_type(component, "resistor")
+            and named_net in component.pins.values()
+            and any(is_local_terminal_net(net) for net in component.pins.values())
+        ),
+        None,
+    )
+    if source is None or series is None or shunt is None:
+        return placements
+
+    result = dict(placements)
+
+    def set_if_present(component: Component | None, x: float, y: float, orientation: str) -> None:
+        if component is not None and component.id in components:
+            result[component.id] = _clamped_placement(components[component.id], x, y, orientation, span_x, span_y)
+
+    set_if_present(source, 1.35, 5.75, "right")
+    set_if_present(buffer, 5.2, 2.65, _opamp_orientation(buffer, circuit.components))
+    set_if_present(diff, 9.45, 5.75, _opamp_orientation(diff, circuit.components))
+    set_if_present(meter, 14.2, 5.75, "right")
+    set_if_present(series, 17.25, 5.75, "right")
+    set_if_present(output, 19.9, 5.75, "right")
+    set_if_present(shunt, 5.2, 8.25, "down")
+    set_if_present(ground, 5.2, 10.45, "right")
+    return result
 
 
 def _hint_label_offsets(circuit: Circuit, hints: SchematicLayoutHints) -> dict[str, tuple[float, float]]:
@@ -1454,9 +1788,138 @@ def _apply_block_internal_placements(
             result = _place_auxiliary_feedback_block(members, components, result, span_x, span_y)
         elif "feedback" in block_type and "opamp" in block_type:
             result = _place_opamp_feedback_block(members, components, result, span_x, span_y)
+        elif "filter" in block_type:
+            result = _place_rc_filter_block(block, circuit, components, result, span_x, span_y)
         elif "differential_input" in block_type or "input_pair" in block_type:
             result = _place_differential_input_block(members, components, result, span_x, span_y)
     return result
+
+
+def _place_rc_filter_block(
+    block: BlockHint,
+    circuit: Circuit,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> dict[str, tuple[float, float, str]]:
+    result = dict(placements)
+    member_ids = set(block.members)
+    if not member_ids:
+        return result
+    node_nets = set(block.ports.values())
+    node_nets = {net for net in node_nets if net and not is_local_terminal_net(net)}
+    opamp, input_pin = _opamp_receiver_for_nets(circuit, node_nets)
+    if opamp is None or input_pin is None or opamp.id not in components or opamp.id not in result:
+        return result
+
+    opamp_component = _component_at_hint_placement(components[opamp.id], result[opamp.id])
+    input_x, input_y, _ = _pin_point(opamp_component, input_pin)
+    node_x = max(CANVAS_EDGE_PADDING + 1.8, input_x - 0.95)
+
+    circuit_by_id = {component.id: component for component in circuit.components}
+    series = next(
+        (
+            circuit_by_id[component_id]
+            for component_id in member_ids
+            if component_id in circuit_by_id
+            and _is_type(circuit_by_id[component_id], "resistor")
+            and not any(is_local_terminal_net(net) for net in circuit_by_id[component_id].pins.values())
+        ),
+        None,
+    )
+    if series is not None and series.id in components:
+        series_x = node_x - 0.95
+        result[series.id] = _clamped_placement(components[series.id], series_x, input_y, "right", span_x, span_y)
+        _align_sources_to_series_input(circuit, series, components, result, input_y, span_x, span_y)
+
+    shunts = [
+        circuit_by_id[component_id]
+        for component_id in sorted(member_ids)
+        if component_id in circuit_by_id
+        and any(is_local_terminal_net(net) for net in circuit_by_id[component_id].pins.values())
+    ]
+    for index, shunt in enumerate(shunts):
+        if shunt.id not in components:
+            continue
+        x = node_x + index * 0.72
+        y = input_y + 1.22
+        orientation = "down" if (_is_type(shunt, "capacitor") or _is_type(shunt, "resistor")) else "right"
+        result[shunt.id] = _clamped_placement(components[shunt.id], x, y, orientation, span_x, span_y)
+        _align_ground_to_shunt(circuit, shunt, components, result, span_x, span_y)
+
+    output_net = _opamp_output_net(opamp)
+    if output_net:
+        opamp_layout = _component_at_hint_placement(components[opamp.id], result[opamp.id])
+        out_x, out_y, _ = _pin_point(opamp_layout, "out")
+        for terminal in circuit.components:
+            if _is_output(terminal) and output_net in terminal.pins.values() and terminal.id in components:
+                result[terminal.id] = _clamped_placement(components[terminal.id], out_x + 2.25, out_y, "right", span_x, span_y)
+    return result
+
+
+def _opamp_receiver_for_nets(circuit: Circuit, nets: set[str]) -> tuple[Component | None, str | None]:
+    for opamp in [component for component in circuit.components if _is_opamp(component)]:
+        for pin_name, net in _opamp_input_pin_items(opamp):
+            if net in nets:
+                return opamp, pin_name
+    return None, None
+
+
+def _align_sources_to_series_input(
+    circuit: Circuit,
+    series: Component,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    y: float,
+    span_x: float,
+    span_y: float,
+) -> None:
+    source_nets = [net for pin_name, net in series.pins.items() if _series_pin_direction(series, pin_name) == "input"]
+    if not source_nets or series.id not in placements:
+        return
+    series_x, _, _ = placements[series.id]
+    for source in circuit.components:
+        if not _is_input_or_source(source) or source.id not in components:
+            continue
+        if not set(source.pins.values()) & set(source_nets):
+            continue
+        placements[source.id] = _clamped_placement(components[source.id], series_x - 2.9, y, "right", span_x, span_y)
+
+
+def _series_pin_direction(component: Component, pin_name: str) -> str:
+    ordered = list(component.pins)
+    kind = _pin_kind(pin_name)
+    if kind in {"out", "output", "o", "b", "right", "to"}:
+        return "output"
+    if kind in {"in", "input", "i", "a", "left", "from"}:
+        return "input"
+    if len(ordered) >= 2 and pin_name == ordered[-1]:
+        return "output"
+    return "input"
+
+
+def _align_ground_to_shunt(
+    circuit: Circuit,
+    shunt: Component,
+    components: dict[str, LayoutComponent],
+    placements: dict[str, tuple[float, float, str]],
+    span_x: float,
+    span_y: float,
+) -> None:
+    local_nets = {net for net in shunt.pins.values() if is_local_terminal_net(net)}
+    if not local_nets or shunt.id not in placements:
+        return
+    shunt_component = _component_at_hint_placement(components[shunt.id], placements[shunt.id])
+    bottom_pin = next((pin_name for pin_name, net in shunt.pins.items() if net in local_nets), None)
+    if bottom_pin is None:
+        return
+    pin_x, pin_y, _ = _pin_point(shunt_component, bottom_pin)
+    for ground in circuit.components:
+        if not _is_ground(ground) or ground.id not in components or not (set(ground.pins.values()) & local_nets):
+            continue
+        placements[ground.id] = _clamped_placement(components[ground.id], pin_x, pin_y + 1.25, "right", span_x, span_y)
+        break
 
 
 def _place_parallel_buffer_block(
@@ -1935,7 +2398,8 @@ def _hint_stage_positions(
 
     minimum_stage = min(stages)
     maximum_stage = max(stages)
-    naive_gap = min(4.35, (span_x - 2.4) / max(1, maximum_stage - minimum_stage))
+    gap_ceiling = 3.58 if _hint_is_linear_block_chain(hints, components) else 4.35
+    naive_gap = min(gap_ceiling, (span_x - 2.4) / max(1, maximum_stage - minimum_stage))
     positions: dict[int, float] = {}
     cursor_right = 0.55
     for stage in stages:
@@ -1979,7 +2443,15 @@ def _hint_lane_positions(
 
     minimum_lane = min(lanes)
     maximum_lane = max(lanes)
-    naive_gap = (span_y - 1.6) / max(1, maximum_lane - minimum_lane)
+    if len(lanes) == 1:
+        lane = lanes[0]
+        top, bottom = extents[lane]
+        y = (span_y / 2.0) - ((bottom - top) / 2.0)
+        return {lane: _clamp(y, CANVAS_EDGE_PADDING + top, span_y - CANVAS_EDGE_PADDING - bottom)}
+    if hints.source == "deterministic" and hints.intent is not None:
+        naive_gap = min(2.8, max(1.65, (span_y - 1.6) / max(1, maximum_lane - minimum_lane)))
+    else:
+        naive_gap = (span_y - 1.6) / max(1, maximum_lane - minimum_lane)
     positions: dict[int, float] = {}
     cursor_bottom = 0.45
     for lane in lanes:
@@ -2003,6 +2475,18 @@ def _hint_lane_positions(
 def _hint_bbox_extents(component: LayoutComponent, orientation: str) -> tuple[float, float, float, float]:
     bbox = _component_bbox(component.type, 0.0, 0.0, orientation)
     return (-bbox.x, bbox.right, -bbox.y, bbox.bottom)
+
+
+def _hint_is_linear_block_chain(hints: SchematicLayoutHints, components: dict[str, LayoutComponent]) -> bool:
+    if len({hint.lane_y for hint in hints.placements}) != 1 or len({hint.stage_x for hint in hints.placements}) < 4:
+        return False
+    for hint in hints.placements:
+        component = components.get(hint.component_id)
+        if component is None:
+            return False
+        if not (_is_filter_block_layout(component) or _is_input_or_source_layout(component) or _is_output_layout(component)):
+            return False
+    return True
 
 
 def _clamp_anchor_to_canvas(
@@ -2268,6 +2752,23 @@ def _local_terminal_intents(
             )
         )
         terminal_keys.add(key)
+    for key in _named_signal_terminal_keys(net_to_pins, pin_map, route_policies):
+        if key in terminal_keys:
+            continue
+        pin = pin_map.get(key)
+        if pin is None:
+            continue
+        terminals.append(
+            LocalTerminalIntent(
+                component_id=key[0],
+                pin_name=key[1],
+                net=pin.net,
+                terminal_type="signal_label",
+                label=pin.net,
+                preferred_direction="left" if pin.side == "left" else "right",
+            )
+        )
+        terminal_keys.add(key)
     for key in _auxiliary_signal_terminal_keys(net_to_pins, pin_map, component_by_id, route_policies):
         if key in terminal_keys:
             continue
@@ -2323,6 +2824,22 @@ def _ecg_auxiliary_signal_terminal_keys(
 
 def _ecg_signal_terminal_label(net: str) -> str:
     return {"v3_cm": "V3", "right_leg_drive": "Vo", "aux_out": "v_out"}.get(net, net)
+
+
+def _named_signal_terminal_keys(
+    net_to_pins: dict[str, list[tuple[str, str]]],
+    pin_map: dict[tuple[str, str], LayoutPin],
+    route_policies: tuple[RoutePolicyHint, ...],
+) -> set[tuple[str, str]]:
+    labeled_nets = {
+        policy.net
+        for policy in route_policies
+        if policy.net is not None and policy.policy == "named_net_label"
+    }
+    result: set[tuple[str, str]] = set()
+    for net in labeled_nets:
+        result.update(key for key in net_to_pins.get(net, ()) if key in pin_map)
+    return result
 
 
 def _auxiliary_signal_terminal_keys(
@@ -2640,6 +3157,8 @@ def _labels_for_components(
 ) -> list[LayoutLabel]:
     labels: list[LayoutLabel] = []
     for component in components:
+        if _is_filter_block_layout(component):
+            continue
         text = _display_label(component)
         dx, dy = label_offsets.get(component.id, _default_label_offset(component))
         x, y = component.x + dx, component.y + dy
@@ -3868,11 +4387,35 @@ def _non_inverting_op_amp_routes(
     vm_left = Point(_p(pin_map, "Rf", "b").x, minus.y)
     rg_drop = Point(vm_left.x, _p(pin_map, "Rg", "a").y)
     return {
-        "vin": [_p(pin_map, "VIN", "out"), _p(pin_map, "U1", "+")],
+        "vin": _non_inverting_input_route(_p(pin_map, "VIN", "out"), _p(pin_map, "U1", "+"), vm_left, rg_drop),
         "vout": [out, _p(pin_map, "VOUT", "in"), out, Point(out.x, _p(pin_map, "Rf", "a").y), _p(pin_map, "Rf", "a")],
         "vm": [_p(pin_map, "Rf", "b"), vm_left, minus, vm_left, rg_drop, _p(pin_map, "Rg", "a")],
         "gnd": [_p(pin_map, "Rg", "b"), _p(pin_map, "GND", "gnd")],
     }
+
+
+def _non_inverting_input_route(vin: LayoutPin, plus: LayoutPin, feedback_top: Point, feedback_bottom: Point) -> list[Point]:
+    start = Point(vin.x, vin.y)
+    end = Point(plus.x, plus.y)
+    crosses_feedback_leg = (
+        _route_between(feedback_top.x, start.x, end.x, 0.02)
+        and _route_between(start.y, feedback_top.y, feedback_bottom.y, 0.02)
+    )
+    if not crosses_feedback_leg:
+        return [start, end]
+    detour_y = max(start.y, end.y, feedback_bottom.y) + 0.48
+    approach_x = max(feedback_top.x + 0.54, end.x - 0.54)
+    return [
+        start,
+        Point(start.x, detour_y),
+        Point(approach_x, detour_y),
+        Point(approach_x, end.y),
+        end,
+    ]
+
+
+def _route_between(value: float, first: float, second: float, tolerance: float) -> bool:
+    return min(first, second) - tolerance <= value <= max(first, second) + tolerance
 
 
 def _two_electrode_voltage_clamp_routes(
@@ -4661,8 +5204,10 @@ def _infer_motif(components: list[Component]) -> str | None:
         return "instrumentation_amplifier"
     if opamps >= 2:
         return "op_amp_network"
-    if opamps == 1:
+    if opamps == 1 and resistors == 2 and capacitors == 0:
         return "non_inverting_op_amp"
+    if opamps > 0:
+        return None
     if resistors >= 1 and capacitors >= 1:
         return "rc_low_pass"
     if resistors >= 4:
@@ -4691,7 +5236,7 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
         return None
-    if motif == "non_inverting_op_amp" and (opamps != 1 or resistors < 2):
+    if motif == "non_inverting_op_amp" and (opamps != 1 or resistors != 2 or capacitors):
         return None
     if motif == "op_amp_network" and opamps < 2:
         return None
@@ -4767,7 +5312,7 @@ def _is_input_or_source(component: Component) -> bool:
 
 
 def _is_output(component: Component) -> bool:
-    return _key(component.type) == "output" or "output" in _key(component.role)
+    return _key(component.type) == "output" or _role_is_output_port(component.role)
 
 
 def _is_ground(component: Component) -> bool:
@@ -4805,7 +5350,7 @@ def _is_input_or_source_layout(component: LayoutComponent) -> bool:
 
 
 def _is_output_layout(component: LayoutComponent) -> bool:
-    return _key(component.type) == "output" or "output" in _key(component.role)
+    return _key(component.type) == "output" or _role_is_output_port(component.role)
 
 
 def _is_terminal_layout(component: LayoutComponent) -> bool:
@@ -4815,6 +5360,11 @@ def _is_terminal_layout(component: LayoutComponent) -> bool:
     if key in {"voltage_source", "current_source", "source"} or "source" in key:
         return len(component.pins) <= 1
     return False
+
+
+def _role_is_output_port(role: str | None) -> bool:
+    key = _key(role)
+    return key in {"output", "output_port", "output_terminal", "load_output", "monitor_output", "final_output"} or key.endswith("_output")
 
 
 def _is_explicit_terminal_component(component: LayoutComponent) -> bool:

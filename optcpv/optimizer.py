@@ -15,11 +15,8 @@ from .renderer import render_svg_layers
 from .semantic_repair import repair_circuit
 from .verifier import verify_layout_topology
 from .vector_critic import critique_layout
-from .visual_review import VisualReview, VisualReviewClient, layout_patch_from_visual_review
+from .visual_review import VisualReview, VisualReviewClient, layout_patch_from_visual_review, visual_review_client_from_env
 from .vision_agent import VisionLayoutClient
-
-EXTERNAL_GUIDANCE_SCORE_MARGIN = 20.0
-EXTERNAL_GUIDANCE_SOURCES = {"visual_review", "vision"}
 
 
 def draw_optimized_svg(
@@ -52,6 +49,7 @@ def draw_optimized_artifact(
 ) -> SchematicArtifact:
     native = circuit_from_any(circuit)
     planning_client = planning_client or planning_client_from_env()
+    visual_review_client = visual_review_client or visual_review_client_from_env()
     layout = plan_layout(native, planning_client=planning_client, reference_image=reference_image)
     verify_layout_topology(native, layout)
     layers = render_svg_layers(layout)
@@ -89,6 +87,23 @@ def draw_optimized_artifact(
             if current_reports.combined_report.score < best_reports.combined_report.score:
                 best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
             continue
+
+        if planning_client is not None and _should_request_refinement(current_reports.combined_report):
+            refinement_result = _evaluate_planning_refinement(
+                native,
+                current_layout,
+                current_svg,
+                current_reports,
+                planning_client,
+                iteration=iteration,
+                reference_image=reference_image,
+                log=log,
+            )
+            if refinement_result is not None:
+                current_layout, current_svg, current_reports = refinement_result
+                if current_reports.combined_report.score <= best_reports.combined_report.score:
+                    best_layout, best_svg, best_reports = current_layout, current_svg, current_reports
+                continue
 
         if visual_review_client is not None:
             visual_result = _evaluate_visual_review(
@@ -242,20 +257,7 @@ def _evaluate_patch(
     candidate_reports = critique_parts(circuit, candidate_layout, candidate_layers.final_svg, layers=candidate_layers)
     hard_before = sum(1 for violation in current_reports.combined_report.violations if violation.hard)
     hard_after = sum(1 for violation in candidate_reports.combined_report.violations if violation.hard)
-    overlaps_before = _violation_count(current_reports.combined_report, "component_overlap")
-    overlaps_after = _violation_count(candidate_reports.combined_report, "component_overlap")
     accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5 or hard_after < hard_before
-    external_guidance_override = False
-    if not accepted and source in EXTERNAL_GUIDANCE_SOURCES:
-        external_guidance_override = _external_guidance_allowed(
-            current_reports.combined_report.score,
-            candidate_reports.combined_report.score,
-            hard_before,
-            hard_after,
-            overlaps_before,
-            overlaps_after,
-        )
-        accepted = external_guidance_override
     if accepted and visual_review is not None:
         candidate_layout = replace(
             candidate_layout,
@@ -269,29 +271,11 @@ def _evaluate_patch(
             "accepted": accepted,
             "hard_failures_before": hard_before,
             "hard_failures_after": hard_after,
-            "component_overlaps_before": overlaps_before,
-            "component_overlaps_after": overlaps_after,
-            "external_guidance_override": external_guidance_override,
         }
     )
     if not accepted:
         return None
     return candidate_layout, candidate_layers.final_svg, candidate_reports
-
-
-def _external_guidance_allowed(
-    score_before: float,
-    score_after: float,
-    hard_before: int,
-    hard_after: int,
-    overlaps_before: int,
-    overlaps_after: int,
-) -> bool:
-    if hard_after > hard_before:
-        return False
-    if overlaps_after > overlaps_before:
-        return False
-    return score_after <= score_before + EXTERNAL_GUIDANCE_SCORE_MARGIN
 
 
 def _evaluate_visual_review(
@@ -350,6 +334,92 @@ def _evaluate_visual_review(
     return None
 
 
+def _evaluate_planning_refinement(
+    circuit: Circuit,
+    current_layout: LayoutPlan,
+    current_svg: str,
+    current_reports: CriticBreakdown,
+    planning_client: SemanticPlanningClient,
+    *,
+    iteration: int,
+    reference_image: bytes | None,
+    log: list[dict],
+) -> tuple[LayoutPlan, str, CriticBreakdown] | None:
+    try:
+        refined_hints = planning_client.refine_hints(
+            circuit,
+            current_layout,
+            current_svg,
+            current_reports.combined_report,
+            reference_image=reference_image,
+        )
+    except Exception as exc:
+        log.append(
+            {
+                "iteration": iteration,
+                "source": "planning_refinement",
+                "score": current_reports.combined_report.score,
+                "accepted": False,
+                "reason": f"planning_refinement_client_error: {exc}",
+            }
+        )
+        return None
+    if refined_hints is None:
+        log.append(
+            {
+                "iteration": iteration,
+                "source": "planning_refinement",
+                "score": current_reports.combined_report.score,
+                "accepted": False,
+                "reason": "no_refinement_hints",
+            }
+        )
+        return None
+
+    try:
+        candidate_layout = plan_layout(circuit, planning_hints=refined_hints)
+        verify_layout_topology(circuit, candidate_layout)
+        candidate_layers = render_svg_layers(candidate_layout)
+        candidate_reports = critique_parts(
+            circuit,
+            candidate_layout,
+            candidate_layers.final_svg,
+            layers=candidate_layers,
+        )
+    except Exception as exc:
+        log.append(
+            {
+                "iteration": iteration,
+                "source": "planning_refinement",
+                "score": current_reports.combined_report.score,
+                "accepted": False,
+                "reason": f"planning_refinement_candidate_error: {exc}",
+            }
+        )
+        return None
+
+    hard_before = sum(1 for violation in current_reports.combined_report.violations if violation.hard)
+    hard_after = sum(1 for violation in candidate_reports.combined_report.violations if violation.hard)
+    accepted = candidate_reports.combined_report.score <= current_reports.combined_report.score - 0.5 or hard_after < hard_before
+    log.append(
+        {
+            "iteration": iteration,
+            "source": "planning_refinement",
+            "score": candidate_reports.combined_report.score,
+            "accepted": accepted,
+            "hard_failures_before": hard_before,
+            "hard_failures_after": hard_after,
+        }
+    )
+    if not accepted:
+        return None
+    return candidate_layout, candidate_layers.final_svg, candidate_reports
+
+
+def _should_request_refinement(report) -> bool:
+    return bool(report.hard_fail or report.score > 10)
+
+
 def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
     moves: list[MoveComponent] = []
     label_moves: list[MoveLabel] = []
@@ -370,7 +440,7 @@ def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
     should_compact = "fill_ratio_low" in codes or "too_much_empty_canvas" in codes or (
         "spread_excessive" in codes and raster_fill < 0.28 and component_fill < 0.45
     )
-    if should_compact and not _has_external_planning_hints(layout):
+    if should_compact and _compaction_allowed(layout, codes):
         moves = _compact_moves(layout, moves)
 
     if "component_overlap" in codes:
@@ -420,7 +490,13 @@ def _orientation_candidate_better(candidate_report, best_report) -> bool:
         return False
     if candidate_hard < best_hard:
         return True
+    if candidate_report.score <= best_report.score + 0.1 and _wire_crossing_count(candidate_report) < _wire_crossing_count(best_report):
+        return True
     return candidate_report.score < best_report.score - 0.1
+
+
+def _wire_crossing_count(report) -> float:
+    return float(report.metrics.get("wire_crossing_count", report.metrics.get("vector.wire_crossing_count", 0)))
 
 
 def _violation_count(report, code: str) -> int:
@@ -667,6 +743,12 @@ def _has_external_planning_hints(layout: LayoutPlan) -> bool:
     return bool(layout.support.planning_hints)
 
 
+def _compaction_allowed(layout: LayoutPlan, codes: set[str]) -> bool:
+    if not _has_external_planning_hints(layout):
+        return True
+    return bool({"fill_ratio_low", "too_much_empty_canvas", "unbalanced_ink_mass"} & codes)
+
+
 def _empty_patch(patch: LayoutPatch) -> bool:
     return not (
         patch.move_component
@@ -707,7 +789,7 @@ def _is_terminal_layout(component: LayoutComponent) -> bool:
 
 
 def _is_output_layout(component: LayoutComponent) -> bool:
-    return _key(component.type) == "output" or "output" in _key(component.role)
+    return _key(component.type) == "output" or _role_is_output_port(component.role)
 
 
 def _pin_kind(pin_name: str) -> str:
@@ -723,6 +805,11 @@ def _pin_kind(pin_name: str) -> str:
 
 def _key(value: str | None) -> str:
     return (value or "").lower().replace("-", "_").replace(" ", "_")
+
+
+def _role_is_output_port(role: str | None) -> bool:
+    key = _key(role)
+    return key in {"output", "output_port", "output_terminal", "load_output", "monitor_output", "final_output"} or key.endswith("_output")
 
 
 def _polyline_intersects_bbox(points: list[Point], bbox: BBox) -> bool:

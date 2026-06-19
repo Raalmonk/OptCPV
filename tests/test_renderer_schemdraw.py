@@ -1,7 +1,7 @@
 from dataclasses import replace
 import xml.etree.ElementTree as ET
 
-from optcpv import draw_svg
+from optcpv import Circuit, Component, draw_svg
 from optcpv.examples import EXAMPLES, instrumentation_amplifier
 from optcpv.models import LayoutWire, Point
 from optcpv.planner import plan_layout
@@ -69,3 +69,24 @@ def test_debug_renderer_draws_wire_crossing_as_jump_bridge() -> None:
     assert '<path class="wire"' in svg
     assert " Q " in svg
     assert 'data-net-name="horizontal"' in svg
+
+
+def test_meter_components_render_as_round_meter_symbols() -> None:
+    circuit = Circuit(
+        id="meter_symbol",
+        components=[
+            Component(id="VIN", type="input", pins={"out": "in"}),
+            Component(id="A", type="ammeter", pins={"a": "in", "b": "out"}, label="A"),
+            Component(id="VOUT", type="output", pins={"in": "out"}),
+        ],
+    )
+
+    svg = draw_svg(circuit)
+    debug_svg = render_debug_svg(plan_layout(circuit))
+
+    assert 'data-component-id="A"' in svg
+    assert "<circle" in svg
+    assert ">A<" in svg
+    assert 'data-label-id="label:A"' not in svg
+    assert 'data-component-type="ammeter"' in debug_svg
+    assert ">A<" in debug_svg

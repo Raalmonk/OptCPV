@@ -119,6 +119,12 @@ class SchemdrawRenderer:
             return _first_attr(elm, ["Photodiode", "Diode"]) if "photo" in key else _first_attr(elm, ["Diode"])
         if "switch" in key or key.startswith("sw"):
             return _first_attr(elm, ["Switch"])
+        if _is_meter_component(component):
+            if _is_current_meter(component):
+                return _first_attr(elm, ["MeterA", "MeterI", "MeterAnalog"])
+            if _is_voltage_meter(component):
+                return _first_attr(elm, ["MeterV", "MeterAnalog"])
+            return _first_attr(elm, ["MeterAnalog", "MeterA"])
         if _is_filter_block(component):
             return None
         if key in {"ground", "gnd"}:
@@ -651,6 +657,8 @@ def draw_local_supply_or_ground(layout: LayoutPlan, terminal: LocalTerminalInten
     direction = terminal.preferred_direction
     label = terminal.label or terminal.net
     if terminal.terminal_type == "signal_label":
+        if _is_redundant_output_signal_label_terminal(layout, terminal):
+            return ""
         return _draw_signal_label_terminal(layout, terminal, pin, label)
     if terminal.terminal_type == "positive_supply":
         return _draw_supply_terminal(layout, terminal, Point(pin.x, pin.y), label, up=True)
@@ -859,6 +867,24 @@ def _terminal_owner_is_filter_block(layout: LayoutPlan, terminal: LocalTerminalI
     return component is not None and _is_filter_block(component)
 
 
+def _is_redundant_output_signal_label_terminal(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    owner = next((component for component in layout.components if component.id == terminal.component_id), None)
+    if owner is None or _key(owner.type) not in {"output", "output_terminal"}:
+        return False
+    return any(
+        other.terminal_type == "signal_label"
+        and other.net == terminal.net
+        and other.component_id != terminal.component_id
+        and not _terminal_owner_is_output(layout, other)
+        for other in layout.semantic.local_terminals
+    )
+
+
+def _terminal_owner_is_output(layout: LayoutPlan, terminal: LocalTerminalIntent) -> bool:
+    owner = next((component for component in layout.components if component.id == terminal.component_id), None)
+    return owner is not None and _key(owner.type) in {"output", "output_terminal"}
+
+
 def _is_redundant_terminal_component(layout: LayoutPlan, component: LayoutComponent) -> bool:
     if _has_signal_label_terminal(layout, component) and _is_signal_label_terminal_component(component):
         return True
@@ -936,7 +962,7 @@ def _filter_token(value: str) -> bool:
 
 def _element_anchor(component: LayoutComponent) -> Point:
     key = _key(component.type)
-    if "resistor" in key or key.startswith("r") or "capacitor" in key or key.startswith("c"):
+    if "resistor" in key or key.startswith("r") or "capacitor" in key or key.startswith("c") or _is_meter_component(component):
         if component.orientation in {"up", "north"}:
             return Point(component.x, component.y + 0.95)
         if component.orientation in {"down", "south"}:
@@ -949,7 +975,7 @@ def _element_anchor(component: LayoutComponent) -> Point:
 
 def _is_two_terminal(component: LayoutComponent) -> bool:
     key = _key(component.type)
-    return "resistor" in key or key.startswith("r") or "capacitor" in key or key.startswith("c")
+    return "resistor" in key or key.startswith("r") or "capacitor" in key or key.startswith("c") or _is_meter_component(component)
 
 
 def _terminal_length(component: LayoutComponent) -> float:
@@ -965,6 +991,8 @@ def _add_visible_labels(svg: str, layout: LayoutPlan) -> str:
 
 def _is_visible_label(layout: LayoutPlan, label: LayoutLabel) -> bool:
     owner = next((component for component in layout.components if component.id == label.owner_id), None)
+    if owner is not None and _is_duplicate_meter_label(owner, label):
+        return False
     return owner is None or not _is_redundant_terminal_component(layout, owner)
 
 
@@ -1006,6 +1034,31 @@ def _label_svg(layout: LayoutPlan, label: LayoutLabel) -> str:
 
 def _sd(point: Point) -> tuple[float, float]:
     return (point.x, -point.y)
+
+
+def _is_meter_component(component: LayoutComponent) -> bool:
+    identity = _key(" ".join(filter(None, [component.type, component.role, component.label, component.value])))
+    return (
+        "ammeter" in identity
+        or "voltmeter" in identity
+        or "meter" in identity
+        or "current_probe" in identity
+        or "voltage_probe" in identity
+    )
+
+
+def _is_current_meter(component: LayoutComponent) -> bool:
+    identity = _key(" ".join(filter(None, [component.type, component.role, component.label, component.value])))
+    return "ammeter" in identity or "current" in identity or identity in {"a", "meter_a"}
+
+
+def _is_voltage_meter(component: LayoutComponent) -> bool:
+    identity = _key(" ".join(filter(None, [component.type, component.role, component.label, component.value])))
+    return "voltmeter" in identity or "voltage" in identity or identity in {"v", "meter_v"}
+
+
+def _is_duplicate_meter_label(component: LayoutComponent, label: LayoutLabel) -> bool:
+    return _is_meter_component(component) and _key(label.text) in {"a", "v", "i", "m"}
 
 
 def _key(value: str | None) -> str:

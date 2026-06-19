@@ -218,21 +218,6 @@ def test_visual_review_request_reroute_becomes_route_policy_patch() -> None:
     assert any(item["net"] == "ecg_out" for item in rerouted.support.planning_hints["route_policies"])
 
 
-def test_visual_review_can_request_orientation_patch() -> None:
-    layout = plan_layout(ecg_rld_frontend(), planning_client=FakePlanningClient(ecg_rld_hints()))
-    review = VisualReview(
-        passed=False,
-        score=42,
-        recognized_topology="ecg",
-        patches=[VisualPatch(action="set_orientation", component_id="A3", orientation="RIGHT_FLIP")],
-    )
-
-    patch = layout_patch_from_visual_review(review, layout)
-
-    assert patch.set_orientation[0].component_id == "A3"
-    assert patch.set_orientation[0].orientation == "right_flip"
-
-
 def test_local_optimizer_searches_opamp_flip_candidates() -> None:
     circuit = ecg_rld_frontend()
     layout = plan_layout(circuit, planning_client=FakePlanningClient(ecg_rld_hints()))

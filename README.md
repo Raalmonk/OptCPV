@@ -46,18 +46,125 @@ vision = ["google-genai>=1.0"]
 
 ## Optional Gemini Feedback
 
-The default loop uses local vector/OpenCV criticism plus `HeuristicVisionClient` for Gemini-shaped feedback without spending credits. To attach Gemini for selected cases, install the optional extra and pass an explicit client:
+The default loop is local: deterministic semantic planning, vector/OpenCV criticism, and topology-safe patches. Gemini is opt-in and can participate at three boundaries:
+
+- `GeminiPlanningClient` proposes semantic layout hints before the first render.
+- The same planning client can receive the failed SVG, local critic report, and optional reference image after a local patch fails, then return refined stage/lane/route hints.
+- `GeminiVisualReviewClient` can review the rendered raster and suggest topology-safe visual patches.
+- `GeminiFigureSemanticClient` can perform the two-pass figure classification/check used before image-backed overlays. The local default uses the same prompt contract without spending quota.
+
+To attach Gemini for selected cases, install the optional extra and pass an explicit client:
 
 ```python
-from optcpv import GeminiVisionClient, draw_optimized_artifact
+from optcpv import GeminiPlanningClient, GeminiVisualReviewClient, draw_optimized_artifact
 
 artifact = draw_optimized_artifact(
     circuit,
-    vision_client=GeminiVisionClient(model="gemini-pro-latest"),
+    planning_client=GeminiPlanningClient(model="gemini-3.5-flash"),
+    visual_review_client=GeminiVisualReviewClient(model="gemini-3.5-flash"),
 )
 ```
 
-The Gemini clients default to Pro-family models. The vision client sends the rendered schematic raster as PNG plus layout/topology metadata, and expects a topology-safe `LayoutPatch` JSON response. Gemini may propose coordinated component moves, label moves, orientation changes, and route-corridor guidance; topology, terminal-net safety, canvas size, and scale-hack validation still run locally before any move is accepted.
+Or enable clients explicitly from the environment:
+
+```bash
+export OPTCPV_PLANNING_CLIENT=textbook
+# or, for real Gemini:
+export OPTCPV_USE_GEMINI_PLANNER=1
+export OPTCPV_USE_GEMINI_VISUAL_REVIEW=1
+export OPTCPV_USE_GEMINI_FIGURE_SEMANTICS=1
+export GEMINI_API_KEY=...
+```
+
+`OPTCPV_PLANNING_CLIENT=gemini`, `OPTCPV_VISUAL_REVIEW_CLIENT=gemini`, and `OPTCPV_FIGURE_SEMANTIC_CLIENT=gemini` are equivalent opt-in switches. `OPTCPV_USE_HEURISTIC_VISUAL_REVIEW=1` enables the local Gemini-shaped reviewer without network calls.
+
+`OPTCPV_PLANNING_CLIENT=textbook` enables the local two-layer Gemini surrogate:
+
+1. `TextbookFigureInterpreter` reads the extracted textbook corpus and compresses figures into structured visual grammar cards.
+2. `TextbookStructurePlanner` retrieves relevant cards for a circuit and emits legal `SchematicLayoutHints`.
+
+This is the preferred low-quota path. It lets OptCPV use the textbook corpus without asking Gemini to inspect hundreds of images each run.
+
+Gemini responses are never trusted blindly. Planning hints are legalized against the existing topology, visual patches are verified locally, and no client may create/delete/rename/rewire components, pins, or nets.
+
+## Textbook Corpus Extraction
+
+When a local textbook PDF is present in the repository root, extract figure crops, problem statements, and category indexes with:
+
+```bash
+python tools/extract_textbook_corpus.py --dpi 180 --out textbook_circuit_corpus
+```
+
+The generated corpus contains:
+
+- `figures/figure_*/crop.png` and `metadata.json`
+- `problems/chapter_*.jsonl`
+- `indexes/figures.jsonl`
+- `indexes/likely_circuit_figures.jsonl`
+- `indexes/problems.jsonl`
+- `indexes/circuit_or_design_problems.jsonl`
+- `classified/` category folders with browsable image links for circuit-like figures
+- `structured_text/figure_cards.jsonl`
+- `structured_text/figure_cards.txt`
+- `structured_text/style_guide.json`
+- `structured_text/by_family/*.txt`
+
+The extractor uses the textbook caption font, nearby vector/image graphics, and chapter-scoped problem IDs so body references such as `Figure ... shows` and numeric values such as `3.3 V` do not become false figures/problems.
+
+Build or refresh the structured cards with:
+
+```bash
+python tools/build_textbook_structured_cards.py --corpus textbook_circuit_corpus
+```
+
+These cards are deliberately text-first. They summarize figure family, component cues, layout principles, route principles, image metrics, and source crop paths so a real Gemini call can receive a compact textbook memory instead of raw bulk images.
+
+To run a local smoke check of that communication layer without Gemini quota:
+
+```bash
+python tools/run_textbook_surrogate_smoke.py
+```
+
+It writes SVG/PNG artifacts, summaries, and the exact `GEMINI_MIDDLE_LAYER` structured text to `generated/textbook_surrogate_smoke/`.
+
+To run the full textbook batch over every extracted figure card:
+
+```bash
+python tools/run_textbook_corpus_batch.py --out generated/textbook_corpus_batch
+```
+
+That batch validates every crop and structured card, then renders every likely circuit figure through a card-scoped textbook surrogate fixture. It writes `summary.json`, `results.jsonl`, and per-card middle-layer prompts under `generated/textbook_corpus_batch/`.
+
+## Image-Backed Interactive Overlays
+
+For problem statements that already include a textbook figure, OptCPV can keep the original image as the source of truth and add transparent interactive SVG hit targets on top:
+
+```python
+from optcpv import analyze_image_overlay, render_image_overlay_svg
+
+plan = analyze_image_overlay("textbook_circuit_corpus/figures/figure_1.9_p065/crop.png")
+svg = render_image_overlay_svg(plan)
+```
+
+The local low-quota Gemini surrogate has two semantic layers before CV overlay:
+
+1. `FIGURE_SEMANTIC_DRAFT`: generate basic figure grammar, identify the input/figure kind, describe plot axes/quantity when applicable, and apply circuit grammar only to true schematics.
+2. `FIGURE_SEMANTIC_CHECK`: reject contradictions before overlay. Plots/waveforms/photos are skipped; block diagrams only create functional block buttons, never R/C/L/op-amp symbol buttons.
+
+Only after that gate does CV run:
+
+1. `IMAGE_GRAPH_DRAFT`: extract wire runs, node candidates, and component or block regions from the allowed image regions.
+2. `IMAGE_OVERLAY_PLAN`: snap those primitives into highlightable wires and `role=button` regions while preserving the source image.
+
+Rendered overlay SVGs expose `window.optcpvHighlightWires([...])`, `window.optcpvClearHighlight()`, wire `data-wire-id` attributes, and component `data-component-id`/`data-wire-ids` attributes. Clicking a component button highlights its connected wires.
+
+Run the full textbook overlay audit with:
+
+```bash
+python tools/run_textbook_image_overlay_batch.py --out generated/textbook_image_overlay_batch
+```
+
+The batch writes per-figure SVG/JSON artifacts, both overlay middle-layer text files, `results.jsonl`, `summary.json`, and visual contact sheets. For every figure it also writes auditable Gemini-shaped communication files under `middle_layers/`: `*.gemini_layer1_input.txt`, `*.gemini_layer1_output.json`, `*.gemini_layer2_input.txt`, and `*.gemini_layer2_output.json`. It reports card-level expectations separately from the semantic/visual classifier, so mislabeled textbook crops such as waveforms or anatomy photos are surfaced as semantic rejections instead of being forced into circuit overlays.
 
 ## Public API
 
@@ -127,7 +234,7 @@ CV means OptCPV inspects its own rendered output:
 - component density and compactness
 - left-to-right balance and schematic conventions
 
-CV does not mean OCR or recognizing arbitrary uploaded schematic images.
+For existing figure images, CV can produce image-backed interaction overlays. That is not the same as recovering a complete electrical netlist; the original image remains the visual source of truth, and OptCPV adds nodes, wires, component buttons, and highlight metadata for interaction.
 
 ## Topology Safety
 

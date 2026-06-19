@@ -35,6 +35,21 @@ def test_vector_critic_catches_different_net_wire_overlap() -> None:
     assert report.hard_fail
 
 
+def test_vector_critic_tracks_jumpable_crossings_without_failure() -> None:
+    layout = plan_layout(voltage_divider())
+    crossed = replace(
+        layout,
+        wires=[
+            LayoutWire(net="a", points=[Point(13.0, 12.0), Point(17.0, 12.0)], connected_pins=[]),
+            LayoutWire(net="b", points=[Point(15.0, 10.0), Point(15.0, 14.0)], connected_pins=[]),
+        ],
+    )
+    report = critique_layout(crossed)
+
+    assert report.metrics["wire_crossing_count"] == 1
+    assert not any(violation.code == "wire_crossings" for violation in report.violations)
+
+
 def test_vector_critic_rejects_diagonal_wire() -> None:
     layout = plan_layout(voltage_divider())
     diagonal = replace(

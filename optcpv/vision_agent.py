@@ -8,11 +8,9 @@ import json
 import re
 from typing import Any
 
-from .models import BBox, Circuit, CriticReport, LayoutComponent, LayoutLabel, LayoutPlan, NetClass, Point
-from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, SetRoutePolicy
+from .models import BBox, Circuit, CriticReport, LayoutComponent, LayoutLabel, LayoutPlan, Point
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation
 from .raster import RasterImage
-
-DEFAULT_GEMINI_VISION_MODEL = "gemini-pro-latest"
 
 
 class VisionLayoutClient:
@@ -97,7 +95,7 @@ class HeuristicVisionClient(VisionLayoutClient):
 class GeminiVisionClient(VisionLayoutClient):
     """Optional Gemini-backed client; never part of the default optimizer."""
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_GEMINI_VISION_MODEL) -> None:
+    def __init__(self, api_key: str | None = None, model: str = "gemini-3.5-flash") -> None:
         try:
             from google import genai  # type: ignore
             from google.genai import types  # type: ignore
@@ -359,25 +357,14 @@ def _patch_prompt(
         "task": "Return a topology-safe OptCPV LayoutPatch JSON only.",
         "hard_rules": [
             "Do not change canvas width, height, grid, component ids, component types, pins, nets, or topology.",
-            "You may move existing components, move existing labels, set existing component orientation, or request route-policy corridors for existing non-terminal nets.",
-            "You may make coordinated drawing-guidance moves when they improve teaching readability, but keep the layout inside the canvas.",
+            "Only move existing components, move existing labels, or set existing component orientation.",
+            "Do not spread components far apart. Prefer small local moves.",
             "If uncertain, return empty arrays.",
         ],
-        "authority": {
-            "drawing_guidance": "High. Prefer clear schematic conventions, feedback corridors, and non-overlapping labels over preserving deterministic placement.",
-            "local_gate": "OptCPV will reject topology changes, terminal-net routing changes, canvas/scale hacks, and unsafe spread.",
-        },
         "schema": {
             "move_component": [{"component_id": "existing id", "x": "float", "y": "float"}],
             "move_label": [{"label_id": "existing label id", "x": "float", "y": "float"}],
-            "set_orientation": [{"component_id": "existing id", "orientation": "right|left|up|down|right_flip"}],
-            "set_route_policy": [
-                {
-                    "net": "existing non-terminal net",
-                    "net_role": "feedback|right_leg_drive|signal|inter_block",
-                    "policy": "top_feedback_corridor|bottom_feedback_corridor|bottom_auxiliary_corridor|left_to_right_manhattan|avoid_opamp_body",
-                }
-            ],
+            "set_orientation": [{"component_id": "existing id", "orientation": "right|left|up|down"}],
             "set_wire_points": [],
         },
         "circuit": {
@@ -428,14 +415,7 @@ def _patch_from_json(text: str, layout: LayoutPlan) -> LayoutPatch:
     data = _parse_json(text)
     component_ids = {component.id for component in layout.components}
     label_ids = {label.id for label in layout.labels}
-    orientations = {"right", "left", "up", "down", "right_flip"}
-    route_policies = {
-        "left_to_right_manhattan",
-        "top_feedback_corridor",
-        "bottom_feedback_corridor",
-        "bottom_auxiliary_corridor",
-        "avoid_opamp_body",
-    }
+    orientations = {"right", "left", "up", "down"}
 
     move_component = []
     for raw in _list(data.get("move_component")):
@@ -452,35 +432,16 @@ def _patch_from_json(text: str, layout: LayoutPlan) -> LayoutPatch:
     set_orientation = []
     for raw in _list(data.get("set_orientation")):
         component_id = str(raw.get("component_id", ""))
-        orientation = _normalize_orientation(str(raw.get("orientation", "")))
+        orientation = str(raw.get("orientation", ""))
         if component_id in component_ids and orientation in orientations:
             set_orientation.append(SetOrientation(component_id, orientation))
-
-    set_route_policy = []
-    for raw in _list(data.get("set_route_policy")):
-        net = str(raw.get("net", ""))
-        policy = str(raw.get("policy", ""))
-        if net in layout.net_to_pins and policy in route_policies and _route_policy_safe(layout, net):
-            set_route_policy.append(SetRoutePolicy(net=net, policy=policy, net_role=str(raw.get("net_role", "feedback"))))
 
     return LayoutPatch(
         move_component=move_component,
         move_label=move_label,
         set_orientation=set_orientation,
-        set_route_policy=set_route_policy,
         set_wire_points=[],
     )
-
-
-def _normalize_orientation(value: str) -> str:
-    key = _key(value)
-    aliases = {"east": "right", "west": "left", "north": "up", "south": "down", "rightflip": "right_flip"}
-    return aliases.get(key, key)
-
-
-def _route_policy_safe(layout: LayoutPlan, net: str) -> bool:
-    net_class = layout.semantic.net_classes.get(net, NetClass.SIGNAL)
-    return net_class not in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}
 
 
 def _parse_json(text: str) -> dict[str, Any]:

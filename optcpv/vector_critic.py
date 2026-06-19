@@ -49,6 +49,7 @@ def critique_layout(layout: LayoutPlan) -> CriticReport:
         "viewbox_area": canvas_area,
         "component_bbox_area": component_bbox.area(),
         "wire_length_limit": wire_length_limit,
+        "wire_crossing_count": _wire_crossings(layout),
         "semantic_local_terminal_count": len(layout.semantic.local_terminals),
         "semantic_terminal_net_count": sum(1 for net_class in layout.semantic.net_classes.values() if _is_terminal_net_class(net_class)),
     }
@@ -117,9 +118,6 @@ def _wire_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> N
                         subject=f"{wire.net}:{component.id}",
                     )
                 )
-    crossings = _wire_crossings(layout)
-    if crossings:
-        violations.append(CriticViolation("wire_crossings", f"{crossings} wire crossings detected.", crossings * 3))
     overlaps = _wire_net_overlaps(layout)
     if overlaps:
         violations.append(
@@ -194,6 +192,8 @@ def _convention_violations(layout: LayoutPlan, violations: list[CriticViolation]
             if component.y < median_y:
                 violations.append(CriticViolation("ground_not_low", f"{component.id} is not below signal path.", 7, subject=component.id))
         if "resistor" in key and "feedback" in _key(component.role):
+            if _opamp_network_layout(layout):
+                continue
             owner = _feedback_owner(layout, component)
             owner_y = owner.y if owner is not None else _opamp_y(layout)
             if owner is not None and _is_flipped_opamp(owner):
@@ -326,6 +326,8 @@ def _signal_flow_violations(layout: LayoutPlan, violations: list[CriticViolation
         target = component_by_id.get(route.target[0])
         if source is None or target is None or source.id == target.id:
             continue
+        if _is_shunt_reference_component(source) or _is_shunt_reference_component(target):
+            continue
         if target.x + 0.2 < source.x and not _is_feedback_route(layout, route.net, source, target):
             violations.append(
                 CriticViolation(
@@ -335,6 +337,13 @@ def _signal_flow_violations(layout: LayoutPlan, violations: list[CriticViolation
                     subject=route.net,
                 )
             )
+
+
+def _is_shunt_reference_component(component: LayoutComponent) -> bool:
+    key = _key(component.type)
+    if not ("resistor" in key or "capacitor" in key):
+        return False
+    return any(is_local_terminal_net(net) for net in component.pins.values())
 
 
 def _parallel_lane_violations(layout: LayoutPlan, violations: list[CriticViolation]) -> None:
@@ -497,11 +506,25 @@ def _average_component_distance(layout: LayoutPlan) -> float:
 
 
 def _average_distance_limit(layout: LayoutPlan) -> float:
+    if _linear_block_chain_layout(layout):
+        return max(12.0, len(_visible_components(layout)) * 1.8)
     if _opamp_network_layout(layout):
         if layout.width > 1400 and layout.height <= 720:
             return 14.0
         return 11.2
     return 8.2 if _complex_opamp_layout(layout) else 7.5
+
+
+def _linear_block_chain_layout(layout: LayoutPlan) -> bool:
+    visible = _visible_components(layout)
+    if len(visible) < 4:
+        return False
+    filter_count = sum(1 for component in visible if _is_filter_block(component))
+    if filter_count < 2:
+        return False
+    if any(not (_is_filter_block(component) or _is_explicit_terminal_component(component)) for component in visible):
+        return False
+    return max(component.x for component in visible) - min(component.x for component in visible) > 4.0
 
 
 def _opamp_network_layout(layout: LayoutPlan) -> bool:

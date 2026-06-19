@@ -10,12 +10,12 @@ import re
 from typing import Any
 
 from .models import Circuit, CriticReport, LayoutComponent, LayoutPin, LayoutPlan, NetClass
-from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, SetRoutePolicy
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetRoutePolicy
 from .raster import RasterImage
 
 
-VISUAL_PATCH_ACTIONS = {"move_component", "move_label", "set_orientation", "assign_route_corridor", "request_reroute", "no_op"}
-DEFAULT_GEMINI_VISUAL_REVIEW_MODEL = "gemini-pro-latest"
+VISUAL_PATCH_ACTIONS = {"move_component", "move_label", "assign_route_corridor", "request_reroute", "add_constraint", "no_op"}
+DEFAULT_GEMINI_VISUAL_REVIEW_MODEL = "gemini-3.5-flash"
 
 
 @dataclass(frozen=True)
@@ -49,9 +49,9 @@ class VisualPatch:
     label_id: str | None = None
     net: str | None = None
     corridor: str | None = None
-    orientation: str | None = None
     x: float | None = None
     y: float | None = None
+    constraint: dict[str, Any] | None = None
     reason: str = ""
 
     def __post_init__(self) -> None:
@@ -66,9 +66,9 @@ class VisualPatch:
             label_id=_optional_str(raw.get("label_id")),
             net=_optional_str(raw.get("net")),
             corridor=_optional_str(raw.get("corridor")),
-            orientation=_optional_str(raw.get("orientation")),
             x=_optional_float(raw.get("x")),
             y=_optional_float(raw.get("y")),
+            constraint=raw.get("constraint") if isinstance(raw.get("constraint"), dict) else None,
             reason=str(raw.get("reason", "")),
         )
 
@@ -79,9 +79,9 @@ class VisualPatch:
             "label_id": self.label_id,
             "net": self.net,
             "corridor": self.corridor,
-            "orientation": self.orientation,
             "x": self.x,
             "y": self.y,
+            "constraint": dict(self.constraint) if self.constraint is not None else None,
             "reason": self.reason,
         }
 
@@ -181,7 +181,8 @@ class GeminiVisualReviewClient(VisualReviewClient):
             from google.genai import types  # type: ignore
         except ImportError as exc:
             raise RuntimeError("Install optcpv[vision] to use GeminiVisualReviewClient.") from exc
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        env_api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY")
+        self._client = genai.Client(api_key=env_api_key) if env_api_key else genai.Client()
         self._model = model or os.getenv("OPTCPV_GEMINI_VISUAL_REVIEW_MODEL", DEFAULT_GEMINI_VISUAL_REVIEW_MODEL)
         self._types = types
 
@@ -209,12 +210,26 @@ class GeminiVisualReviewClient(VisualReviewClient):
         return self._types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/png")
 
 
+def visual_review_client_from_env() -> VisualReviewClient | None:
+    """Return an env-configured visual reviewer when explicitly enabled."""
+
+    from .planning_agent import load_dotenv_if_present
+
+    load_dotenv_if_present()
+    reviewer = _key(os.getenv("OPTCPV_VISUAL_REVIEW_CLIENT"))
+    if reviewer in {"heuristic", "local"} or _truthy(os.getenv("OPTCPV_USE_HEURISTIC_VISUAL_REVIEW")):
+        return HeuristicVisualReviewClient()
+    enabled = _truthy(os.getenv("OPTCPV_USE_GEMINI_VISUAL_REVIEW")) or reviewer == "gemini"
+    if not enabled:
+        return None
+    return GeminiVisualReviewClient()
+
+
 def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) -> LayoutPatch:
     component_ids = {component.id for component in layout.components}
     label_ids = {label.id for label in layout.labels}
     move_components: list[MoveComponent] = []
     move_labels: list[MoveLabel] = []
-    orientations: list[SetOrientation] = []
     route_policies: list[SetRoutePolicy] = []
 
     for patch in review.patches:
@@ -222,12 +237,12 @@ def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) ->
             move_components.append(MoveComponent(patch.component_id, patch.x, patch.y))
         elif patch.action == "move_label" and patch.label_id in label_ids and patch.x is not None and patch.y is not None:
             move_labels.append(MoveLabel(patch.label_id, patch.x, patch.y))
-        elif patch.action == "set_orientation" and patch.component_id in component_ids:
-            orientation = _normalize_orientation(patch.orientation)
-            if orientation is not None:
-                orientations.append(SetOrientation(patch.component_id, orientation))
         elif patch.action in {"assign_route_corridor", "request_reroute"} and patch.net:
             route_policy = _route_policy_from_visual_patch(patch, layout)
+            if route_policy is not None:
+                route_policies.append(route_policy)
+        elif patch.action == "add_constraint":
+            route_policy = _route_policy_from_constraint_patch(patch, layout)
             if route_policy is not None:
                 route_policies.append(route_policy)
         elif patch.action == "no_op":
@@ -235,16 +250,8 @@ def layout_patch_from_visual_review(review: VisualReview, layout: LayoutPlan) ->
     return LayoutPatch(
         move_component=move_components,
         move_label=move_labels,
-        set_orientation=orientations,
         set_route_policy=route_policies,
     )
-
-
-def _normalize_orientation(value: str | None) -> str | None:
-    key = _key(value or "")
-    aliases = {"east": "right", "west": "left", "north": "up", "south": "down", "rightflip": "right_flip"}
-    key = aliases.get(key, key)
-    return key if key in {"right", "left", "up", "down", "right_flip"} else None
 
 
 def _route_policy_from_visual_patch(patch: VisualPatch, layout: LayoutPlan) -> SetRoutePolicy | None:
@@ -258,6 +265,28 @@ def _route_policy_from_visual_patch(patch: VisualPatch, layout: LayoutPlan) -> S
         return None
     role = "right_leg_drive" if policy == "bottom_auxiliary_corridor" else "feedback"
     return SetRoutePolicy(net=patch.net, policy=policy, net_role=role)
+
+
+def _route_policy_from_constraint_patch(patch: VisualPatch, layout: LayoutPlan) -> SetRoutePolicy | None:
+    constraint = patch.constraint or {}
+    constraint_type = _key(_optional_str(constraint.get("type", constraint.get("constraint_type"))) or "")
+    net = _optional_str(constraint.get("net")) or patch.net
+    if net is None:
+        return None
+    if constraint_type in {"feedback_outside_body", "outer_feedback_loop", "avoid_opamp_body", "avoid_active_body"}:
+        side = _key(_optional_str(constraint.get("preferred_side", constraint.get("side"))) or "")
+        corridor = patch.corridor
+        if side in {"top", "above"}:
+            corridor = "top_feedback_corridor"
+        elif side in {"bottom", "below"}:
+            corridor = "bottom_feedback_corridor"
+        return _route_policy_from_visual_patch(
+            VisualPatch(action="request_reroute", net=net, corridor=corridor, reason=patch.reason),
+            layout,
+        )
+    if constraint_type == "local_terminal_only":
+        return None
+    return None
 
 
 def _normalize_corridor_policy(corridor: str | None, net: str, layout: LayoutPlan) -> str | None:
@@ -358,14 +387,10 @@ def _review_prompt(circuit: Circuit, layout: LayoutPlan, svg: str, critic_report
             "Do not create, delete, rename, or rewire components, pins, or nets.",
             "Do not change pin mappings.",
             "Do not output absolute pixel-only SVG rewrites.",
-            "You may propose coordinated component moves, label moves, component orientation changes, and route corridor/reroute requests.",
-            "Only propose move_component, move_label, set_orientation, assign_route_corridor, request_reroute, or no_op patches.",
+            "Prefer add_constraint when the issue is a violated schematic grammar rule such as feedback_outside_body or local_terminal_only.",
+            "Only propose move_component, move_label, assign_route_corridor, request_reroute, add_constraint, or no_op patches.",
             "All patches must be safe to pass through local LayoutPatch verification.",
         ],
-        "authority": {
-            "drawing_guidance": "High. Prefer the clearest teaching schematic even when deterministic placement is visually conservative.",
-            "local_gate": "Topology, terminal nets, canvas bounds, and scale-hack protections remain enforced locally.",
-        },
         "schema": {
             "passed": "boolean",
             "score": "integer 0-100",
@@ -373,14 +398,19 @@ def _review_prompt(circuit: Circuit, layout: LayoutPlan, svg: str, critic_report
             "visual_errors": [{"code": "string", "message": "string", "subject": "optional string", "severity": "number"}],
             "patches": [
                 {
-                    "action": "move_component|move_label|set_orientation|assign_route_corridor|request_reroute|no_op",
+                    "action": "move_component|move_label|assign_route_corridor|request_reroute|add_constraint|no_op",
                     "component_id": "optional existing id",
                     "label_id": "optional existing label id",
                     "net": "optional existing net",
                     "corridor": "optional corridor name",
-                    "orientation": "optional right|left|up|down|right_flip for set_orientation",
                     "x": "optional layout-grid x for move actions",
                     "y": "optional layout-grid y for move actions",
+                    "constraint": {
+                        "type": "feedback_outside_body|outer_feedback_loop|local_terminal_only|avoid_opamp_body|avoid_active_body",
+                        "subject": "optional existing component id",
+                        "net": "optional existing net",
+                        "preferred_side": "optional top|bottom",
+                    },
                     "reason": "string",
                 }
             ],
@@ -457,6 +487,10 @@ def _key(value: str | None) -> str:
     return (value or "").lower().replace("-", "_").replace(" ", "_")
 
 
+def _truthy(value: str | None) -> bool:
+    return _key(value) in {"1", "true", "yes", "on", "gemini"}
+
+
 __all__ = [
     "FakeVisualReviewClient",
     "GeminiVisualReviewClient",
@@ -466,4 +500,5 @@ __all__ = [
     "VisualReview",
     "VisualReviewClient",
     "layout_patch_from_visual_review",
+    "visual_review_client_from_env",
 ]

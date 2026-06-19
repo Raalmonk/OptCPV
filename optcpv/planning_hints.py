@@ -12,18 +12,33 @@ import json
 import re
 from typing import Any
 
+from .intent import SchematicIntent
 
-INPUT_MODES = {"image_guided", "model_guided"}
+
+INPUT_MODES = {"image_guided", "model_guided", "refinement"}
 ORIENTATIONS = {"RIGHT", "LEFT", "UP", "DOWN", "RIGHT_FLIP"}
 ROUTE_POLICIES = {
+    "avoid_crossing_existing_route",
+    "avoid_label_zone",
     "left_to_right_manhattan",
+    "input_to_stage",
+    "stage_to_stage",
+    "output_to_load",
     "top_feedback_corridor",
     "bottom_feedback_corridor",
+    "outer_feedback_loop",
     "bottom_auxiliary_corridor",
     "local_terminal_only",
+    "direct_short",
+    "named_net_label",
+    "paired_differential_route",
+    "shared_bus_spine",
+    "star_node",
+    "tee_branch",
     "avoid_opamp_body",
+    "avoid_active_body",
 }
-HINT_SOURCES = {"deterministic", "gemini", "fake", "manual"}
+HINT_SOURCES = {"deterministic", "gemini", "gemini_refinement", "textbook_surrogate", "fake", "manual"}
 
 
 @dataclass(frozen=True)
@@ -422,6 +437,7 @@ class SchematicLayoutHints:
     inter_block_routes: tuple[InterBlockRouteHint, ...]
     auxiliary_loops: tuple[AuxiliaryLoopHint, ...]
     orientation_overrides: tuple[OrientationOverrideHint, ...]
+    intent: SchematicIntent | None
 
     def __init__(
         self,
@@ -444,6 +460,7 @@ class SchematicLayoutHints:
         inter_block_routes: tuple[InterBlockRouteHint, ...] | list[InterBlockRouteHint] | None = None,
         auxiliary_loops: tuple[AuxiliaryLoopHint, ...] | list[AuxiliaryLoopHint] | None = None,
         orientation_overrides: tuple[OrientationOverrideHint, ...] | list[OrientationOverrideHint] | None = None,
+        intent: SchematicIntent | dict[str, Any] | None = None,
     ) -> None:
         use_stages = stages if stages is not None else stage_order
         use_placements = list(placements or ())
@@ -469,6 +486,7 @@ class SchematicLayoutHints:
         object.__setattr__(self, "inter_block_routes", tuple(inter_block_routes or ()))
         object.__setattr__(self, "auxiliary_loops", tuple(auxiliary_loops or ()))
         object.__setattr__(self, "orientation_overrides", tuple(orientation_overrides or ()))
+        object.__setattr__(self, "intent", _intent_from_raw(intent))
 
     @property
     def stage_order(self) -> tuple[StageHint, ...]:
@@ -507,6 +525,7 @@ class SchematicLayoutHints:
             inter_block_routes=inter_block_routes,
             auxiliary_loops=tuple(AuxiliaryLoopHint.from_dict(item) for item in _list(raw.get("auxiliary_loops"))),
             orientation_overrides=tuple(OrientationOverrideHint.from_dict(item) for item in _list(raw.get("orientation_overrides"))),
+            intent=_intent_raw_from_dict(raw),
         )
 
     @classmethod
@@ -531,6 +550,7 @@ class SchematicLayoutHints:
             inter_block_routes=updates.get("inter_block_routes", self.inter_block_routes),
             auxiliary_loops=updates.get("auxiliary_loops", self.auxiliary_loops),
             orientation_overrides=updates.get("orientation_overrides", self.orientation_overrides),
+            intent=updates.get("intent", self.intent),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -551,6 +571,7 @@ class SchematicLayoutHints:
             "inter_block_routes": [route.to_dict() for route in self.inter_block_routes],
             "auxiliary_loops": [loop.to_dict() for loop in self.auxiliary_loops],
             "orientation_overrides": [override.to_dict() for override in self.orientation_overrides],
+            "intent": self.intent.to_dict() if self.intent is not None else None,
         }
 
     def to_json(self) -> str:
@@ -599,6 +620,33 @@ def _list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("Expected a list of objects.")
     return [item for item in value if isinstance(item, dict)]
+
+
+def _intent_raw_from_dict(raw: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(raw.get("intent"), dict):
+        return raw["intent"]
+    intent_keys = {"component_roles", "pin_roles", "net_roles", "constraints"}
+    if not any(key in raw for key in intent_keys):
+        return None
+    return {
+        "recognized_topology": raw.get("recognized_topology", ""),
+        "component_roles": raw.get("component_roles", {}),
+        "pin_roles": raw.get("pin_roles", {}),
+        "net_roles": raw.get("net_roles", {}),
+        "blocks": raw.get("functional_blocks", raw.get("intent_blocks", [])),
+        "constraints": raw.get("constraints", []),
+        "route_intents": raw.get("route_intents", []),
+        "confidence": raw.get("confidence", 0.0),
+        "source": raw.get("source", "manual"),
+    }
+
+
+def _intent_from_raw(raw: SchematicIntent | dict[str, Any] | None) -> SchematicIntent | None:
+    if raw is None:
+        return None
+    if isinstance(raw, SchematicIntent):
+        return raw
+    return SchematicIntent.from_dict(raw)
 
 
 def _normalize_orientation(value: str | None) -> str:

@@ -24,7 +24,7 @@ def legalize_planning_hints(circuit: Circuit, hints: SchematicLayoutHints) -> Sc
         return None
     if any(placement.component_id not in component_ids for placement in hints.placements):
         return None
-    if not _members_are_known(hints, component_ids, net_names):
+    if not _members_are_known(hints, circuit.components, component_ids, net_names):
         return None
     if not _route_policies_are_legal(hints, net_names):
         return None
@@ -44,7 +44,13 @@ def legalize_planning_hints(circuit: Circuit, hints: SchematicLayoutHints) -> Sc
     return hints.with_updates(placements=tuple(placements.values()), confidence=confidence)
 
 
-def _members_are_known(hints: SchematicLayoutHints, component_ids: set[str], net_names: set[str]) -> bool:
+def _members_are_known(
+    hints: SchematicLayoutHints,
+    components: list[Component],
+    component_ids: set[str],
+    net_names: set[str],
+) -> bool:
+    component_pins = {component.id: set(component.pins) for component in components}
     for stage in hints.stages:
         if set(stage.members) - component_ids:
             return False
@@ -70,6 +76,45 @@ def _members_are_known(hints: SchematicLayoutHints, component_ids: set[str], net
             return False
     for override in hints.orientation_overrides:
         if override.component_id not in component_ids:
+            return False
+    if hints.intent is not None and not _intent_members_are_known(hints.intent, component_ids, net_names, component_pins):
+        return False
+    return True
+
+
+def _intent_members_are_known(intent, component_ids: set[str], net_names: set[str], component_pins: dict[str, set[str]]) -> bool:
+    if set(intent.component_roles) - component_ids:
+        return False
+    if set(intent.net_roles) - net_names:
+        return False
+    for pin_key in intent.pin_roles:
+        component_id, _, pin_name = pin_key.partition(".")
+        if component_id not in component_ids:
+            return False
+        if pin_name and pin_name not in component_pins.get(component_id, set()):
+            return False
+    for block in intent.blocks:
+        if set(block.members) - component_ids:
+            return False
+        if set(block.input_nets) - net_names:
+            return False
+        if set(block.output_nets) - net_names:
+            return False
+        if set(block.feedback_nets) - net_names:
+            return False
+        if set(block.reference_nets) - net_names:
+            return False
+    for route in intent.route_intents:
+        if route.net is not None and route.net not in net_names:
+            return False
+    for constraint in intent.constraints:
+        if constraint.net is not None and constraint.net not in net_names:
+            return False
+        if set(constraint.members) - component_ids:
+            return False
+        for endpoint in (constraint.subject, constraint.object):
+            if endpoint is None or endpoint in component_ids or endpoint in net_names:
+                continue
             return False
     return True
 
@@ -249,7 +294,7 @@ def _is_input_or_source(component: Component) -> bool:
 
 
 def _is_output(component: Component) -> bool:
-    return _key(component.type) == "output" or "output" in _key(component.role)
+    return _key(component.type) == "output" or _role_is_output_port(component.role)
 
 
 def _is_opamp(component: Component) -> bool:
@@ -270,3 +315,8 @@ def _pin_kind(pin_name: str) -> str:
 
 def _key(value: str | None) -> str:
     return (value or "").lower().replace("-", "_").replace(" ", "_")
+
+
+def _role_is_output_port(role: str | None) -> bool:
+    key = _key(role)
+    return key in {"output", "output_port", "output_terminal", "load_output", "monitor_output", "final_output"} or key.endswith("_output")

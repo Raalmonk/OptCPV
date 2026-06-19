@@ -1,6 +1,36 @@
 """OptCPV: a CV-native schematic drawing optimizer."""
 
 from .artifact import draw_artifact, draw_svg
+from .figure_semantics import (
+    BASIC_FIGURE_GRAMMAR,
+    CircuitGrammar,
+    FigureSemanticCheck,
+    FigureSemanticChecker,
+    FigureSemanticClient,
+    FigureSemanticDraft,
+    FigureSemanticInterpreter,
+    FigureVisualEvidence,
+    GeminiFigureSemanticClient,
+    LocalFigureSemanticClient,
+    PlotGrammar,
+    analyze_figure_semantics,
+    build_figure_check_prompt,
+    build_figure_identification_prompt,
+    figure_semantic_client_from_env,
+)
+from .grammar import infer_schematic_intent, planning_hints_from_intent
+from .image_overlay import (
+    ImageComponentButton,
+    ImageGraphDraft,
+    ImageNodeWireInterpreter,
+    ImageOverlayNode,
+    ImageOverlayPlan,
+    ImageOverlayPlanner,
+    ImageOverlayWire,
+    analyze_image_overlay,
+    render_image_overlay_svg,
+)
+from .intent import FunctionalBlock, LayoutConstraint, RouteIntentRule, SchematicIntent
 from .models import Circuit, Component, LayoutSupport, SchematicArtifact
 from .optimizer import draw_optimized_artifact, draw_optimized_svg
 from .planning_agent import FakePlanningClient, GeminiPlanningClient, SemanticPlanningClient, planning_client_from_env
@@ -19,6 +49,14 @@ from .planning_hints import (
 )
 from .planner import plan_layout
 from .semantic_repair import repair_circuit
+from .textbook_surrogate import (
+    FigureStructureCard,
+    TextbookCorpusIndex,
+    TextbookFigureInterpreter,
+    TextbookStructurePlanner,
+    TextbookSurrogatePlanningClient,
+    build_structured_cards,
+)
 from .visual_review import (
     FakeVisualReviewClient,
     GeminiVisualReviewClient,
@@ -27,33 +65,61 @@ from .visual_review import (
     VisualPatch,
     VisualReview,
     VisualReviewClient,
+    visual_review_client_from_env,
 )
 from .vision_agent import GeminiVisionClient, HeuristicVisionClient, VisualFeedback, heuristic_feedback
 
 __all__ = [
     "Circuit",
+    "BASIC_FIGURE_GRAMMAR",
+    "CircuitGrammar",
     "Component",
     "AuxiliaryLoopHint",
     "BlockHint",
     "FakePlanningClient",
     "FakeVisualReviewClient",
+    "FunctionalBlock",
+    "FigureStructureCard",
+    "FigureSemanticCheck",
+    "FigureSemanticChecker",
+    "FigureSemanticClient",
+    "FigureSemanticDraft",
+    "FigureSemanticInterpreter",
+    "FigureVisualEvidence",
+    "GeminiFigureSemanticClient",
     "GeminiVisualReviewClient",
     "GeminiVisionClient",
     "GeminiPlanningClient",
     "GridPlacementHint",
     "InterBlockRouteHint",
     "HeuristicVisionClient",
+    "ImageComponentButton",
+    "ImageGraphDraft",
+    "ImageNodeWireInterpreter",
+    "ImageOverlayNode",
+    "ImageOverlayPlan",
+    "ImageOverlayPlanner",
+    "ImageOverlayWire",
     "HeuristicVisualReviewClient",
     "LaneHint",
+    "LocalFigureSemanticClient",
     "LayoutSupport",
+    "LayoutConstraint",
     "PlanningHints",
+    "PlotGrammar",
     "OrientationOverrideHint",
     "RoutePolicyHint",
+    "RouteIntentRule",
     "SchematicArtifact",
+    "SchematicIntent",
     "SchematicLayoutHints",
     "SchematicPlanningRequest",
     "SemanticPlanningClient",
     "StageHint",
+    "TextbookCorpusIndex",
+    "TextbookFigureInterpreter",
+    "TextbookStructurePlanner",
+    "TextbookSurrogatePlanningClient",
     "VisualFeedback",
     "VisualError",
     "VisualPatch",
@@ -63,8 +129,18 @@ __all__ = [
     "draw_optimized_artifact",
     "draw_optimized_svg",
     "draw_svg",
+    "analyze_image_overlay",
+    "analyze_figure_semantics",
+    "build_structured_cards",
+    "build_figure_check_prompt",
+    "build_figure_identification_prompt",
+    "figure_semantic_client_from_env",
     "heuristic_feedback",
+    "infer_schematic_intent",
+    "planning_hints_from_intent",
     "plan_layout",
     "planning_client_from_env",
+    "render_image_overlay_svg",
     "repair_circuit",
+    "visual_review_client_from_env",
 ]

@@ -4,6 +4,7 @@ from optcpv import draw_optimized_artifact, draw_optimized_svg
 from optcpv.critic import critique
 from optcpv.examples import instrumentation_amplifier
 from optcpv.patch import LayoutPatch, MoveComponent
+from optcpv.planning_agent import SemanticPlanningClient
 from optcpv.planner import plan_layout
 from optcpv.renderer import render_svg
 from optcpv.vision_agent import VisionLayoutClient
@@ -69,6 +70,32 @@ def test_optimizer_asks_vision_client_after_local_patch_fails(monkeypatch) -> No
 
     assert client.calls == 1
     assert any(item["source"] == "vision" and item["reason"] == "empty_patch" for item in artifact.optimization_log)
+
+
+def test_optimizer_asks_planning_client_for_refinement_after_local_patch_fails(monkeypatch) -> None:
+    class RecordingPlanningClient(SemanticPlanningClient):
+        def __init__(self) -> None:
+            self.refine_calls = 0
+
+        def propose_hints(self, circuit, reference_image=None):
+            return None
+
+        def refine_hints(self, circuit, layout, svg, critic_report, reference_image=None):
+            self.refine_calls += 1
+            assert svg.startswith("<svg") or "<svg" in svg
+            assert critic_report.to_dict()["score"] >= 0
+            return None
+
+    client = RecordingPlanningClient()
+    monkeypatch.setattr("optcpv.optimizer.propose_local_patch", lambda layout, report: LayoutPatch())
+    monkeypatch.setattr("optcpv.optimizer._should_request_refinement", lambda report: True)
+    artifact = draw_optimized_artifact(instrumentation_amplifier(), max_iterations=1, planning_client=client)
+
+    assert client.refine_calls == 1
+    assert any(
+        item["source"] == "planning_refinement" and item["reason"] == "no_refinement_hints"
+        for item in artifact.optimization_log
+    )
 
 
 def test_optimizer_rejects_illegal_vision_patch(monkeypatch) -> None:

@@ -82,7 +82,7 @@ def test_gemini_vision_client_sends_png_and_parses_patch(monkeypatch) -> None:
 
     patch = GeminiVisionClient(api_key="test-key").propose_patch(circuit, layout, layers.final_svg, raster, report)
 
-    assert calls["model"] == "gemini-pro-latest"
+    assert calls["model"] == "gemini-3.5-flash"
     assert calls["config"] == {"response_mime_type": "application/json"}
     assert len(calls["contents"]) == 2
     assert calls["contents"][1]["mime_type"] == "image/png"

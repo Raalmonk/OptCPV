@@ -20,6 +20,13 @@ artifacts/
 contact_sheet*.json
 contact_sheet*.png
 
+# Local textbook inputs and batch-extracted corpora
+*.pdf
+textbook_circuit_corpus*/
+textbook_*_corpus*/
+*_circuit_corpus*/
+*_corpus_smoke*/
+
 # Python
 .venv/
 venv/
