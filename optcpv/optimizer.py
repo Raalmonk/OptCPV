@@ -6,8 +6,8 @@ from dataclasses import replace
 
 from .artifact import artifact_from_layout
 from .critic import CriticBreakdown, critique_parts
-from .models import BBox, Circuit, Component, LayoutComponent, LayoutLabel, LayoutPlan, Point, SchematicArtifact, circuit_from_any
-from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, apply_patch
+from .models import BBox, Circuit, Component, LayoutComponent, LayoutLabel, LayoutPlan, NetClass, Point, SchematicArtifact, circuit_from_any
+from .patch import LayoutPatch, MoveComponent, MoveLabel, SetOrientation, SetRoutePolicy, apply_patch
 from .planning_agent import SemanticPlanningClient, planning_client_from_env
 from .planner import plan_layout
 from .raster import rasterize_svg
@@ -448,8 +448,107 @@ def propose_local_patch(layout: LayoutPlan, report) -> LayoutPatch:
 
     label_moves = _propose_label_moves(layout, report)
     orientation_updates = _propose_orientation_updates(layout)
+    route_policies = _propose_route_policies(layout, report)
 
-    return LayoutPatch(move_component=moves, move_label=label_moves, set_orientation=orientation_updates)
+    return LayoutPatch(
+        move_component=moves,
+        move_label=label_moves,
+        set_orientation=orientation_updates,
+        set_route_policy=route_policies,
+    )
+
+
+def _propose_route_policies(layout: LayoutPlan, report) -> list[SetRoutePolicy]:
+    affected_nets = _route_policy_violation_nets(report)
+    if not affected_nets:
+        return []
+    existing = _existing_route_policy_by_net(layout)
+    policies: list[SetRoutePolicy] = []
+    for net in affected_nets:
+        if net not in layout.net_to_pins or _is_terminal_net(layout, net):
+            continue
+        policy = _route_policy_for_net(layout, net)
+        if policy is None or existing.get(net) == policy:
+            continue
+        role = "right_leg_drive" if policy == "bottom_auxiliary_corridor" else "feedback"
+        policies.append(SetRoutePolicy(net=net, policy=policy, net_role=role))
+    return policies
+
+
+def _route_policy_violation_nets(report) -> list[str]:
+    nets: list[str] = []
+    for violation in report.violations:
+        if violation.code not in {"wire_through_component", "feedback_crosses_opamp_body"}:
+            continue
+        if not violation.subject:
+            continue
+        net = violation.subject.split(":", 1)[0]
+        if net and net not in nets:
+            nets.append(net)
+    return nets
+
+
+def _existing_route_policy_by_net(layout: LayoutPlan) -> dict[str, str]:
+    raw = (layout.support.planning_hints or {}).get("route_policies", [])
+    if not isinstance(raw, list):
+        return {}
+    result: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        net = item.get("net")
+        policy = item.get("policy")
+        if net is not None and policy is not None:
+            result[str(net)] = str(policy)
+    return result
+
+
+def _is_terminal_net(layout: LayoutPlan, net: str) -> bool:
+    net_class = layout.semantic.net_classes.get(net)
+    return net_class in {NetClass.GROUND, NetClass.POSITIVE_SUPPLY, NetClass.NEGATIVE_SUPPLY, NetClass.REFERENCE}
+
+
+def _route_policy_for_net(layout: LayoutPlan, net: str) -> str | None:
+    net_key = _key(net)
+    if any(token in net_key for token in ("rld", "right_leg", "driven_right_leg", "cmfb", "aux")):
+        return "bottom_auxiliary_corridor"
+    pins = [layout.pin_map[key] for key in layout.net_to_pins.get(net, []) if key in layout.pin_map]
+    if len(pins) < 2:
+        return None
+    components = {component.id: component for component in layout.components}
+    driver = next(
+        (
+            pin
+            for pin in pins
+            if _is_opamp_output_pin(pin.pin_name)
+            and (component := components.get(pin.component_id)) is not None
+            and _is_opamp_layout(component)
+        ),
+        None,
+    )
+    receivers = [
+        pin
+        for pin in pins
+        if _pin_kind(pin.pin_name) in {"+", "-"}
+        and (component := components.get(pin.component_id)) is not None
+        and _is_opamp_layout(component)
+    ]
+    if driver is not None and receivers:
+        receiver = min(receivers, key=lambda pin: abs(pin.y - driver.y))
+        return "bottom_feedback_corridor" if receiver.y > driver.y else "top_feedback_corridor"
+    if receivers:
+        receiver = sorted(receivers, key=lambda pin: (pin.x, pin.y))[0]
+        owner = components.get(receiver.component_id)
+        if owner is not None:
+            return "bottom_feedback_corridor" if receiver.y > owner.y else "top_feedback_corridor"
+        return "top_feedback_corridor"
+    if driver is not None:
+        return "top_feedback_corridor"
+    return None
+
+
+def _is_opamp_output_pin(pin_name: str) -> bool:
+    return _pin_kind(pin_name) in {"out", "output", "vo", "vout"}
 
 
 def _propose_orientation_updates(layout: LayoutPlan) -> list[SetOrientation]:

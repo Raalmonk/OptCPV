@@ -21,12 +21,15 @@ def from_citt_payload(payload: dict[str, Any]) -> Circuit:
 
     voltage_clamp_terminals_added = False
     if _is_two_electrode_voltage_clamp(payload):
-        voltage_clamp_terminals_added = _add_voltage_clamp_terminals(
+        components = _canonicalize_voltage_clamp_components(
             components,
             raw_components,
             ground_node=ground_node,
             output_node=output_node,
         )
+        ground_node = "0"
+        output_node = "Vm"
+        voltage_clamp_terminals_added = _add_canonical_voltage_clamp_terminals(components)
 
     if not voltage_clamp_terminals_added and input_node and not _has_terminal(components, input_node, "input"):
         components.insert(0, Component(id=_unique_id(components, "VIN"), type="input", pins={"out": input_node}, label="VIN"))
@@ -127,35 +130,63 @@ def _is_two_electrode_voltage_clamp(payload: dict[str, Any]) -> bool:
     return motif in {"two_electrode_voltage_clamp", "twoelectrodevoltageclamp", "tevc"}
 
 
-def _add_voltage_clamp_terminals(
+def _add_canonical_voltage_clamp_terminals(components: list[Component]) -> bool:
+    if not _has_terminal(components, "Vc", "input"):
+        components.insert(0, Component(id=_unique_id(components, "VC"), type="input", pins={"out": "Vc"}, label="V_c"))
+    if not _has_terminal(components, "Vm", "output"):
+        components.append(Component(id=_unique_id(components, "VM"), type="output", pins={"in": "Vm"}, label="V_m"))
+    if not _has_terminal(components, "Vo", "output"):
+        components.append(Component(id=_unique_id(components, "VO"), type="output", pins={"in": "Vo"}, label="V_o"))
+    return True
+
+
+def _canonicalize_voltage_clamp_components(
     components: list[Component],
     raw_components: list[Any],
     *,
     ground_node: str | None,
     output_node: str | None,
-) -> bool:
+) -> list[Component]:
     command_node, membrane_node, amplifier_output_node = _voltage_clamp_nets(
         raw_components,
         ground_node=ground_node,
         output_node=output_node,
     )
     if not command_node or not membrane_node or not amplifier_output_node:
-        return False
+        return components
 
-    if not _has_terminal(components, command_node, "input"):
-        components.insert(
-            0,
-            Component(id=_unique_id(components, "VC"), type="input", pins={"out": command_node}, label="V_c"),
+    aliases = {
+        command_node: "Vc",
+        membrane_node: "Vm",
+        amplifier_output_node: "Vo",
+    }
+    if ground_node:
+        aliases[ground_node] = "0"
+
+    return [
+        Component(
+            id=_canonical_voltage_clamp_component_id(component),
+            type=component.type,
+            pins={pin: aliases.get(net, net) for pin, net in component.pins.items()},
+            label=component.label,
+            role=component.role,
+            value=component.value,
         )
-    if not _has_terminal(components, membrane_node, "output"):
-        components.append(
-            Component(id=_unique_id(components, "VM"), type="output", pins={"in": membrane_node}, label="V_m")
-        )
-    if not _has_terminal(components, amplifier_output_node, "output"):
-        components.append(
-            Component(id=_unique_id(components, "VO"), type="output", pins={"in": amplifier_output_node}, label="V_o")
-        )
-    return True
+        for component in components
+    ]
+
+
+def _canonical_voltage_clamp_component_id(component: Component) -> str:
+    key = _key(component.id)
+    if key in {"vc", "vcommand", "vcmd", "commandvoltage"} and _key(component.type) == "input":
+        return "VC"
+    if key in {"vm", "vmembrane", "membrane"} and _key(component.type) == "output":
+        return "VM"
+    if key in {"vo", "vout", "ampout", "amplifieroutput"} and _key(component.type) == "output":
+        return "VO"
+    if key in {"gnd", "ground"} and _key(component.type) in {"ground", "gnd"}:
+        return "GND"
+    return component.id
 
 
 def _voltage_clamp_nets(

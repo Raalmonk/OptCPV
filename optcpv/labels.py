@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 
+from .math_label import plain_math_text
+
 
 def wrap_label_lines(text: str, *, max_chars: int = 14, max_lines: int = 3) -> list[str]:
-    normalized = re.sub(r"[_/]+", " ", text.strip())
+    normalized = re.sub(r"[/]+", " ", text.strip())
     words = [word for word in normalized.split() if word]
     if not words:
         return [text]
@@ -36,7 +38,7 @@ def wrap_label_lines(text: str, *, max_chars: int = 14, max_lines: int = 3) -> l
 
 def label_bbox_size(text: str) -> tuple[float, float]:
     lines = wrap_label_lines(text)
-    width = max(0.7, 0.145 * max(len(line) for line in lines) + 0.35)
+    width = max(0.7, 0.145 * max(len(plain_math_text(line)) for line in lines) + 0.35)
     height = max(0.38, 0.36 * len(lines) + 0.06)
     return width, height
 

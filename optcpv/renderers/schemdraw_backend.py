@@ -6,6 +6,7 @@ from html import escape
 from io import StringIO
 
 from ..labels import component_display_label, display_label_text, wrap_label_lines
+from ..math_label import svg_math_line_tspan, svg_math_text
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LayoutWire, LocalTerminalIntent, Motif, Point
 from ..segments import junction_points, merged_axis_aligned_segments
 from .svg_postprocess import draw_wires_with_jumps, inject_metadata, render_debug_svg, _set_root_attr
@@ -694,7 +695,7 @@ def _draw_signal_label_terminal(
             f'<circle cx="{x0:.1f}" cy="{y:.1f}" r="3.8" fill="#ffffff" stroke="#111827" stroke-width="1.8"/>',
             f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" dominant-baseline="auto" '
             'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
-            f"{escape(label)}</text>",
+            f"{svg_math_text(label)}</text>",
             "</g>",
         ]
     )
@@ -715,7 +716,7 @@ def draw_filter_block(layout: LayoutPlan, component: LayoutComponent) -> str:
             f'<text x="{(component.x * layout.grid):.1f}" y="{(component.y * layout.grid):.1f}" '
             'text-anchor="middle" dominant-baseline="middle" '
             'font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#111827">'
-            f"{escape(label)}</text>",
+            f"{svg_math_text(label)}</text>",
             "</g>",
         ]
     )
@@ -848,7 +849,7 @@ def _draw_supply_terminal(
             f'<path d="{arrow}" fill="none" stroke="#111827" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
             f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" dominant-baseline="middle" '
             'font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#374151">'
-            f"{escape(label)}</text>",
+            f"{svg_math_text(label)}</text>",
             "</g>",
         ]
     )
@@ -1009,11 +1010,11 @@ def _label_svg(layout: LayoutPlan, label: LayoutLabel) -> str:
         dy = "0"
     lines = wrap_label_lines(label.text)
     if len(lines) == 1:
-        inner = escape(lines[0])
+        inner = svg_math_text(lines[0])
     else:
         start_y = label.y * layout.grid - (len(lines) - 1) * 8.3
         inner = "".join(
-            f'<tspan x="{label.x * layout.grid:.1f}" y="{start_y + index * 16.6:.1f}">{escape(line)}</tspan>'
+            svg_math_line_tspan(line, x=label.x * layout.grid, y=start_y + index * 16.6)
             for index, line in enumerate(lines)
         )
     common = (

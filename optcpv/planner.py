@@ -231,7 +231,10 @@ def _plan_non_inverting_op_amp(circuit: Circuit) -> LayoutPlan:
 def _plan_two_electrode_voltage_clamp(circuit: Circuit) -> LayoutPlan:
     placements: dict[str, tuple[float, float, str]] = {}
     label_offsets: dict[str, tuple[float, float]] = {}
-    opamp = _first(circuit, _is_opamp)
+    opamps = [component for component in circuit.components if _is_opamp(component)]
+    if len(opamps) == 2:
+        return _plan_two_opamp_voltage_clamp(circuit, opamps)
+    opamp = opamps[0] if opamps else None
     ground = _first(circuit, _is_ground)
     command = _first(circuit, lambda item: item.id == "VC") or _first(circuit, _is_input_or_source)
     membrane = _first(circuit, lambda item: item.id == "VM")
@@ -276,6 +279,171 @@ def _plan_two_electrode_voltage_clamp(circuit: Circuit) -> LayoutPlan:
         label_offsets=label_offsets,
         support=_native_motif_support("two_electrode_voltage_clamp"),
     )
+
+
+def _plan_two_opamp_voltage_clamp(circuit: Circuit, opamps: list[Component]) -> LayoutPlan:
+    placements: dict[str, tuple[float, float, str]] = {}
+    label_offsets: dict[str, tuple[float, float]] = {}
+    buffer = _tevc_buffer_opamp(opamps)
+    diffamp = _tevc_diff_opamp(opamps, buffer)
+    membrane_net = _tevc_membrane_net(circuit, buffer)
+    sense_net = _opamp_output_net(buffer) if buffer is not None else None
+    diff_output_net = _opamp_output_net(diffamp) if diffamp is not None else None
+
+    command = _tevc_command_source(circuit, diffamp)
+    membrane = _tevc_output_for_net(circuit, membrane_net, preferred_id="VM")
+    amp_output = _tevc_output_for_net(circuit, diff_output_net, preferred_id="VO")
+    meter = _first(circuit, lambda item: _key(item.type) == "ammeter")
+    ground = _first(circuit, _is_ground)
+    output_resistor = _tevc_series_resistor(circuit, membrane_net)
+    membrane_resistor = _tevc_membrane_resistor(circuit, membrane_net)
+
+    def place(component: Component | None, x: float, y: float, orientation: str) -> None:
+        if component is not None:
+            placements[component.id] = (x, y, orientation)
+
+    place(command, 1.35, 5.75, "right")
+    place(buffer, 5.2, 2.65, _opamp_orientation(buffer, circuit.components) if buffer is not None else "right")
+    place(diffamp, 9.45, 5.75, _opamp_orientation(diffamp, circuit.components) if diffamp is not None else "right")
+    place(meter, 14.2, 5.75, "right")
+    place(output_resistor, 17.25 if meter else 14.6, 5.75, "right")
+    place(membrane, 19.9 if meter else 17.2, 5.75, "right")
+    place(amp_output, 13.4, 4.15, "right")
+    place(membrane_resistor, 5.2, 8.25, "down")
+    place(ground, 5.2, 10.45, "right")
+
+    for component, offset in (
+        (command, (-0.15, -0.42)),
+        (buffer, (0.85, -1.65)),
+        (diffamp, (0.9, -1.65)),
+        (output_resistor, (0.0, -0.9)),
+        (membrane_resistor, (0.78, 0.08)),
+        (membrane, (0.35, -0.28)),
+        (amp_output, (0.35, -0.28)),
+    ):
+        if component is not None:
+            label_offsets[component.id] = offset
+
+    return _build_layout(
+        circuit,
+        placements,
+        ["motif: two_electrode_voltage_clamp"],
+        width=980,
+        height=600,
+        label_offsets=label_offsets,
+        support=_two_opamp_tevc_support(membrane_net=membrane_net, sense_net=sense_net),
+    )
+
+
+def _tevc_buffer_opamp(opamps: list[Component]) -> Component | None:
+    named = next((opamp for opamp in opamps if _tevc_identity_contains(opamp, ("buf", "buffer"))), None)
+    if named is not None:
+        return named
+    return next((opamp for opamp in opamps if (_opamp_output_net(opamp) in set(_opamp_input_nets(opamp)))), None)
+
+
+def _tevc_diff_opamp(opamps: list[Component], buffer: Component | None) -> Component | None:
+    named = next((opamp for opamp in opamps if _tevc_identity_contains(opamp, ("diff", "differential"))), None)
+    if named is not None:
+        return named
+    return next((opamp for opamp in opamps if buffer is None or opamp.id != buffer.id), None)
+
+
+def _tevc_identity_contains(component: Component, tokens: tuple[str, ...]) -> bool:
+    identity = _key(" ".join(filter(None, [component.id, component.label, component.role, component.value])))
+    return any(token in identity for token in tokens)
+
+
+def _tevc_command_source(circuit: Circuit, diffamp: Component | None) -> Component | None:
+    if diffamp is not None:
+        diff_inputs = set(_opamp_input_nets(diffamp))
+        for component in circuit.components:
+            if _is_input_or_source(component) and any(net in diff_inputs for net in component.pins.values()):
+                return component
+    return _first(circuit, lambda item: item.id == "VC") or _first(circuit, _is_input_or_source)
+
+
+def _tevc_membrane_net(circuit: Circuit, buffer: Component | None) -> str | None:
+    if buffer is not None:
+        for pin_name, net in buffer.pins.items():
+            if _pin_kind(pin_name) == "+":
+                return net
+    membrane_output = _first(circuit, lambda item: item.id == "VM" and _is_output(item))
+    if membrane_output is not None:
+        return next(iter(membrane_output.pins.values()), None)
+    return None
+
+
+def _tevc_output_for_net(circuit: Circuit, net: str | None, *, preferred_id: str) -> Component | None:
+    preferred = _first(circuit, lambda item: item.id == preferred_id and _is_output(item))
+    if preferred is not None:
+        return preferred
+    if net is None:
+        return None
+    return _first(circuit, lambda item: _is_output(item) and net in item.pins.values())
+
+
+def _tevc_series_resistor(circuit: Circuit, membrane_net: str | None) -> Component | None:
+    resistors = [component for component in circuit.components if _is_type(component, "resistor")]
+    named = _first(
+        circuit,
+        lambda item: _is_type(item, "resistor")
+        and (
+            _tevc_identity_contains(item, ("r_o", "ro", "output", "electrode"))
+            or "current_electrode" in _key(item.role)
+        ),
+    )
+    if named is not None:
+        return named
+    if membrane_net is not None:
+        series = next(
+            (
+                component
+                for component in resistors
+                if membrane_net in component.pins.values()
+                and not any(is_local_terminal_net(net) for net in component.pins.values() if net != membrane_net)
+            ),
+            None,
+        )
+        if series is not None:
+            return series
+    return resistors[0] if resistors else None
+
+
+def _tevc_membrane_resistor(circuit: Circuit, membrane_net: str | None) -> Component | None:
+    resistors = [component for component in circuit.components if _is_type(component, "resistor")]
+    named = _first(
+        circuit,
+        lambda item: _is_type(item, "resistor") and _tevc_identity_contains(item, ("r_m", "rm", "membrane")),
+    )
+    if named is not None:
+        return named
+    if membrane_net is not None:
+        shunt = next(
+            (
+                component
+                for component in resistors
+                if membrane_net in component.pins.values()
+                and any(is_local_terminal_net(net) for net in component.pins.values() if net != membrane_net)
+            ),
+            None,
+        )
+        if shunt is not None:
+            return shunt
+    series = _tevc_series_resistor(circuit, membrane_net)
+    return next((component for component in resistors if component != series), None)
+
+
+def _two_opamp_tevc_support(*, membrane_net: str | None, sense_net: str | None) -> LayoutSupport:
+    route_policies = []
+    if membrane_net:
+        route_policies.append({"net": membrane_net, "net_role": "membrane_voltage", "policy": "named_net_label"})
+    if sense_net:
+        route_policies.append({"net": sense_net, "net_role": "buffer_feedback", "policy": "bottom_feedback_corridor"})
+    support = _native_motif_support("two_electrode_voltage_clamp")
+    if not route_policies:
+        return support
+    return replace(support, planning_hints={"route_policies": route_policies})
 
 
 def _plan_instrumentation_amplifier(circuit: Circuit) -> LayoutPlan:
@@ -5234,7 +5402,7 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "instrumentation_amplifier" and (opamps != 3 or resistors < 7):
         return None
-    if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
+    if motif == "two_electrode_voltage_clamp" and (opamps not in {1, 2} or resistors < 2):
         return None
     if motif == "non_inverting_op_amp" and (opamps != 1 or resistors != 2 or capacitors):
         return None

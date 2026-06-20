@@ -210,7 +210,7 @@ def _validated_motif(circuit: Circuit) -> str | None:
         return None
     if motif == "instrumentation_amplifier" and (opamps != 3 or resistors < 7):
         return None
-    if motif == "two_electrode_voltage_clamp" and (opamps != 1 or resistors < 2):
+    if motif == "two_electrode_voltage_clamp" and (opamps not in {1, 2} or resistors < 2):
         return None
     if motif == "non_inverting_op_amp" and (opamps != 1 or resistors != 2 or capacitors):
         return None

@@ -6,6 +6,7 @@ from html import escape
 from typing import Literal
 
 from ..labels import wrap_label_lines
+from ..math_label import svg_math_line_tspan, svg_math_text
 from ..models import LayoutComponent, LayoutLabel, LayoutPlan, LocalTerminalIntent, Point
 from ..segments import EPSILON, merged_axis_aligned_segments
 
@@ -416,7 +417,7 @@ def _should_hide_local_terminal(layout: LayoutPlan, terminal: LocalTerminalInten
 
 
 def _local_terminal_label(x: float, y: float, label: str) -> str:
-    return f'<text class="terminal-label" x="{x:.1f}" y="{y:.1f}">{escape(label)}</text>'
+    return f'<text class="terminal-label" x="{x:.1f}" y="{y:.1f}">{svg_math_text(label)}</text>'
 
 
 def _draw_signal_label_terminal(layout: LayoutPlan, terminal: LocalTerminalIntent, pin) -> str:
@@ -435,7 +436,7 @@ def _draw_signal_label_terminal(layout: LayoutPlan, terminal: LocalTerminalInten
         f'<line class="symbol" x1="{x:.1f}" y1="{y:.1f}" x2="{x1:.1f}" y2="{y:.1f}"/>'
         f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.8" fill="#ffffff" stroke="#111827" stroke-width="1.8"/>'
         f'<text class="terminal-label" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" '
-        f'dominant-baseline="auto">{escape(label)}</text>'
+        f'dominant-baseline="auto">{svg_math_text(label)}</text>'
         "</g>"
     )
 
@@ -445,11 +446,11 @@ def _draw_label(layout: LayoutPlan, label: LayoutLabel) -> str:
     y = label.y * layout.grid
     lines = wrap_label_lines(label.text)
     if len(lines) == 1:
-        inner = escape(lines[0])
+        inner = svg_math_text(lines[0])
     else:
         start_y = y - (len(lines) - 1) * 7.8
         inner = "".join(
-            f'<tspan x="{x:.1f}" y="{start_y + index * 15.6:.1f}">{escape(line)}</tspan>'
+            svg_math_line_tspan(line, x=x, y=start_y + index * 15.6)
             for index, line in enumerate(lines)
         )
     halo = f'<text class="label-halo" x="{x:.1f}" y="{y:.1f}" text-anchor="{escape(label.anchor)}">{inner}</text>'
@@ -625,7 +626,7 @@ def _draw_meter(component: LayoutComponent, x: float, y: float) -> str:
 def _draw_terminal(component: LayoutComponent, x: float, y: float) -> str:
     return (
         f'<circle class="component" cx="{x:.1f}" cy="{y:.1f}" r="18"/>'
-        f'<text class="terminal-label" x="{x:.1f}" y="{y + 4:.1f}">{escape(component.label or component.id)}</text>'
+        f'<text class="terminal-label" x="{x:.1f}" y="{y + 4:.1f}">{svg_math_text(component.label or component.id)}</text>'
     )
 
 

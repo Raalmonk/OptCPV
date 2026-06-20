@@ -3,6 +3,8 @@ import xml.etree.ElementTree as ET
 
 from optcpv import Circuit, Component, draw_svg
 from optcpv.examples import EXAMPLES, instrumentation_amplifier
+from optcpv.labels import wrap_label_lines
+from optcpv.math_label import svg_math_text
 from optcpv.models import LayoutWire, Point
 from optcpv.planner import plan_layout
 from optcpv.renderers.schemdraw_backend import FALLBACK_RENDERER_ID, SchemdrawRenderer
@@ -54,6 +56,34 @@ def test_label_halo_preserves_label_metadata() -> None:
 
     assert 'data-label-id="label:U1"' in labels_svg
     assert 'class="label-halo"' in labels_svg
+
+
+def test_svg_labels_render_common_latex_subscripts() -> None:
+    circuit = Circuit(
+        id="math_label_probe",
+        components=[
+            Component(id="VIN", type="input", pins={"out": "vin"}, label="V_c"),
+            Component(id="R_m", type="resistor", pins={"a": "vin", "b": "gnd"}, label="R_m = 10 Ω"),
+            Component(id="GND", type="ground", pins={"gnd": "gnd"}, label="0"),
+        ],
+    )
+
+    svg = draw_svg(circuit)
+
+    assert wrap_label_lines("R_m = 10 Ω") == ["R_m = 10 Ω"]
+    assert 'baseline-shift="sub"' in svg
+    assert "R m = 10" not in svg
+    assert 'data-label-owner-id="R_m"' in svg
+
+
+def test_math_label_renderer_handles_latex_groups_and_units() -> None:
+    rendered = svg_math_text(r"V_{out} = I_\mathrm{bias} R_f + 1\,\Omega")
+
+    assert 'baseline-shift="sub"' in rendered
+    assert ">out</tspan>" in rendered
+    assert ">bias</tspan>" in rendered
+    assert ">f</tspan>" in rendered
+    assert "Ω" in rendered
 
 
 def test_debug_renderer_draws_wire_crossing_as_jump_bridge() -> None:
